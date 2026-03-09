@@ -146,7 +146,7 @@ float dveWetnessMask(vec3 normalDir, vec3 worldPos) {
 float dveEdgeMask(vec2 faceUV) {
   vec2 centered = abs(faceUV - 0.5) * 2.0;
   float edge = max(centered.x, centered.y);
-  return smoothstep(0.62, 0.96, edge);
+  return smoothstep(0.7, 0.985, edge);
 }
 
 float dveTopExposureMask(vec3 normalDir, vec3 worldPos) {
@@ -220,8 +220,8 @@ float dveSurfaceTop = clamp(vMetadata.w, 0.0, 1.0);
 float dveMacroBase = clamp(dveFbm3(worldPOS * 0.035) * 1.2, 0.0, 1.0);
 float dveMacroBands = dveFbm3(vec3(worldPOS.x * 0.018, worldPOS.y * 0.045, worldPOS.z * 0.018) + vec3(17.2, -3.1, 8.4));
 float dveMacroPatch = dveFbm3(worldPOS * 0.012 + vec3(-9.7, 5.2, 11.1));
-float dveBaseCavity = max(dveCavityMask(vAO, worldPOS), dveSurfaceCavity * 0.9);
-float dveWetnessBase = clamp(dveWetnessMask(normalDir, worldPOS) * 0.72 + dveSurfaceCavity * 0.22 + (1.0 - dveSurfaceExposure) * 0.08, 0.0, 1.0);
+float dveBaseCavity = max(dveCavityMask(vAO, worldPOS), dveSurfaceCavity * 0.82);
+float dveWetnessBase = clamp(dveWetnessMask(normalDir, worldPOS) * 0.72 + dveSurfaceCavity * 0.14 + (1.0 - dveSurfaceExposure) * 0.08, 0.0, 1.0);
 float dveNearField = dveNearFieldMask(vDistance, 10.0, 56.0);
 float dveCenterBlend = dveCenterMask(iUV);
 float dveMicroNoise = dveFbm3(worldPOS * 0.34 + normalDir * 2.3);
@@ -261,7 +261,7 @@ float dveCavity = ${
 terrainColor = pow(max(terrainColor, vec3(0.0)), vec3(0.9));
 terrainColor = mix(terrainColor, terrainColor * vec3(1.12, 1.1, 1.06), dveTopExposure * 0.18);
 terrainColor = mix(terrainColor, terrainColor * vec3(0.74, 0.72, 0.7), dveCavity * 0.28);
-terrainColor += vec3(0.06, 0.05, 0.04) * dveEdgeWear * (0.18 + dveCloseBoost * 0.14);
+terrainColor += vec3(0.045, 0.04, 0.03) * dveEdgeWear * (0.1 + dveCloseBoost * 0.08);
 
 if (dveMaterialClass == ${TerrainMaterialClass.Soil}.0) {
   terrainColor *= vec3(1.08, 0.98, 0.9);
@@ -270,7 +270,7 @@ if (dveMaterialClass == ${TerrainMaterialClass.Soil}.0) {
 }
 if (dveMaterialClass == ${TerrainMaterialClass.Rock}.0) {
   terrainColor *= vec3(0.94, 0.98, 1.04);
-  terrainColor = mix(terrainColor, terrainColor * vec3(1.1, 1.08, 1.04), dveEdgeWear * 0.24);
+  terrainColor = mix(terrainColor, terrainColor * vec3(1.08, 1.06, 1.03), dveEdgeWear * 0.16);
   terrainColor = mix(terrainColor, terrainColor * vec3(0.8, 0.84, 0.9), dveCavity * 0.16);
 }
 if (dveMaterialClass == ${TerrainMaterialClass.Flora}.0) {
@@ -326,18 +326,18 @@ if (dveMaterialClass == ${TerrainMaterialClass.Exotic}.0) {
   const surfaceOverlaysCode = terrain.surfaceOverlays && !isTransparent && !isGlow
     ? /* glsl */ `
 float dveOverlayNoise = dveFbm3(worldPOS * 0.11 + vec3(4.3, -1.7, 8.1));
-float dveDepositionMask = clamp(dveSurfaceTop * (1.0 - dveSurfaceSlope) * 0.72 + dveSurfaceCavity * 0.12 + dveOverlayNoise * 0.18, 0.0, 1.0);
-float dveMossMask = clamp(dveWetnessBase * 0.45 + dveSurfaceCavity * 0.42 + (1.0 - dveSurfaceSlope) * 0.08 - dveSurfaceExposure * 0.12, 0.0, 1.0);
-float dveDustMask = clamp(dveSurfaceExposure * 0.34 + (1.0 - dveWetnessBase) * 0.22 + dveOverlayNoise * 0.12, 0.0, 1.0);
-float dveCrustMask = clamp(dveSurfaceExposure * 0.2 + dveSurfaceCavity * 0.36 + dveOverlayNoise * 0.24, 0.0, 1.0);
+float dveDepositionMask = clamp(dveSurfaceTop * (1.0 - dveSurfaceSlope) * 0.66 + dveSurfaceCavity * 0.08 + dveOverlayNoise * 0.14, 0.0, 1.0);
+float dveMossMask = clamp(dveWetnessBase * 0.38 + dveSurfaceCavity * 0.3 + (1.0 - dveSurfaceSlope) * 0.08 - dveSurfaceExposure * 0.12, 0.0, 1.0);
+float dveDustMask = clamp(dveSurfaceExposure * 0.3 + (1.0 - dveWetnessBase) * 0.18 + dveOverlayNoise * 0.1, 0.0, 1.0);
+float dveCrustMask = clamp(dveSurfaceExposure * 0.18 + dveSurfaceCavity * 0.24 + dveOverlayNoise * 0.18, 0.0, 1.0);
 
 if (dveMaterialClass == ${TerrainMaterialClass.Rock}.0) {
   terrainColor = mix(terrainColor, terrainColor * vec3(0.74, 0.88, 0.72), dveMossMask * 0.18);
   terrainColor = mix(terrainColor, terrainColor * vec3(1.08, 1.04, 0.96), dveDepositionMask * 0.14);
 }
 if (dveMaterialClass == ${TerrainMaterialClass.Soil}.0 || dveMaterialClass == ${TerrainMaterialClass.Cultivated}.0) {
-  terrainColor = mix(terrainColor, terrainColor * vec3(1.12, 1.06, 0.92), dveDepositionMask * 0.22);
-  terrainColor = mix(terrainColor, terrainColor * vec3(0.68, 0.74, 0.62), dveMossMask * 0.14);
+  terrainColor = mix(terrainColor, terrainColor * vec3(1.1, 1.05, 0.92), dveDepositionMask * 0.16);
+  terrainColor = mix(terrainColor, terrainColor * vec3(0.7, 0.76, 0.64), dveMossMask * 0.1);
 }
 if (dveMaterialClass == ${TerrainMaterialClass.Flora}.0) {
   terrainColor = mix(terrainColor, terrainColor * vec3(1.06, 1.1, 0.96), dveDepositionMask * 0.1);
@@ -356,18 +356,18 @@ if (dveMaterialClass == ${TerrainMaterialClass.Exotic}.0) {
 
   const microVariationCode = terrain.microVariation && !isTransparent
     ? /* glsl */ `
-float dveMicroRelief = clamp(dveMicroNoise * 0.72 + dveMicroNoiseFine * 0.28, 0.0, 1.0);
-float dveMicroEdge = dveEdgeMask(iUV) * (0.24 + dveSurfaceSlope * 0.34);
-float dveMicroBreakup = clamp((dveMicroNoiseFine - 0.5) * 1.6 + 0.5, 0.0, 1.0);
-terrainColor = mix(terrainColor, terrainColor * mix(vec3(0.92, 0.9, 0.88), vec3(1.08, 1.06, 1.02), dveMicroRelief), dveNearField * 0.1 * (0.45 + dveOrganicMaterial * 0.55));
-terrainColor += vec3(0.04, 0.035, 0.03) * dveCenterBlend * dveNearField * dveSurfaceTop * 0.12 * dveOrganicMaterial;
-terrainColor = mix(terrainColor, terrainColor * vec3(0.82, 0.8, 0.78), dveMicroEdge * dveNearField * 0.12 * (0.35 + dveOrganicMaterial * 0.65));
+float dveMicroRelief = clamp(dveMicroNoise * 0.62 + dveMicroNoiseFine * 0.38, 0.0, 1.0);
+float dveMicroEdge = dveEdgeMask(iUV) * (0.18 + dveSurfaceSlope * 0.22);
+float dveMicroBreakup = clamp((dveMicroNoiseFine - 0.5) * 1.3 + 0.5, 0.0, 1.0);
+terrainColor = mix(terrainColor, terrainColor * mix(vec3(0.94, 0.92, 0.9), vec3(1.05, 1.04, 1.01), dveMicroRelief), dveNearField * 0.06 * (0.45 + dveOrganicMaterial * 0.55));
+terrainColor += vec3(0.03, 0.026, 0.022) * dveCenterBlend * dveNearField * dveSurfaceTop * 0.07 * dveOrganicMaterial;
+terrainColor = mix(terrainColor, terrainColor * vec3(0.86, 0.84, 0.82), dveMicroEdge * dveNearField * 0.07 * (0.35 + dveOrganicMaterial * 0.65));
 
 if (dveMaterialClass == ${TerrainMaterialClass.Rock}.0) {
-  terrainColor = mix(terrainColor, terrainColor * vec3(0.9, 0.92, 0.96), dveMicroBreakup * dveNearField * 0.08);
+  terrainColor = mix(terrainColor, terrainColor * vec3(0.92, 0.94, 0.97), dveMicroBreakup * dveNearField * 0.05);
 }
 if (dveMaterialClass == ${TerrainMaterialClass.Flora}.0) {
-  terrainColor = mix(terrainColor, terrainColor * vec3(0.92, 1.04, 0.9), dveMicroBreakup * dveNearField * 0.1);
+  terrainColor = mix(terrainColor, terrainColor * vec3(0.94, 1.03, 0.92), dveMicroBreakup * dveNearField * 0.06);
 }
 `
     : "";
@@ -383,13 +383,13 @@ terrainColor = mix(terrainColor, terrainColor * vec3(0.8, 0.78, 0.76), dveEdgeMa
   const transitionMeshesCode = terrain.transitionMeshes && !isTransparent
     ? /* glsl */ `
 float dveSoftCap = dveCenterBlend * dveSurfaceTop * (1.0 - dveSurfaceSlope);
-float dveShoulder = dveEdgeMask(iUV) * (0.26 + dveSurfaceSlope * 0.58);
+float dveShoulder = dveEdgeMask(iUV) * (0.18 + dveSurfaceSlope * 0.4);
 float dveTransitionBlend = dveNearField * (0.28 + dveOrganicMaterial * 0.72);
-terrainColor = mix(terrainColor, terrainColor * vec3(1.1, 1.08, 1.03), dveSoftCap * dveTransitionBlend * 0.2);
-terrainColor = mix(terrainColor, terrainColor * vec3(0.76, 0.74, 0.72), dveShoulder * dveTransitionBlend * 0.14);
+terrainColor = mix(terrainColor, terrainColor * vec3(1.08, 1.06, 1.03), dveSoftCap * dveTransitionBlend * 0.14);
+terrainColor = mix(terrainColor, terrainColor * vec3(0.8, 0.78, 0.76), dveShoulder * dveTransitionBlend * 0.08);
 
 if (dveMaterialClass == ${TerrainMaterialClass.Soil}.0 || dveMaterialClass == ${TerrainMaterialClass.Cultivated}.0 || dveMaterialClass == ${TerrainMaterialClass.Flora}.0) {
-  terrainColor += vec3(0.045, 0.04, 0.03) * dveSoftCap * dveNearField * 0.18;
+  terrainColor += vec3(0.036, 0.032, 0.025) * dveSoftCap * dveNearField * 0.12;
 }
 if (dveMaterialClass == ${TerrainMaterialClass.Rock}.0) {
   terrainColor = mix(terrainColor, terrainColor * vec3(0.9, 0.92, 0.96), dveShoulder * dveNearField * 0.08);
@@ -436,7 +436,7 @@ terrainColor = mix(terrainColor, terrainColor * vec3(0.52, 0.6, 0.72), dveWetnes
 vec3 viewDir = normalize(cameraPosition - worldPOS);
 float dveSheen = pow(1.0 - max(dot(normalDir, viewDir), 0.0), 3.0);
 terrainColor += vec3(0.1, 0.12, 0.16) * dveSheen * dveWetness * 0.28;
-terrainColor = mix(terrainColor, terrainColor * vec3(0.68, 0.74, 0.82), dveWetness * dveBaseCavity * 0.1);
+terrainColor = mix(terrainColor, terrainColor * vec3(0.68, 0.74, 0.82), dveWetness * dveBaseCavity * 0.05);
 
 if (dveMaterialClass == ${TerrainMaterialClass.Soil}.0 || dveMaterialClass == ${TerrainMaterialClass.Cultivated}.0) {
   terrainColor = mix(terrainColor, terrainColor * vec3(0.58, 0.64, 0.76), dveWetness * 0.16);

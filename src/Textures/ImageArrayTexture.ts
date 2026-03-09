@@ -217,10 +217,17 @@ export class ImageArrayTexture extends Texture {
       const maxAniso = gl.getParameter(
         anisotropicEnabled.MAX_TEXTURE_MAX_ANISOTROPY_EXT
       ) as number;
+      const textureSize = EngineSettings.settings.rendererSettings.textureSize[0];
       const useReducedAnisotropy =
-        EngineSettings.settings.rendererSettings.textureSize[0] > 16 &&
-        EngineSettings.settings.terrain.transitionMeshes;
-      const desired = Math.min(useReducedAnisotropy ? 2 : 8, maxAniso);
+        textureSize > 16 && EngineSettings.settings.terrain.transitionMeshes;
+      const desired = Math.min(
+        textureSize > 32 && EngineSettings.settings.terrain.transitionMeshes
+          ? 1
+          : useReducedAnisotropy
+            ? 2
+            : 8,
+        maxAniso,
+      );
 
       gl.texParameterf(
         gl.TEXTURE_2D_ARRAY,
