@@ -6,6 +6,8 @@ export class SubBufferMesh {
   verticesCount = 0;
   indicesStart = 0;
   indicesCount = 0;
+  transitionGeometry = false;
+  baseMaterialId = "";
   allocation: BufferAllocation;
   transform: TransformNode;
   mesh: SubMesh;

@@ -1,6 +1,9 @@
 import { DVEBRPBRMaterial } from "../../Matereials/PBR/DVEBRPBRMaterial";
 import { DVEBRDefaultMaterialBaseData } from "../../Matereials/Types/DVEBRDefaultMaterial.types";
-import { CreateDefaultRenderer } from "../Default/CreateDefaultRenderer";
+import {
+  CreateDefaultRenderer,
+  CreateTextures,
+} from "../Default/CreateDefaultRenderer";
 import { CreateBox } from "@babylonjs/core/Meshes/Builders/boxBuilder";
 import { DirectionalLight } from "@babylonjs/core/Lights/directionalLight";
 import { HemisphericLight } from "@babylonjs/core/Lights/hemisphericLight";
@@ -13,15 +16,105 @@ import { DefaultRenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPi
 import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
 import { Texture } from "@babylonjs/core/Materials/Textures/texture";
 import { HDRCubeTexture } from "@babylonjs/core/Materials/Textures/hdrCubeTexture";
+import "@babylonjs/core/Lights/Shadows/shadowGeneratorSceneComponent";
+import "@babylonjs/core/Rendering/depthRendererSceneComponent";
+import "@babylonjs/core/Rendering/geometryBufferRendererSceneComponent";
+import "@babylonjs/core/Rendering/prePassRendererSceneComponent";
 
 import { LevelParticles } from "./LevelParticles";
 import { WorkItemProgress } from "@divinevoxel/vlox/Util/WorkItemProgress";
 import { EngineSettings } from "@divinevoxel/vlox/Settings/EngineSettings";
+import { MaterialInterface } from "../../Matereials/MaterialInterface";
 export type DVEBRPBRData = DVEBRDefaultMaterialBaseData & {
   getProgress?: (progress: WorkItemProgress) => void;
 };
 
-export default function InitDVEPBR(initData: DVEBRPBRData) {
+function applyTerrainPhase1RendererProfile(
+  pipeline: DefaultRenderingPipeline,
+  ssr: SSRRenderingPipeline,
+  sunLight: DirectionalLight
+) {
+  const terrain = EngineSettings.settings.terrain;
+  if (!terrain.visualV2 && !terrain.materialTriplanar && !terrain.materialWetness) {
+    return;
+  }
+
+  if (terrain.visualV2) {
+    pipeline.imageProcessing.contrast = 1.6;
+    pipeline.imageProcessing.exposure = 1.02;
+    pipeline.bloomThreshold = 0.2;
+    ssr.strength = 0.9;
+    ssr.roughnessFactor = 0.14;
+    sunLight.intensity = 9;
+  }
+
+  if (terrain.materialWetness) {
+    pipeline.imageProcessing.exposure = 0.96;
+    pipeline.bloomThreshold = 0.24;
+    ssr.strength = 1.1;
+    ssr.roughnessFactor = 0.08;
+    sunLight.intensity = 8.5;
+  }
+}
+
+function applyTerrainPhase1MaterialProfile(materials: MaterialInterface[]) {
+  const terrain = EngineSettings.settings.terrain;
+  if (!terrain.visualV2 && !terrain.materialTriplanar && !terrain.materialWetness) {
+    return;
+  }
+
+  for (const material of materials) {
+    if (!(material instanceof DVEBRPBRMaterial)) continue;
+
+    const pbr = material._material;
+    const isLiquid = material.id.includes("liquid");
+    const isFlora = material.id.includes("flora");
+    const isTransparent = material.id.includes("transparent");
+    const isGlow = material.id.includes("glow");
+
+    if (terrain.visualV2) {
+      pbr.environmentIntensity = isLiquid ? 1.35 : 0.8;
+      pbr.directIntensity = isLiquid ? 0.95 : 1.1;
+      if (!isLiquid) {
+        pbr.roughness = isFlora ? 0.92 : 0.82;
+      }
+      if (isGlow) {
+        pbr.emissiveIntensity = 1.2;
+      }
+    }
+
+    if (terrain.materialTriplanar && !isLiquid && !isTransparent) {
+      const currentRoughness = pbr.roughness ?? 0;
+      pbr.roughness = Math.max(currentRoughness, isFlora ? 0.94 : 0.88);
+      pbr.environmentIntensity = Math.max(pbr.environmentIntensity, 0.9);
+    }
+
+    if (terrain.materialWetness) {
+      if (isLiquid) {
+        pbr.roughness = 0.02;
+        pbr.alpha = 0.82;
+        pbr.environmentIntensity = 1.65;
+        pbr.reflectivityColor.set(0.95, 0.95, 0.95);
+      } else if (!isTransparent && !isFlora) {
+        const currentRoughness = pbr.roughness ?? 0;
+        pbr.roughness = Math.min(currentRoughness, 0.58);
+        pbr.metallic = 0.02;
+        pbr.environmentIntensity = Math.max(pbr.environmentIntensity, 1.05);
+      }
+    }
+
+    pbr.metadata = {
+      ...(pbr.metadata || {}),
+      terrainPhase1: {
+        visualV2: terrain.visualV2,
+        materialTriplanar: terrain.materialTriplanar,
+        materialWetness: terrain.materialWetness,
+      },
+    };
+  }
+}
+
+export default async function InitDVEPBR(initData: DVEBRPBRData) {
   if (initData.textureSize) {
     EngineSettings.settings.rendererSettings.textureSize = [
       ...initData.textureSize,
@@ -31,15 +124,22 @@ export default function InitDVEPBR(initData: DVEBRPBRData) {
   if (initData.getProgress) initData.getProgress(progress);
   progress.startTask("Init PBR Renderer");
   const scene = initData.scene;
+  const activeCamera = scene.activeCamera ?? scene.cameras[0];
+  if (!activeCamera) {
+    throw new Error(
+      "InitDVEPBR requires an active camera on the scene before initialization."
+    );
+  }
+  await CreateTextures(initData.scene, initData.textureData, progress);
   scene.getEngine()!.createRenderTargetCubeTexture;
   const probe = new ReflectionProbe("", 512, initData.scene);
   initData.scene.environmentTexture = probe.cubeTexture;
   initData.scene.environmentIntensity = 1;
   const pipeline = new DefaultRenderingPipeline("atom", true, initData.scene, [
-    initData.scene.activeCamera!,
+    activeCamera,
   ]);
   const hdrTexture = new HDRCubeTexture("assets/skybox.hdr", scene, 512);
-  initData.scene.activeCamera!.maxZ = 600;
+  activeCamera.maxZ = 600;
   const postprocess = pipeline.imageProcessing;
   postprocess.toneMappingEnabled = true;
   postprocess.toneMappingType = ImageProcessingConfiguration.TONEMAPPING_ACES;
@@ -61,7 +161,7 @@ export default function InitDVEPBR(initData: DVEBRPBRData) {
  */
   LevelParticles.init(scene);
   const ssr = new SSRRenderingPipeline("ssr", initData.scene, [
-    initData.scene.activeCamera!,
+    activeCamera,
   ]);
 
   // ssr.reflectionSpecularFalloffExponent = 2;
@@ -95,7 +195,7 @@ export default function InitDVEPBR(initData: DVEBRPBRData) {
     textureData: initData.textureData,
     textureTypes: initData.textureTypes,
     substances: initData.substances,
-    afterCreate: async () => {
+    afterCreate: async (_renderer, materials) => {
       scene.ambientColor.set(1, 1, 1);
       {
         const hemLight = new HemisphericLight("", new Vector3(0, 0, 0), scene);
@@ -136,6 +236,9 @@ export default function InitDVEPBR(initData: DVEBRPBRData) {
 
       // this.shadows.blurScale = 0;
       // initData.scene.useRightHandedSystem = false;
+
+      applyTerrainPhase1RendererProfile(pipeline, ssr, sunLight);
+      applyTerrainPhase1MaterialProfile(materials);
 
       initData.scene.registerBeforeRender(() => {
         const camera = initData.scene.activeCamera;

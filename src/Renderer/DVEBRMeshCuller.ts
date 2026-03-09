@@ -2,14 +2,41 @@ import { BoundingBox } from "@babylonjs/core/Culling/boundingBox";
 import { Mesh } from "@babylonjs/core/Meshes/mesh";
 import { Scene } from "@babylonjs/core/scene";
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
+import { EngineSettings } from "@divinevoxel/vlox/Settings/EngineSettings";
 import { MeshRegister } from "@divinevoxel/vlox/Renderer/MeshRegister";
 import { WorldSpaces } from "@divinevoxel/vlox/World/WorldSpaces";
 const min = new Vector3();
 const max = new Vector3(16, 16, 16);
 const boundingBox = new BoundingBox(min, max);
-
 const addMeshes: Mesh[] = [];
 const removedMeshes: Mesh[] = [];
+
+function isTransitionGeometryMesh(mesh: Mesh) {
+  return mesh.metadata?.transitionGeometry === true;
+}
+
+function exceedsTransitionGeometryDistance(mesh: Mesh, cameraPosition: Vector3) {
+  if (!isTransitionGeometryMesh(mesh)) return false;
+
+  const minDistance = EngineSettings.settings.terrain.transitionMeshMinDistance;
+  const maxDistance = EngineSettings.settings.terrain.transitionMeshMaxDistance;
+  if (
+    (!Number.isFinite(maxDistance) || maxDistance <= 0) &&
+    (!Number.isFinite(minDistance) || minDistance <= 0)
+  ) {
+    return false;
+  }
+
+  const distance = Vector3.Distance(mesh.getBoundingInfo().boundingBox.centerWorld, cameraPosition);
+  if (Number.isFinite(minDistance) && minDistance > 0 && distance < minDistance) {
+    return true;
+  }
+  if (Number.isFinite(maxDistance) && maxDistance > 0 && distance > maxDistance) {
+    return true;
+  }
+  return false;
+}
+
 function CullSectors(scene: Scene) {
   const camera = scene.activeCamera;
   if (!camera) return;
@@ -28,6 +55,13 @@ function CullSectors(scene: Scene) {
         if (!section) continue;
         for (const [key, mesh] of section.meshes as Map<string, Mesh>) {
           if (!sectorVisible) {
+            if (mesh.isEnabled()) {
+              mesh.setEnabled(false);
+              removedMeshes.push(mesh);
+            }
+            continue;
+          }
+          if (exceedsTransitionGeometryDistance(mesh, camera.globalPosition)) {
             if (mesh.isEnabled()) {
               mesh.setEnabled(false);
               removedMeshes.push(mesh);
@@ -62,12 +96,11 @@ function CullSectors(scene: Scene) {
   }
   addMeshes.length = 0;
   removedMeshes.length = 0;
-
 }
 
 export class DVEBRMeshCuller {
   init(scene: Scene, bufferMode: "single" | "multi") {
-    scene.freezeActiveMeshes();
+    if (bufferMode === "single") return;
     scene.registerBeforeRender(() => {
       CullSectors(scene);
     });

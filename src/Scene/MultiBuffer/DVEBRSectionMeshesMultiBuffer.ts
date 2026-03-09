@@ -15,6 +15,10 @@ import {
   CompactedMeshData,
 } from "@divinevoxel/vlox/Mesher/Voxels/Geometry/CompactedSectionVoxelMesh";
 import { LocationData } from "@divinevoxel/vlox/Math";
+import {
+  getBaseMaterialId,
+  isTransitionMaterialId,
+} from "@divinevoxel/vlox/Mesher/Voxels/Models/TransitionMaterialIds";
 const min = Vector3.Zero();
 const max = new Vector3(16, 16, 16);
 const empty = new Float32Array(1);
@@ -60,7 +64,12 @@ export class DVEBRSectionMeshesMultiBuffer extends DVESectionMeshes {
         newMesh.isPickable = false;
         newMesh.checkCollisions = false;
         newMesh.doNotSerialize = true;
-        newMesh.metadata = { section: true, buffer: null };
+        newMesh.metadata = {
+          section: true,
+          buffer: null,
+          transitionGeometry: isTransitionMaterialId(subMeshMaterial),
+          baseMaterialId: getBaseMaterialId(subMeshMaterial),
+        };
         newMesh.alwaysSelectAsActiveMesh = true;
         const geometry = new Geometry(
           Geometry.RandomId(),
@@ -120,7 +129,9 @@ export class DVEBRSectionMeshesMultiBuffer extends DVESectionMeshes {
       mesh.getBoundingInfo().reConstruct(min, max, mesh.getWorldMatrix());
       mesh.freezeWorldMatrix();
 
-      mesh.material = this.renderer.materials.get(subMeshMaterial)!._material;
+      mesh.material = this.renderer.materials.get(
+        getBaseMaterialId(subMeshMaterial)
+      )!._material;
 
       section.meshes.set(subMeshMaterial, mesh);
 

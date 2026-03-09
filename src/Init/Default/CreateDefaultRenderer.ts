@@ -82,7 +82,10 @@ export async function CreateDefaultRenderer(
       scene: Scene,
       matData: NodeMaterialData
     ) => MaterialInterface;
-    afterCreate?: () => Promise<void>;
+    afterCreate?: (
+      renderer: DVEBabylonRenderer,
+      materials: MaterialInterface[]
+    ) => Promise<void>;
     progress: WorkItemProgress;
   }
 ): Promise<DVEBabylonRenderer> {
@@ -187,7 +190,7 @@ export async function CreateDefaultRenderer(
   });
 
   InitDefaultEffects();
-  initData.afterCreate && (await initData.afterCreate());
+  initData.afterCreate && (await initData.afterCreate(renderer, mats));
   progress.completeWorkItems(4);
   progress.setStatus("Done");
   await progress.wait(100);

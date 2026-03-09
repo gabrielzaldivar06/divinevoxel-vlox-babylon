@@ -69,6 +69,7 @@ in vec3 textureIndex;
 in vec2 uv;
 in vec3 colors;
 in vec4 voxelData;
+in vec4 metadata;
 ${props.attributes || ""}
 
 #ifdef INSTANCES
@@ -98,6 +99,7 @@ out vec3 vLight2;
 out vec3 vLight3;
 out vec3 vLight4;
 out vec4 vAO;
+out vec4 vMetadata;
 
 ${props.varying || ""}
 
@@ -154,6 +156,7 @@ if(animVL == 2.) {
 iUV = quadUVArray[( uint(voxelData.z) >> vertexIndex) & vertexMask];
 
 vNormal = normal;
+vMetadata = metadata;
 
 if(scene_shadeOptions.w == 1.0) {
     vColors = vec4(1.0, 1.0, 1.0, 1.0);
@@ -344,6 +347,7 @@ in vec3 vLight1;
 in vec3 vLight2;
 in vec3 vLight3;
 in vec3 vLight4;
+in vec4 vMetadata;
 
 ${props.varying || ""}
 //functions

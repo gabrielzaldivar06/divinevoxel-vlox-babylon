@@ -5,6 +5,7 @@ import {
 } from "@babylonjs/core/Materials/Textures/internalTexture";
 import { Scene } from "@babylonjs/core/scene";
 import { Texture } from "@babylonjs/core/Materials/Textures/texture";
+import { EngineSettings } from "@divinevoxel/vlox/Settings/EngineSettings";
 
 export class ImageArrayTexture extends Texture {
   width: number;
@@ -127,6 +128,8 @@ export class ImageArrayTexture extends Texture {
 
     const width = imgs[0].width;
     const height = imgs[0].height;
+    const smoothSampling =
+      EngineSettings.settings.rendererSettings.textureSize[0] > 16;
     this.width = width;
     this.height = height;
     const layers = imgs.length;
@@ -195,11 +198,15 @@ export class ImageArrayTexture extends Texture {
 
     gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(
+      gl.TEXTURE_2D_ARRAY,
+      gl.TEXTURE_MAG_FILTER,
+      smoothSampling ? gl.LINEAR : gl.NEAREST,
+    );
     gl.texParameteri(
       gl.TEXTURE_2D_ARRAY,
       gl.TEXTURE_MIN_FILTER,
-      gl.LINEAR_MIPMAP_LINEAR
+      smoothSampling ? gl.LINEAR_MIPMAP_LINEAR : gl.NEAREST_MIPMAP_LINEAR,
     );
     const anisotropicEnabled =
       gl.getExtension("EXT_texture_filter_anisotropic") ||
@@ -210,7 +217,10 @@ export class ImageArrayTexture extends Texture {
       const maxAniso = gl.getParameter(
         anisotropicEnabled.MAX_TEXTURE_MAX_ANISOTROPY_EXT
       ) as number;
-      const desired = Math.min(8, maxAniso);
+      const useReducedAnisotropy =
+        EngineSettings.settings.rendererSettings.textureSize[0] > 16 &&
+        EngineSettings.settings.terrain.transitionMeshes;
+      const desired = Math.min(useReducedAnisotropy ? 2 : 8, maxAniso);
 
       gl.texParameterf(
         gl.TEXTURE_2D_ARRAY,
@@ -252,7 +262,11 @@ export class ImageArrayTexture extends Texture {
 
     this._texture = itex;
 
-    this.updateSamplingMode(Texture.NEAREST_NEAREST_MIPNEAREST);
+    this.updateSamplingMode(
+      smoothSampling
+        ? Texture.TRILINEAR_SAMPLINGMODE
+        : Texture.NEAREST_NEAREST_MIPNEAREST,
+    );
   }
 
   copy(scene: Scene) {

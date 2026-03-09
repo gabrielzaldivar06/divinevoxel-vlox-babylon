@@ -211,6 +211,26 @@ export class BufferMesh extends Mesh {
       undefined,
       false
     );
+    geometry.setVerticesBuffer(
+      new VertexBuffer(
+        engine,
+        verticesBuffer,
+        "metadata",
+        true,
+        undefined,
+        VoxelMeshVertexStructCursor.VertexFloatSize,
+        undefined,
+        VoxelMeshVertexStructCursor.MetadataOffset,
+        4,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        false
+      ),
+      undefined,
+      false
+    );
 
     this.subMeshes = [];
   }

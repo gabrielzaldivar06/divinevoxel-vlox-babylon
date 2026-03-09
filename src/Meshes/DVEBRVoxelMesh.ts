@@ -107,6 +107,19 @@ export class DVEBRVoxelMesh {
         4
       )
     );
+    geo.setVerticesBuffer(
+      new VertexBuffer(
+        engine,
+        buffer,
+        "metadata",
+        false,
+        undefined,
+        VoxelMeshVertexStructCursor.VertexFloatSize,
+        undefined,
+        VoxelMeshVertexStructCursor.MetadataOffset,
+        4
+      )
+    );
     geo.setIndices(indices);
     return buffer;
   }

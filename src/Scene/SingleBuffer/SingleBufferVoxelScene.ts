@@ -10,9 +10,14 @@ import { VoxelLUT } from "@divinevoxel/vlox/Voxels/Data/VoxelLUT";
 import { BufferAllocation, BufferMesh } from "./Meshes/BufferMesh";
 import { SubBufferMesh } from "./Meshes/SubBufferMesh";
 import { VoxelMeshVertexStructCursor } from "@divinevoxel/vlox/Mesher/Voxels/Geometry/VoxelMeshVertexStructCursor";
+import { EngineSettings } from "@divinevoxel/vlox/Settings/EngineSettings";
 import { WorldSpaces } from "@divinevoxel/vlox/World/WorldSpaces";
 import { MeshRegister } from "@divinevoxel/vlox/Renderer/MeshRegister";
 import { VoxelSceneInterface } from "../VoxelScene.interface";
+import {
+  getBaseMaterialId,
+  isTransitionMaterialId,
+} from "@divinevoxel/vlox/Mesher/Voxels/Models/TransitionMaterialIds";
 
 const min = Vector3.Zero();
 const max = new Vector3(16, 16, 16);
@@ -26,8 +31,9 @@ export class SingleBufferVoxelScene extends VoxelSceneInterface<SubBufferMesh> {
   init(scene: Scene) {
     const multiMaterial = new MultiMaterial("Voxel Scene Material", scene);
     for (let i = 0; i < VoxelLUT.material._palette.length; i++) {
+      const materialId = VoxelLUT.material._palette[i];
       multiMaterial.subMaterials.push(
-        this.renderer.materials.get(VoxelLUT.material._palette[i])!
+        this.renderer.materials.get(getBaseMaterialId(materialId))!
           ._material
       );
     }
@@ -141,6 +147,8 @@ export class SingleBufferVoxelScene extends VoxelSceneInterface<SubBufferMesh> {
       false
       // false
     );
+    subBufferMesh.transitionGeometry = isTransitionMaterialId(data.materialId);
+    subBufferMesh.baseMaterialId = getBaseMaterialId(data.materialId);
 
     const scene = bufferMesh.voxelScene.renderer.scene;
     subBufferMesh.transform = new TransformNode("", scene) as any;
@@ -185,6 +193,10 @@ export class SingleBufferVoxelScene extends VoxelSceneInterface<SubBufferMesh> {
   beforRender() {
     const camera = this.renderer.scene.activeCamera;
     if (!camera) return;
+    const minTransitionDistance =
+      EngineSettings.settings.terrain.transitionMeshMinDistance;
+    const maxTransitionDistance =
+      EngineSettings.settings.terrain.transitionMeshMaxDistance;
 
     for (const [, dimension] of MeshRegister._dimensions) {
       for (const [, sector] of dimension) {
@@ -204,6 +216,33 @@ export class SingleBufferVoxelScene extends VoxelSceneInterface<SubBufferMesh> {
           >) {
             if (!mesh.mesh) continue;
             if (!sectorVisible) {
+              if (mesh.isEnabled()) mesh.setEnabled(false);
+              continue;
+            }
+            if (
+              mesh.transitionGeometry &&
+              (() => {
+                const distance = Vector3.Distance(
+                  mesh.mesh.getBoundingInfo().boundingBox.centerWorld,
+                  camera.globalPosition
+                );
+                if (
+                  Number.isFinite(minTransitionDistance) &&
+                  minTransitionDistance > 0 &&
+                  distance < minTransitionDistance
+                ) {
+                  return true;
+                }
+                if (
+                  Number.isFinite(maxTransitionDistance) &&
+                  maxTransitionDistance > 0 &&
+                  distance > maxTransitionDistance
+                ) {
+                  return true;
+                }
+                return false;
+              })()
+            ) {
               if (mesh.isEnabled()) mesh.setEnabled(false);
               continue;
             }

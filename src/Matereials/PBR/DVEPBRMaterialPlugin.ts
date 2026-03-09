@@ -5,6 +5,7 @@ import type { Scene } from "@babylonjs/core/scene";
 import type { UniformBuffer } from "@babylonjs/core/Materials/uniformBuffer";
 import { MaterialPluginBase } from "@babylonjs/core/Materials/materialPluginBase";
 import { DVEBRPBRMaterial } from "./DVEBRPBRMaterial";
+import { EngineSettings } from "@divinevoxel/vlox/Settings/EngineSettings";
 
 export class DVEPBRMaterialPlugin extends MaterialPluginBase {
   uniformBuffer: UniformBuffer;
@@ -123,13 +124,85 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
 
   //@ts-ignore
   getCustomCode(shaderType: any) {
+    const terrain = EngineSettings.settings.terrain;
+    const isLiquid = this.name.includes("liquid");
+    const isTransparent = this.name.includes("transparent");
+    const isGlow = this.name.includes("glow");
+    const enableVisualV2 = terrain.visualV2 && !isLiquid;
+    const enableMacroVariation = terrain.macroVariation && !isLiquid && !isTransparent && !isGlow;
+    const enableTriplanar = terrain.materialTriplanar && !isLiquid && !isTransparent;
+    const enableWetness = terrain.materialWetness && !isLiquid && !isTransparent && !isGlow;
+    const enableMicroVariation = terrain.microVariation && !isLiquid && !isTransparent;
     const textures = "";
     const varying = "";
 
-    const ignoreFunctions = ["toGammaSpace", "toLinearSpace"];
-    const functions = "";
-    const ignoreAttributes = ["position", "normal"];
     const attributes = "";
+    const functions =
+      enableVisualV2 || enableTriplanar || enableWetness
+        ? /* glsl */ `
+float dveHash13(vec3 p) {
+  p = fract(p * 0.1031);
+  p += dot(p, p.yzx + 33.33);
+  return fract((p.x + p.y) * p.z);
+}
+
+float dveNoise3(vec3 p) {
+  vec3 i = floor(p);
+  vec3 f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+
+  float n000 = dveHash13(i + vec3(0.0, 0.0, 0.0));
+  float n100 = dveHash13(i + vec3(1.0, 0.0, 0.0));
+  float n010 = dveHash13(i + vec3(0.0, 1.0, 0.0));
+  float n110 = dveHash13(i + vec3(1.0, 1.0, 0.0));
+  float n001 = dveHash13(i + vec3(0.0, 0.0, 1.0));
+  float n101 = dveHash13(i + vec3(1.0, 0.0, 1.0));
+  float n011 = dveHash13(i + vec3(0.0, 1.0, 1.0));
+  float n111 = dveHash13(i + vec3(1.0, 1.0, 1.0));
+
+  float nx00 = mix(n000, n100, f.x);
+  float nx10 = mix(n010, n110, f.x);
+  float nx01 = mix(n001, n101, f.x);
+  float nx11 = mix(n011, n111, f.x);
+  float nxy0 = mix(nx00, nx10, f.y);
+  float nxy1 = mix(nx01, nx11, f.y);
+  return mix(nxy0, nxy1, f.z);
+}
+
+float dveFbm3(vec3 p) {
+  float value = 0.0;
+  float amplitude = 0.5;
+  for (int octave = 0; octave < 4; octave++) {
+    value += dveNoise3(p) * amplitude;
+    p *= 2.02;
+    amplitude *= 0.5;
+  }
+  return value;
+}
+
+vec3 dveBlendWeights(vec3 normalDir) {
+  vec3 weights = pow(abs(normalDir), vec3(6.0));
+  return weights / max(dot(weights, vec3(1.0)), 0.0001);
+}
+
+vec4 dveProjectedColor(vec2 uv) {
+  return toLinearSpace(getBaseColor(fract(uv)));
+}
+
+float dveComputeWetness(vec3 normalDir, vec3 worldPos) {
+  float upward = clamp(normalDir.y * 0.5 + 0.5, 0.0, 1.0);
+  float drainage = 1.0 - clamp(abs(normalDir.y), 0.0, 1.0);
+  float macro = dveFbm3(worldPos * 0.045 + vec3(13.1, 0.0, -7.3));
+  return clamp(upward * 0.55 + macro * 0.35 - drainage * 0.15, 0.0, 1.0);
+}
+
+float dveEdgeMask(vec2 faceUV) {
+  vec2 centered = abs(faceUV - 0.5) * 2.0;
+  float edge = max(centered.x, centered.y);
+  return smoothstep(0.62, 0.96, edge);
+}
+`
+        : "";
     if (shaderType === "vertex") {
       return {
         CUSTOM_VERTEX_DEFINITIONS: /*glsl*/ `
@@ -137,7 +210,7 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
 const float lightGradient[16] = float[16]( 0.06, 0.1, 0.11, 0.14, 0.17, 0.21, 0.26, 0.31, 0.38, 0.45, 0.54, 0.64, 0.74, 0.85, 0.97, 1.);
 ${attributes}
 ${varying}
-${functions}
+
 #endif
 `,
         CUSTOM_VERTEX_UPDATE_NORMAL: /*glsl*/ `
@@ -180,6 +253,81 @@ ${varying}
       };
     }
     if (shaderType === "fragment") {
+      const albedoEnhancement = !isLiquid
+        ? /* glsl */ `
+vec3 dveNormalW = normalize(vNormalW);
+float dveSlope = 1.0 - abs(dveNormalW.y);
+`
+        : "";
+      const visualV2Code = enableVisualV2
+        ? /* glsl */ `
+voxelBaseColor.rgb = pow(max(voxelBaseColor.rgb, vec3(0.0)), vec3(0.94));
+`
+        : "";
+      const macroVariationCode = enableMacroVariation
+        ? /* glsl */ `
+float dveMacro = clamp(dveFbm3(vPositionW * 0.035) * 1.1, 0.0, 1.0);
+float dveMacroPatch = dveFbm3(vPositionW * 0.012 + vec3(-9.7, 5.2, 11.1));
+vec3 dveMacroTint = mix(vec3(0.86, 0.82, 0.78), vec3(1.08, 1.04, 0.98), clamp(dveMacro * 0.65 + dveMacroPatch * 0.35, 0.0, 1.0));
+voxelBaseColor.rgb *= dveMacroTint;
+`
+        : "";
+      const triplanarCode = enableTriplanar
+        ? /* glsl */ `
+vec3 dveBlend = dveBlendWeights(dveNormalW);
+vec3 dveWorldUV = vPositionW * 0.12;
+vec4 dveXColor = dveProjectedColor(dveWorldUV.yz);
+vec4 dveYColor = dveProjectedColor(dveWorldUV.xz);
+vec4 dveZColor = dveProjectedColor(dveWorldUV.xy);
+vec4 dveTriplanarColor = dveXColor * dveBlend.x + dveYColor * dveBlend.y + dveZColor * dveBlend.z;
+dveTriplanarColor = getAO(dveTriplanarColor);
+float dveTriplanarMix = smoothstep(0.18, 0.82, dveSlope) * 0.65;
+voxelBaseColor = mix(voxelBaseColor, dveTriplanarColor, dveTriplanarMix);
+`
+        : "";
+      const wetnessAlbedoCode = enableWetness
+        ? /* glsl */ `
+float dveWetnessMask = dveComputeWetness(dveNormalW, vPositionW);
+voxelBaseColor.rgb = mix(
+  voxelBaseColor.rgb,
+  voxelBaseColor.rgb * vec3(0.72, 0.76, 0.82),
+  dveWetnessMask * 0.28
+);
+`
+        : "";
+      const microVariationCode = enableMicroVariation
+        ? /* glsl */ `
+float dveMicro = dveFbm3(vPositionW * 0.42 + dveNormalW * 1.8);
+float dveMicroEdge = dveEdgeMask(fract(vPositionW.xz * 0.25 + vPositionW.y * 0.05));
+voxelBaseColor.rgb = mix(
+  voxelBaseColor.rgb,
+  voxelBaseColor.rgb * mix(vec3(0.92, 0.9, 0.88), vec3(1.08, 1.05, 1.02), dveMicro),
+  0.08
+);
+voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.84, 0.82, 0.8), dveMicroEdge * 0.05);
+`
+        : "";
+      const wetnessMicroSurfaceCode = enableWetness
+        ? /* glsl */ `
+#ifdef  DVE_${this.name}
+vec3 dveNormalW = normalize(vNormalW);
+float dveWetnessMask = dveComputeWetness(dveNormalW, vPositionW);
+microSurface = mix(microSurface, 0.96, dveWetnessMask * 0.7);
+surfaceReflectivityColor = mix(
+  surfaceReflectivityColor,
+  max(surfaceReflectivityColor, vec3(0.08, 0.08, 0.08)),
+  dveWetnessMask * 0.25
+);
+#endif
+`
+        : "";
+      const wetnessFinalCode = enableWetness
+        ? /* glsl */ `
+vec3 dveNormalW = normalize(vNormalW);
+float dveWetnessMask = dveComputeWetness(dveNormalW, vPositionW);
+finalDiffuse.rgb = mix(finalDiffuse.rgb, finalDiffuse.rgb * vec3(0.92, 0.94, 0.97), dveWetnessMask * 0.18);
+`
+        : "";
       return {
         CUSTOM_FRAGMENT_DEFINITIONS: /*glsl*/ `
 #ifdef  DVE_${this.name}
@@ -197,7 +345,12 @@ ${functions}
 #ifndef  DVE_dve_liquid
 vec4 voxelBaseColor = toLinearSpace(getBaseColor(vec2(0.,0.)));
 voxelBaseColor = getAO(voxelBaseColor);
-//vec4 voxelMixLight = vec4(vec3(VOXEL[2].rgb + 1.).xyz,1.) * voxelBaseColor;
+${albedoEnhancement}
+${visualV2Code}
+${macroVariationCode}
+${triplanarCode}
+${wetnessAlbedoCode}
+${microVariationCode}
 surfaceAlbedo = vec3(voxelBaseColor.r,voxelBaseColor.g,voxelBaseColor.b);
 alpha = voxelBaseColor.a;
 #endif
@@ -211,6 +364,9 @@ alpha = .9;
 
 
 #endif
+`,
+  CUSTOM_FRAGMENT_UPDATE_MICROSURFACE: /*glsl*/ `
+${wetnessMicroSurfaceCode}
 `,
         /* "!finalIrradiance\\*\\=surfaceAlbedo.rgb;":
 `finalIrradiance*=surfaceAlbedo.rgb;\nfinalIrradiance = vec3(VOXEL[2].rgb ) ;`, */
@@ -228,6 +384,7 @@ if(finalDiffuse.b * VOXEL[2].b > finalDiffuse.b) {
 }
 //add base color
 finalDiffuse.rgb += .01;
+${wetnessFinalCode}
 #endif
 `,
         CUSTOM_FRAGMENT_MAIN_END: /*glsl*/ `
