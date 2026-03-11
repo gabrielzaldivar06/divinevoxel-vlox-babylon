@@ -549,15 +549,15 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
 
   ssr.environmentTexture = hdrTexture as any;
   ssr.environmentTextureIsProbe = false;
-  ssr.samples = isPBRPremium ? 4 : isUniversalisInspired ? 4 : 2;
-  ssr.strength = isPBRPremium ? 0.72 : isUniversalisInspired ? 0.82 : 0.8;
-  ssr.roughnessFactor = isPBRPremium ? 0.24 : isUniversalisInspired ? 0.12 : 0.22;
+  ssr.samples = isPBRPremium ? 4 : isUniversalisInspired ? 4 : isOptimumInspired ? 4 : 2;
+  ssr.strength = isPBRPremium ? 0.72 : isUniversalisInspired ? 0.82 : isOptimumInspired ? 0.76 : 0.8;
+  ssr.roughnessFactor = isPBRPremium ? 0.24 : isUniversalisInspired ? 0.12 : isOptimumInspired ? 0.16 : 0.22;
   ssr.reflectivityThreshold = 0.12;
   ssr.selfCollisionNumSkip = 2;
-  ssr.step = isPBRPremium ? 2 : isUniversalisInspired ? 3 : 2;
-  ssr.maxSteps = isPBRPremium ? 72 : isUniversalisInspired ? 48 : 64;
+  ssr.step = isPBRPremium ? 3 : isUniversalisInspired ? 3 : isOptimumInspired ? 3 : 2;
+  ssr.maxSteps = isPBRPremium ? 52 : isUniversalisInspired ? 48 : isOptimumInspired ? 48 : 64;
   ssr.maxDistance = isPBRPremium ? 112 : isUniversalisInspired ? 128 : 128;
-  ssr.blurDownsample = isUniversalisInspired ? 2 : 1;
+  ssr.blurDownsample = isPBRPremium ? 2 : isUniversalisInspired ? 2 : isOptimumInspired ? 2 : 1;
   ssr.thickness = isPBRPremium ? 1.05 : isUniversalisInspired ? 0.96 : 0.8;
   /*   ssrPipeline.thickness = 0.1;
   ssrPipeline.selfCollisionNumSkip = 2;
@@ -622,7 +622,7 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
         // Keep this disabled until Etapa 1 can re-enable shadows without black-world startup regressions.
         sunLight.shadowEnabled = false;
       } else {
-        const shadowMapSize = isPBRPremium ? 2048 : 1024;
+        const shadowMapSize = 1024;
         const shadows = new ShadowGenerator(shadowMapSize, sunLight);
         // this.shadows.usePoissonSampling = true;
         shadows.usePercentageCloserFiltering = true;

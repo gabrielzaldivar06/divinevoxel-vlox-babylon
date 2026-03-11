@@ -299,18 +299,7 @@ vec3 dveGetVoxelLight() {
   return mix(dveBottom, dveTop, dveIUV.y);
 }
 `;
-    const functions =
-      isLiquid ||
-      enableVisualV2 ||
-      enableTriplanar ||
-      enableWetness ||
-      enableSurfaceOverlays ||
-      enableMacroVariation ||
-      enableMicroVariation ||
-      enableNearCameraHighDetail ||
-      enablePBRPremium ||
-      enableImportedMaterialMaps
-        ? /* glsl */ `
+    const functions = /* glsl */ `
 ${coreFunctions}
 
 float dveHash13(vec3 p) {
@@ -408,8 +397,7 @@ float dveCenterMask(vec2 faceUV) {
 float dveNearFieldMask(float distanceValue, float startDistance, float endDistance) {
   return 1.0 - smoothstep(startDistance, endDistance, distanceValue);
 }
-`
-  : coreFunctions;
+`;
     if (shaderType === "vertex") {
       return {
         CUSTOM_VERTEX_DEFINITIONS: /*glsl*/ `
