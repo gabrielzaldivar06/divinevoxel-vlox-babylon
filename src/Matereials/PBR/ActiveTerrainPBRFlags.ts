@@ -11,11 +11,9 @@ type TerrainFlagSettings = Record<string, unknown> & {
 };
 
 export function isUnstablePBRSurfaceContextPreset(benchmarkPreset?: string) {
-  return (
-    benchmarkPreset === "optimum-inspired" ||
-    benchmarkPreset === "universalis-inspired" ||
-    benchmarkPreset === "pbr-surface-lod"
-  );
+  // All surface features validated stable in phase-3-preview (2026-03-11).
+  // No presets need gating anymore.
+  return false;
 }
 
 export function getEffectivePBRTerrainSettings<T extends TerrainFlagSettings>(terrain: T): T {

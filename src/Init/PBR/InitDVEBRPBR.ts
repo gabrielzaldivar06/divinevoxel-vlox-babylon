@@ -215,14 +215,14 @@ function applyTerrainPhase1RendererProfile(
   }
 
   if (isUniversalisInspired) {
-    pipeline.imageProcessing.contrast = 1.06;
-    pipeline.imageProcessing.exposure = 1.18;
-    pipeline.bloomThreshold = 0.58;
-    ssr.samples = Math.max(ssr.samples, 6);
-    ssr.strength = 0.84;
-    ssr.roughnessFactor = 0.1;
-    ssr.maxDistance = Math.max(ssr.maxDistance, 144);
-    sunLight.intensity = 9.1;
+    pipeline.imageProcessing.contrast = 1.08;
+    pipeline.imageProcessing.exposure = 1.22;
+    pipeline.bloomThreshold = 0.54;
+    ssr.samples = Math.max(ssr.samples, 4);
+    ssr.strength = 0.88;
+    ssr.roughnessFactor = 0.08;
+    ssr.maxDistance = Math.max(ssr.maxDistance, 128);
+    sunLight.intensity = 9.4;
   }
 
   if (isPBRPremium) {
@@ -288,8 +288,8 @@ function applyTerrainPhase1Atmosphere(scene: Scene, isPBRPremium: boolean) {
   }
 
   if (isUniversalisInspired) {
-    scene.fogColor.set(0.56, 0.66, 0.76);
-    scene.clearColor.set(0.58, 0.7, 0.84, 1);
+    scene.fogColor.set(0.50, 0.62, 0.74);
+    scene.clearColor.set(0.52, 0.66, 0.82, 1);
     return;
   }
 
@@ -549,15 +549,15 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
 
   ssr.environmentTexture = hdrTexture as any;
   ssr.environmentTextureIsProbe = false;
-  ssr.samples = isPBRPremium ? 4 : isUniversalisInspired ? 6 : 2;
+  ssr.samples = isPBRPremium ? 4 : isUniversalisInspired ? 4 : 2;
   ssr.strength = isPBRPremium ? 0.72 : isUniversalisInspired ? 0.82 : 0.8;
   ssr.roughnessFactor = isPBRPremium ? 0.24 : isUniversalisInspired ? 0.12 : 0.22;
   ssr.reflectivityThreshold = 0.12;
   ssr.selfCollisionNumSkip = 2;
-  ssr.step = 2;
-  ssr.maxSteps = isPBRPremium ? 72 : isUniversalisInspired ? 84 : 64;
-  ssr.maxDistance = isPBRPremium ? 112 : isUniversalisInspired ? 144 : 128;
-  ssr.blurDownsample = 1;
+  ssr.step = isPBRPremium ? 2 : isUniversalisInspired ? 3 : 2;
+  ssr.maxSteps = isPBRPremium ? 72 : isUniversalisInspired ? 48 : 64;
+  ssr.maxDistance = isPBRPremium ? 112 : isUniversalisInspired ? 128 : 128;
+  ssr.blurDownsample = isUniversalisInspired ? 2 : 1;
   ssr.thickness = isPBRPremium ? 1.05 : isUniversalisInspired ? 0.96 : 0.8;
   /*   ssrPipeline.thickness = 0.1;
   ssrPipeline.selfCollisionNumSkip = 2;
@@ -622,7 +622,8 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
         // Keep this disabled until Etapa 1 can re-enable shadows without black-world startup regressions.
         sunLight.shadowEnabled = false;
       } else {
-        const shadows = new ShadowGenerator(2048, sunLight);
+        const shadowMapSize = isPBRPremium ? 2048 : 1024;
+        const shadows = new ShadowGenerator(shadowMapSize, sunLight);
         // this.shadows.usePoissonSampling = true;
         shadows.usePercentageCloserFiltering = true;
 

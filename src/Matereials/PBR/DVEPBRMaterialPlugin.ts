@@ -56,6 +56,7 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
   prepareDefines(defines: any) {
     defines[`DVE_${this.name}`] = true;
     defines.UV1 = true;
+    defines.NORMAL = true;
   }
 
   getClassName() {
@@ -74,7 +75,7 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
 
   getUniforms() {
     return {
-      ubo: [{ name: "dve_voxel_animation_size" }],
+      ubo: [{ name: "dve_voxel_animation_size" }, { name: "dve_time" }],
     };
   }
 
@@ -168,6 +169,7 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
     for (const [uniformId, size] of this.dveMaterial.animationSizes) {
       effect.setInt(uniformId, size);
     }
+    effect.setFloat("dve_time", performance.now() * 0.001);
   }
 
   //@ts-ignore
@@ -298,7 +300,7 @@ vec3 dveGetVoxelLight() {
 }
 `;
     const functions =
-      !isLiquid ||
+      isLiquid ||
       enableVisualV2 ||
       enableTriplanar ||
       enableWetness ||
@@ -415,6 +417,7 @@ float dveNearFieldMask(float distanceValue, float startDistance, float endDistan
 const float lightGradient[16] = float[16]( 0.06, 0.1, 0.11, 0.14, 0.17, 0.21, 0.26, 0.31, 0.38, 0.45, 0.54, 0.64, 0.74, 0.85, 0.97, 1.);
 uniform highp usampler2D dve_voxel_animation;
 uniform highp int dve_voxel_animation_size;
+uniform float dve_time;
 ${attributes}
 ${varying}
 
@@ -472,9 +475,16 @@ vec3 dveDecodeLightValue(uint value) {
   dveIUV = dveQuadUVArray[(uint(voxelData.z) >> dveVertexIndex) & dveVertexMask];
   ${enableSurfaceMetadata ? "dveMetadata = metadata;" : ""}
 
-
 #endif
         `,
+        CUSTOM_VERTEX_UPDATE_POSITION: /*glsl*/ `
+${isLiquid ? `
+  float dveWaveA = sin(position.x * 1.8 + dve_time * 1.2) * 0.04;
+  float dveWaveB = sin(position.z * 2.4 + dve_time * 0.9 + 1.7) * 0.03;
+  float dveWaveC = sin((position.x + position.z) * 1.1 + dve_time * 1.6) * 0.02;
+  positionUpdated.y += dveWaveA + dveWaveB + dveWaveC;
+` : ""}
+`,
       };
     }
     if (shaderType === "fragment") {
@@ -730,12 +740,16 @@ vec3 dveVoxelLight = dveGetVoxelLight();
       finalDiffuse.rgb *= mix(vec3(1.0), dveVoxelLight, ${voxelLightMix.toFixed(2)});
 finalDiffuse.rgb += dveVoxelLight * 0.02;
 `
-        : "";
+        : /* glsl */ `
+vec3 dveVoxelLight = dveGetVoxelLight();
+finalDiffuse.rgb *= mix(vec3(1.0), dveVoxelLight, 0.22);
+`;
       return {
         CUSTOM_FRAGMENT_DEFINITIONS: /*glsl*/ `
 #ifdef  DVE_${this.name}
 precision highp sampler2DArray;
 const float lightGradient[16] = float[16]( 0.06, 0.1, 0.11, 0.14, 0.17, 0.21, 0.26, 0.31, 0.38, 0.45, 0.54, 0.64, 0.74, 0.85, 0.97, 1.);
+uniform float dve_time;
 ${textures}
 ${varying}
 ${functions}
@@ -784,9 +798,25 @@ if (dveOverlayTextureIndex.x > 0.) {
   vec4 oRGB = texture(dve_voxel, vec3(dveBaseUV, dveOverlayTextureIndex.x));
   if (oRGB.a > 0.5) dveLiquidSample = oRGB;
 }
-vec4 voxelBaseColor = ${benchmarkPreset === "material-import" ? "vec4(0.18, 0.44, 0.68, 1.0)" : "vec4(dveLiquidSample.rgb, 1.) * vec4(.2, .58, .79, 1.)"};
-surfaceAlbedo = toLinearSpace(vec3(voxelBaseColor.r,voxelBaseColor.g,voxelBaseColor.b));
-alpha = ${benchmarkPreset === "material-import" ? "1.0" : ".9"};
+// Dual-normal scrolling for wave detail
+vec2 dveWaterUV1 = vPositionW.xz * 0.08 + vec2(dve_time * 0.03, dve_time * 0.02);
+vec2 dveWaterUV2 = vPositionW.xz * 0.12 + vec2(-dve_time * 0.025, dve_time * 0.035);
+float dveWaveN1 = dveNoise3(vec3(dveWaterUV1 * 8.0, dve_time * 0.4)) * 2.0 - 1.0;
+float dveWaveN2 = dveNoise3(vec3(dveWaterUV2 * 6.0, dve_time * 0.3 + 5.0)) * 2.0 - 1.0;
+float dveDualWave = (dveWaveN1 + dveWaveN2) * 0.5;
+// Absorption tinting — deeper water gets darker and bluer
+float dveWaterDepthFactor = clamp((64.0 - vPositionW.y) * 0.02, 0.0, 1.0);
+vec3 dveShallowColor = vec3(0.22, 0.52, 0.72);
+vec3 dveDeepColor = vec3(0.06, 0.18, 0.34);
+vec3 dveAbsorptionColor = mix(dveShallowColor, dveDeepColor, dveWaterDepthFactor);
+// Blend texture with absorption-tinted water
+vec3 dveLiquidColor = mix(dveLiquidSample.rgb * vec3(0.3, 0.6, 0.82), dveAbsorptionColor, 0.6);
+// Micro-shimmer from wave interaction
+float dveShimmer = dveDualWave * 0.08 + 0.04;
+dveLiquidColor += vec3(dveShimmer * 0.3, dveShimmer * 0.4, dveShimmer * 0.5);
+vec4 voxelBaseColor = vec4(dveLiquidColor, 1.0);
+surfaceAlbedo = toLinearSpace(voxelBaseColor.rgb);
+alpha = ${benchmarkPreset === "material-import" ? "1.0" : "mix(0.82, 0.92, dveWaterDepthFactor)"};
 
 #endif
 
@@ -799,6 +829,15 @@ ${importedMaterialMicroSurfaceCode}
 `,
   CUSTOM_FRAGMENT_BEFORE_LIGHTS: /*glsl*/ `
 ${importedMaterialBeforeLightsCode}
+#ifdef DVE_dve_liquid
+{
+  vec2 dveBL_uv1 = vPositionW.xz * 0.08 + vec2(dve_time * 0.03, dve_time * 0.02);
+  vec2 dveBL_uv2 = vPositionW.xz * 0.12 + vec2(-dve_time * 0.025, dve_time * 0.035);
+  float dveBL_n1 = dveNoise3(vec3(dveBL_uv1 * 8.0, dve_time * 0.4)) * 2.0 - 1.0;
+  float dveBL_n2 = dveNoise3(vec3(dveBL_uv2 * 6.0, dve_time * 0.3 + 5.0)) * 2.0 - 1.0;
+  normalW = normalize(normalW + vec3(dveBL_n1 * 0.12, 0.0, dveBL_n2 * 0.12));
+}
+#endif
 `,
         /* "!finalIrradiance\\*\\=surfaceAlbedo.rgb;":
 `finalIrradiance*=surfaceAlbedo.rgb;\nfinalIrradiance = vec3(VOXEL[2].rgb ) ;`, */
