@@ -744,6 +744,37 @@ finalDiffuse.rgb += dveVoxelLight * 0.02;
 vec3 dveVoxelLight = dveGetVoxelLight();
 finalDiffuse.rgb *= mix(vec3(1.0), dveVoxelLight, 0.22);
 `;
+
+      const liquidSSSCode = isLiquid
+        ? /* glsl */ `
+#ifdef DVE_dve_liquid
+{
+  // --- Sub-surface scattering approximation ---
+  float dveSSSfresnel = 1.0 - max(dot(viewDirectionW, normalW), 0.0);
+  float dveSSSedge = pow(dveSSSfresnel, 3.0);
+  float dveSSSdepth = clamp((64.0 - vPositionW.y) * 0.02, 0.0, 1.0);
+  float dveSSSthickness = 1.0 - dveSSSdepth;
+  vec3 dveSSScolor = vec3(0.04, 0.14, 0.22);
+  float dveSSSintensity = dveSSSedge * 0.28 + dveSSSthickness * 0.08;
+  finalDiffuse.rgb += dveSSScolor * dveSSSintensity;
+  finalDiffuse.rgb += vec3(0.02, 0.06, 0.1) * dveSSSedge * 0.4;
+
+  // --- Refraction depth approximation ---
+  float dveViewDot = max(dot(viewDirectionW, vec3(0.0, 1.0, 0.0)), 0.0);
+  float dveRefrDepth = (1.0 - dveViewDot) * dveSSSdepth * 0.15;
+  finalDiffuse.rgb *= 1.0 - dveRefrDepth;
+
+  // --- Caustics ---
+  vec2 dveCaustUV = vPositionW.xz * 0.15 + vec2(dve_time * 0.04, dve_time * 0.03);
+  float dveCaust = dveNoise3(vec3(dveCaustUV * 5.0, dve_time * 0.5));
+  dveCaust = pow(dveCaust, 2.8) * 1.6;
+  float dveCaustMask = dveSSSthickness * dveViewDot;
+  finalDiffuse.rgb += vec3(0.06, 0.1, 0.12) * dveCaust * dveCaustMask;
+}
+#endif
+`
+        : "";
+
       return {
         CUSTOM_FRAGMENT_DEFINITIONS: /*glsl*/ `
 #ifdef  DVE_${this.name}
@@ -846,6 +877,7 @@ ${importedMaterialBeforeLightsCode}
 finalDiffuse.rgb += .01;
       ${voxelLightFinalCode}
 ${wetnessFinalCode}
+${liquidSSSCode}
 #endif
 `,
         CUSTOM_FRAGMENT_MAIN_END: /*glsl*/ `
