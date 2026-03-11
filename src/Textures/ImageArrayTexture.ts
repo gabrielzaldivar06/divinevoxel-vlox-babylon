@@ -128,7 +128,10 @@ export class ImageArrayTexture extends Texture {
 
     const width = imgs[0].width;
     const height = imgs[0].height;
+    const sharpTextureSampling =
+      EngineSettings.settings.rendererSettings.sharpTextureSampling === true;
     const smoothSampling =
+      !sharpTextureSampling &&
       EngineSettings.settings.rendererSettings.textureSize[0] > 16;
     this.width = width;
     this.height = height;
@@ -221,7 +224,9 @@ export class ImageArrayTexture extends Texture {
       const useReducedAnisotropy =
         textureSize > 16 && EngineSettings.settings.terrain.transitionMeshes;
       const desired = Math.min(
-        textureSize > 32 && EngineSettings.settings.terrain.transitionMeshes
+        sharpTextureSampling
+          ? 1
+          : textureSize > 32 && EngineSettings.settings.terrain.transitionMeshes
           ? 1
           : useReducedAnisotropy
             ? 2

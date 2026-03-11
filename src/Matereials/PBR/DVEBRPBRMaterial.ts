@@ -1,6 +1,7 @@
 import { Material } from "@babylonjs/core/Materials/material";
 import { PBRBaseMaterial } from "@babylonjs/core/Materials/PBR/pbrBaseMaterial";
 import { Scene } from "@babylonjs/core/scene";
+import { RawTexture } from "@babylonjs/core/Materials/Textures/rawTexture";
 import { Texture } from "@babylonjs/core/Materials/Textures/texture";
 import { PBRMaterial } from "@babylonjs/core/Materials/PBR/pbrMaterial";
 import { Vector3, Vector4 } from "@babylonjs/core/Maths/";
@@ -8,6 +9,33 @@ import { DVEPBRMaterialPlugin } from "./DVEPBRMaterialPlugin";
 import { IMatrixLike } from "@babylonjs/core/Maths/math.like";
 import { MaterialData, MaterialInterface } from "../MaterialInterface.js";
 import { SceneOptions } from "../../Scene/SceneOptions";
+import { TextureManager } from "@divinevoxel/vlox/Textures/TextureManager.js";
+import { EngineSettings } from "@divinevoxel/vlox/Settings/EngineSettings.js";
+import {
+  applyActiveTerrainMaterialProfiles,
+  classifyTerrainMaterial,
+} from "./MaterialFamilyProfiles";
+
+const neutralDetailTextures = new WeakMap<Scene, RawTexture>();
+
+function getNeutralDetailTexture(scene: Scene) {
+  const cached = neutralDetailTextures.get(scene);
+  if (cached) {
+    return cached;
+  }
+
+  const texture = RawTexture.CreateRGBATexture(
+    new Uint8Array([128, 128, 255, 128]),
+    1,
+    1,
+    scene,
+    false,
+    false,
+    Texture.NEAREST_NEAREST_MIPLINEAR
+  );
+  neutralDetailTextures.set(scene, texture);
+  return texture;
+}
 
 export type DVEBRPBRMaterialData = MaterialData<{
   textureTypeId: string;
@@ -24,6 +52,8 @@ export class DVEBRPBRMaterial implements MaterialInterface {
   scene: Scene;
 
   plugin: DVEPBRMaterialPlugin;
+  animationSizes = new Map<string, number>();
+  static importedMaterialMapSamplerIds = ["dve_voxel_normal", "dve_voxel_material"] as const;
 
   afterCreate: ((material: PBRMaterial) => void)[] = [];
   constructor(
@@ -41,22 +71,31 @@ export class DVEBRPBRMaterial implements MaterialInterface {
   _create(data: DVEBRPBRMaterialData): PBRMaterial {
     this.scene = data.scene;
 
-    const material = new PBRMaterial(this.id, data.scene);
-    let synced = false;
-    material.onBind = () => {
-      const effect = this._material.getEffect();
+    if (this.data.data.material && this.data.data.textures) {
+      this._material = this.data.data.material as PBRMaterial;
+      this.textures = this.data.data.textures;
+      this.plugin = this.data.data.plugin!;
+      return this._material;
+    }
 
-      /*      if (this?.texture) {
-   
+    let texture;
+    let animationTexture;
+    if (data.data.textureTypeId) {
+      texture = TextureManager.getTexture(
+        data.data.textureTypeId ? data.data.textureTypeId : this.id
+      );
 
-          effect.setTexture(
-            this.texture.textureID,
-            this.texture.shaderTexture!._texture
-          );
-        
+      if (!texture && data.data.textureTypeId) {
+        throw new Error(
+          `Could find the texture type for material ${this.id}. Texture typeid:  ${data.data.textureTypeId}`
+        );
       }
- */
-    };
+      animationTexture = texture.animatedTexture;
+    }
+
+    const extraTextureTypes = [...DVEBRPBRMaterial.importedMaterialMapSamplerIds];
+
+    const material = new PBRMaterial(this.id, data.scene);
     const pluginId = `${this.id.replace("#", "")}`;
 
     const pluginBase = DVEPBRMaterialPlugin;
@@ -97,9 +136,17 @@ export class DVEBRPBRMaterial implements MaterialInterface {
       material.alpha = 0.7;
     } else {
       material.metallic = 0.0;
-      material.roughness = 0;
-      material.reflectionColor.set(0, 0, 0);
+      material.roughness = 0.92;
+      material.reflectionColor.set(0.45, 0.45, 0.45);
+      material.reflectivityColor.set(0.04, 0.04, 0.04);
+      material.environmentIntensity = 0.45;
+      material.directIntensity = 1;
+      material.backFaceCulling = false;
+      material.twoSidedLighting = true;
+      material.forceNormalForward = true;
     }
+    (material as any).useVertexColors = false;
+    (material as any).hasVertexAlpha = false;
     material.emissiveColor;
     // material.sheen.isEnabled = false;
     // material.sheen.intensity = 0;
@@ -107,9 +154,66 @@ export class DVEBRPBRMaterial implements MaterialInterface {
     // material.ambientColor.set(0,0,0);
     material.anisotropy.dispose();
 
+    if (texture) {
+      this.textures.set(texture.id, texture.shaderTexture!);
+      this.textures.set(
+        `${texture.id}_animation`,
+        animationTexture!.shaderTexture!
+      );
+      this.animationSizes.set(
+        `${texture.id}_animation_size`,
+        animationTexture!._size
+      );
+    }
+
+    for (const textureType of extraTextureTypes) {
+      try {
+        const extraTexture = TextureManager.getTexture(textureType);
+        if (!extraTexture.shaderTexture) continue;
+        this.textures.set(extraTexture.id, extraTexture.shaderTexture);
+      } catch {
+        // Extra material maps are optional and only exist for specific benchmarks.
+      }
+    }
+
+    if (this.shouldUseImportedMaterialMaps()) {
+      material.detailMap.texture = getNeutralDetailTexture(this.scene);
+      material.detailMap.isEnabled = true;
+      material.detailMap.diffuseBlendLevel = 0;
+      material.detailMap.roughnessBlendLevel = 0;
+      material.detailMap.bumpLevel = 1;
+      material.forceIrradianceInFragment = true;
+    }
+
+    applyActiveTerrainMaterialProfiles(material, this.id, EngineSettings.settings.terrain);
+
+    material.markAsDirty(Material.AllDirtyFlag);
+
     //  material.wireframe = true;
     //  material.refraction.set(0.1,0.1,0.1);
     return this._material;
+  }
+
+  hasImportedMaterialMaps() {
+    return DVEBRPBRMaterial.importedMaterialMapSamplerIds.every((samplerId) => {
+      return this.textures.has(samplerId);
+    });
+  }
+
+  shouldUseImportedMaterialMaps() {
+    const classification = classifyTerrainMaterial(this.id);
+    return (
+      this.hasImportedMaterialMaps() &&
+      !classification.isLiquid &&
+      !classification.isTransparent &&
+      !classification.isGlow &&
+      !classification.isFlora &&
+      (classification.isRock ||
+        classification.isSoil ||
+        classification.isWood ||
+        classification.isCultivated ||
+        classification.isExotic)
+    );
   }
 
   setTextureArray(samplerId: string, sampler: Texture[]): void {
@@ -117,13 +221,16 @@ export class DVEBRPBRMaterial implements MaterialInterface {
   }
   textures = new Map<string, Texture>();
   setTexture(samplerId: string, sampler: Texture): void {
-    if (!this.plugin.uniformBuffer) return;
-    this.plugin.uniformBuffer.setTexture(samplerId, sampler);
+    if (this.plugin.uniformBuffer) {
+      this.plugin.uniformBuffer.setTexture(samplerId, sampler);
+    }
     this.textures.set(samplerId, sampler);
   }
   clone(scene: Scene) {
-    for (const [textId, texture] of this.textures) {
-      this.plugin.uniformBuffer.setTexture(textId, null);
+    for (const [textId] of this.textures) {
+      if (this.plugin.uniformBuffer) {
+        this.plugin.uniformBuffer.setTexture(textId, null);
+      }
     }
     const pluginId = `${this.id.replace("#", "")}`;
 
@@ -154,8 +261,12 @@ export class DVEBRPBRMaterial implements MaterialInterface {
     for (const [textId, texture] of this.textures) {
       const newTexture = texture.clone();
       textures.set(textId, newTexture);
-      plugin.uniformBuffer.setTexture(textId, newTexture);
-      this.plugin.uniformBuffer.setTexture(textId, texture!);
+      if (plugin.uniformBuffer) {
+        plugin.uniformBuffer.setTexture(textId, newTexture);
+      }
+      if (this.plugin.uniformBuffer) {
+        this.plugin.uniformBuffer.setTexture(textId, texture!);
+      }
     }
 
     const mat = new DVEBRPBRMaterial(this.options, this.id, {
@@ -170,6 +281,7 @@ export class DVEBRPBRMaterial implements MaterialInterface {
     mat.plugin = plugin;
     mat._material = newMat;
     mat.textures = textures;
+    mat.animationSizes = new Map(this.animationSizes);
     return mat;
   }
 

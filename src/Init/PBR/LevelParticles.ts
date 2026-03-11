@@ -8,6 +8,7 @@ import { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { Color4 } from "@babylonjs/core/Maths/math.color";
 import type { Mesh } from "@babylonjs/core/Meshes/mesh";
 import { CreateBox } from "@babylonjs/core/Meshes/Builders/boxBuilder";
+import type { Observer } from "@babylonjs/core/Misc/observable";
 
 
 export class LevelParticles {
@@ -16,16 +17,14 @@ export class LevelParticles {
   static activeParticles: ParticleSystem | GPUParticleSystem;
   static texture: Texture;
   static scene: Scene;
+  static cameraObserver?: Observer<Scene>;
   static init(scene: Scene) {
-    // Create a particle system
     this.scene = scene;
     const box = CreateBox("", { size: 1 }, scene);
-    box.parent = scene.activeCamera!;
     this.emitter = box;
     box.isVisible = false;
-    box.position.y = 200;
+    box.alwaysSelectAsActiveMesh = false;
 
-    //Texture of each particle
     const texture = new Texture(
       "assets/particle.png",
       scene,
@@ -47,49 +46,37 @@ export class LevelParticles {
     if (GPUParticleSystem.IsSupported) {
       particleSystem = new GPUParticleSystem(
         "particles",
-        { capacity: 4_000, randomTextureSize: 4096 },
+        { capacity: 2_500, randomTextureSize: 2048 },
         scene
       );
     } else {
-      particleSystem = new ParticleSystem("paritcles", 2000, scene);
+      particleSystem = new ParticleSystem("paritcles", 1400, scene);
     }
     this.particle = particleSystem;
 
     particleSystem.particleTexture = this.texture;
-
-    // particleSystem.translationPivot = new Vector3(0, 100,0);
-    particleSystem.translationPivot.set(0, 100);
-    // Where the particles come from
-    // ps1.emitter = fountain; // the starting object, the emitter
     particleSystem.emitter = this.emitter;
-    particleSystem.minEmitBox = new Vector3(-0.3, 0, 0); // Starting all from
-    particleSystem.maxEmitBox = new Vector3(0.3, 0, 0); // To...
+    particleSystem.minEmitBox = new Vector3(-2, -1, -2);
+    particleSystem.maxEmitBox = new Vector3(2, 1, 2);
 
     particleSystem.blendMode = ParticleSystem.BLENDMODE_STANDARD;
 
-    // Colors of all particles
-    particleSystem.color1 = new Color4(0, 1, 1, 1.0);
-    particleSystem.color2 = new Color4(1, 0, 1, 1.0);
-    particleSystem.colorDead = new Color4(0, 1, 1, 0.5);
+    particleSystem.color1 = new Color4(0.89, 0.85, 0.68, 0.28);
+    particleSystem.color2 = new Color4(0.61, 0.78, 0.56, 0.2);
+    particleSystem.colorDead = new Color4(0.44, 0.52, 0.35, 0);
 
-    // Size of each particle (random between...
-    particleSystem.minSize = 0.2;
-    particleSystem.maxSize = 0.7;
+    particleSystem.minSize = 0.35;
+    particleSystem.maxSize = 1.15;
 
-    // Life time of each particle (random between...
-    particleSystem.minLifeTime = 50;
-    particleSystem.maxLifeTime = 100;
+    particleSystem.minLifeTime = 10;
+    particleSystem.maxLifeTime = 18;
 
-    // Emission rate
-    particleSystem.emitRate = 600;
-    // ps1.manualEmitCount = 100;
+    particleSystem.emitRate = 120;
 
-    // Set the gravity of all particles
-    particleSystem.gravity = new Vector3(0, -1, 0);
+    particleSystem.gravity = new Vector3(0, -0.015, 0);
 
-    // Direction of each particle after it has been emitted
-    particleSystem.direction1 = new Vector3(-0.5, -1, 1);
-    particleSystem.direction2 = new Vector3(0.5, 10, 10);
+    particleSystem.direction1 = new Vector3(-0.3, -0.04, 0.24);
+    particleSystem.direction2 = new Vector3(0.3, 0.1, 0.56);
 
     particleSystem.isAnimationSheetEnabled = true;
     particleSystem.spriteCellHeight = 32;
@@ -99,28 +86,38 @@ export class LevelParticles {
     particleSystem.endSpriteCellID = 3;
     particleSystem.spriteCellChangeSpeed = 0;
 
-    // Angular speed, in radians
-    particleSystem.minAngularSpeed = 0;
-    particleSystem.maxAngularSpeed = Math.PI * 0.5;
+    particleSystem.minAngularSpeed = -Math.PI * 0.04;
+    particleSystem.maxAngularSpeed = Math.PI * 0.04;
 
 
     const customEmitter = new CustomParticleEmitter();
     customEmitter.particlePositionGenerator = (index, particle, out) => {
-      out.x = Math.random() * 500 * (Math.random() > 0.5 ? 1 : -1);
-      out.y = 100 + Math.random() * 200; // Higher starting point
-      out.z = Math.random() * 500 * (Math.random() > 0.5 ? 1 : -1);
-
+      out.x = (Math.random() - 0.5) * 56;
+      out.y = 2 + Math.random() * 18;
+      out.z = (Math.random() - 0.5) * 56;
     };
     customEmitter.particleDestinationGenerator = (index, particle, out) => {
-      out.x = Math.random() * 500 * (Math.random() > 0.5 ? 1 : -1);
-      out.y = -100;
-      out.z = Math.random() * 500 * (Math.random() > 0.5 ? 1 : -1);
+      out.x = out.x + (Math.random() - 0.5) * 18;
+      out.y = -8 + Math.random() * 6;
+      out.z = out.z + 18 + Math.random() * 16;
     };
     particleSystem.particleEmitterType = customEmitter;
-    // Speed
-    particleSystem.minEmitPower = 0.1;
-    particleSystem.maxEmitPower = 1;
+    particleSystem.minEmitPower = 0.2;
+    particleSystem.maxEmitPower = 0.5;
     return particleSystem;
+  }
+
+  static _bindEmitterToCamera() {
+    if (this.cameraObserver) {
+      this.scene.onBeforeRenderObservable.remove(this.cameraObserver);
+      this.cameraObserver = undefined;
+    }
+    this.cameraObserver = this.scene.onBeforeRenderObservable.add(() => {
+      const camera = this.scene.activeCamera;
+      if (!camera) return;
+      this.emitter.position.copyFrom(camera.globalPosition);
+      this.emitter.position.y += 6;
+    });
   }
 
   static start(
@@ -132,14 +129,35 @@ export class LevelParticles {
       this.stop();
     }
     this.activeParticles = this._getParticleSystem();
+    this._bindEmitterToCamera();
     this.activeParticles.color1.copyFrom(color1);
     this.activeParticles.color2.copyFrom(color2);
     this.activeParticles.colorDead.copyFrom(colorDead);
     this.activeParticles.start();
   }
 
+  static startNatureAmbient(profile: "lush" | "premium" = "lush") {
+    const colors =
+      profile === "premium"
+        ? {
+            color1: new Color4(0.92, 0.88, 0.7, 0.24),
+            color2: new Color4(0.68, 0.79, 0.58, 0.18),
+            dead: new Color4(0.52, 0.57, 0.46, 0),
+          }
+        : {
+            color1: new Color4(0.82, 0.92, 0.68, 0.2),
+            color2: new Color4(0.58, 0.76, 0.5, 0.16),
+            dead: new Color4(0.46, 0.56, 0.38, 0),
+          };
+    this.start(colors.color1, colors.color2, colors.dead);
+  }
+
   static stop() {
     if (!this.activeParticles) return;
+    if (this.cameraObserver) {
+      this.scene.onBeforeRenderObservable.remove(this.cameraObserver);
+      this.cameraObserver = undefined;
+    }
     this.activeParticles.stop();
     this.activeParticles.dispose(false);
   }

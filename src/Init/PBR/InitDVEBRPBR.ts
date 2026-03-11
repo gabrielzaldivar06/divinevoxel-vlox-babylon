@@ -7,15 +7,16 @@ import {
 import { CreateBox } from "@babylonjs/core/Meshes/Builders/boxBuilder";
 import { DirectionalLight } from "@babylonjs/core/Lights/directionalLight";
 import { HemisphericLight } from "@babylonjs/core/Lights/hemisphericLight";
-import { ReflectionProbe } from "@babylonjs/core/Probes/reflectionProbe";
 import { ShadowGenerator } from "@babylonjs/core/Lights/Shadows/shadowGenerator";
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { SSRRenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPipeline/Pipelines/ssrRenderingPipeline";
 import { ImageProcessingConfiguration } from "@babylonjs/core/Materials/imageProcessingConfiguration";
+import { Material } from "@babylonjs/core/Materials/material";
 import { DefaultRenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPipeline/Pipelines/defaultRenderingPipeline";
 import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
 import { Texture } from "@babylonjs/core/Materials/Textures/texture";
 import { HDRCubeTexture } from "@babylonjs/core/Materials/Textures/hdrCubeTexture";
+import { Scene } from "@babylonjs/core/scene";
 import "@babylonjs/core/Lights/Shadows/shadowGeneratorSceneComponent";
 import "@babylonjs/core/Rendering/depthRendererSceneComponent";
 import "@babylonjs/core/Rendering/geometryBufferRendererSceneComponent";
@@ -25,9 +26,135 @@ import { LevelParticles } from "./LevelParticles";
 import { WorkItemProgress } from "@divinevoxel/vlox/Util/WorkItemProgress";
 import { EngineSettings } from "@divinevoxel/vlox/Settings/EngineSettings";
 import { MaterialInterface } from "../../Matereials/MaterialInterface";
+import { InitSkybox } from "../Skybox/InitSkybox";
+import {
+  applyActiveTerrainMaterialProfiles,
+  classifyTerrainMaterial,
+} from "../../Matereials/PBR/MaterialFamilyProfiles";
 export type DVEBRPBRData = DVEBRDefaultMaterialBaseData & {
   getProgress?: (progress: WorkItemProgress) => void;
 };
+
+function applyTerrainPhase1SkyProfile(renderer: Awaited<ReturnType<typeof CreateDefaultRenderer>>) {
+  const terrain = EngineSettings.settings.terrain;
+  const isPBRPremium = terrain.benchmarkPreset === "pbr-premium";
+  const isMaterialImport = terrain.benchmarkPreset === "material-import";
+  const isOptimumInspired = terrain.benchmarkPreset === "optimum-inspired";
+  const isUniversalisInspired = terrain.benchmarkPreset === "universalis-inspired";
+
+  renderer.sceneOptions.shade.doSun = true;
+  renderer.sceneOptions.shade.doRGB = true;
+  renderer.sceneOptions.shade.doAO = true;
+  renderer.sceneOptions.shade.doColor = true;
+  renderer.sceneOptions.levels.baseLevel = 0.2;
+  renderer.sceneOptions.levels.sunLevel = 1;
+  renderer.sceneOptions.fog.setColor(255, 255, 255);
+  renderer.sceneOptions.fog.heightFactor = 0.25;
+  renderer.sceneOptions.sky.setColor(130, 174, 255);
+  renderer.sceneOptions.sky.horizonStart = 0;
+  renderer.sceneOptions.sky.horizon = 64;
+  renderer.sceneOptions.sky.horizonEnd = 120;
+  renderer.sceneOptions.sky.startBlend = 100;
+  renderer.sceneOptions.sky.endBlend = 150;
+
+  if (terrain.visualV2) {
+    renderer.sceneOptions.sky.setColor(186, 214, 255);
+    renderer.sceneOptions.levels.baseLevel = 0.3;
+  }
+
+  if (terrain.macroVariation) {
+    renderer.sceneOptions.fog.heightFactor = Math.max(
+      renderer.sceneOptions.fog.heightFactor,
+      0.32
+    );
+  }
+
+  if (terrain.materialTriplanar) {
+    renderer.sceneOptions.fog.setColor(255, 228, 204);
+    renderer.sceneOptions.fog.heightFactor = 0.4;
+  }
+
+  if (terrain.materialWetness) {
+    renderer.sceneOptions.sky.setColor(86, 118, 168);
+    renderer.sceneOptions.fog.setColor(132, 154, 196);
+    renderer.sceneOptions.levels.baseLevel = 0.12;
+  }
+
+  if (terrain.surfaceOverlays) {
+    renderer.sceneOptions.fog.heightFactor = Math.max(
+      renderer.sceneOptions.fog.heightFactor,
+      0.45
+    );
+  }
+
+  if (terrain.nearCameraHighDetail) {
+    renderer.sceneOptions.levels.baseLevel = Math.max(
+      renderer.sceneOptions.levels.baseLevel,
+      0.18
+    );
+  }
+
+  if (terrain.microVariation) {
+    renderer.sceneOptions.levels.baseLevel = Math.max(
+      renderer.sceneOptions.levels.baseLevel,
+      0.22
+    );
+  }
+
+  if (isMaterialImport) {
+    renderer.sceneOptions.levels.baseLevel = Math.max(
+      renderer.sceneOptions.levels.baseLevel,
+      0.24
+    );
+    renderer.sceneOptions.fog.heightFactor = Math.max(
+      renderer.sceneOptions.fog.heightFactor,
+      0.3
+    );
+  }
+
+  if (isOptimumInspired) {
+    renderer.sceneOptions.sky.setColor(176, 205, 246);
+    renderer.sceneOptions.fog.setColor(255, 230, 208);
+    renderer.sceneOptions.fog.heightFactor = Math.max(
+      renderer.sceneOptions.fog.heightFactor,
+      0.44
+    );
+    renderer.sceneOptions.levels.baseLevel = Math.max(
+      renderer.sceneOptions.levels.baseLevel,
+      0.24
+    );
+  }
+
+  if (isUniversalisInspired) {
+    renderer.sceneOptions.sky.setColor(112, 146, 196);
+    renderer.sceneOptions.fog.setColor(124, 150, 182);
+    renderer.sceneOptions.fog.heightFactor = Math.max(
+      renderer.sceneOptions.fog.heightFactor,
+      0.52
+    );
+    renderer.sceneOptions.levels.baseLevel = Math.max(
+      renderer.sceneOptions.levels.baseLevel,
+      0.16
+    );
+    renderer.sceneOptions.sky.horizon = Math.max(renderer.sceneOptions.sky.horizon, 76);
+    renderer.sceneOptions.sky.horizonEnd = Math.max(renderer.sceneOptions.sky.horizonEnd, 140);
+  }
+
+  if (isPBRPremium) {
+    renderer.sceneOptions.sky.setColor(134, 170, 214);
+    renderer.sceneOptions.fog.setColor(148, 166, 194);
+    renderer.sceneOptions.fog.heightFactor = Math.max(
+      renderer.sceneOptions.fog.heightFactor,
+      0.48
+    );
+    renderer.sceneOptions.levels.baseLevel = Math.max(
+      renderer.sceneOptions.levels.baseLevel,
+      0.18
+    );
+  }
+
+  renderer.sceneOptions.ubo.buffer?.update();
+}
 
 function applyTerrainPhase1RendererProfile(
   pipeline: DefaultRenderingPipeline,
@@ -35,31 +162,162 @@ function applyTerrainPhase1RendererProfile(
   sunLight: DirectionalLight
 ) {
   const terrain = EngineSettings.settings.terrain;
-  if (!terrain.visualV2 && !terrain.materialTriplanar && !terrain.materialWetness) {
+  const isPBRPremium = terrain.benchmarkPreset === "pbr-premium";
+  const isMaterialImport = terrain.benchmarkPreset === "material-import";
+  const isOptimumInspired = terrain.benchmarkPreset === "optimum-inspired";
+  const isUniversalisInspired = terrain.benchmarkPreset === "universalis-inspired";
+  if (
+    !terrain.visualV2 &&
+    !terrain.materialTriplanar &&
+    !terrain.materialWetness &&
+    !isMaterialImport &&
+    !isOptimumInspired &&
+    !isUniversalisInspired &&
+    !isPBRPremium
+  ) {
     return;
   }
 
+  if (isMaterialImport) {
+    pipeline.imageProcessing.contrast = 1.16;
+    pipeline.imageProcessing.exposure = 0.9;
+    pipeline.bloomThreshold = 0.62;
+    ssr.strength = 0.64;
+    ssr.roughnessFactor = 0.24;
+    sunLight.intensity = 6.8;
+  }
+
   if (terrain.visualV2) {
-    pipeline.imageProcessing.contrast = 1.6;
-    pipeline.imageProcessing.exposure = 1.02;
-    pipeline.bloomThreshold = 0.2;
-    ssr.strength = 0.9;
-    ssr.roughnessFactor = 0.14;
-    sunLight.intensity = 9;
+    pipeline.imageProcessing.contrast = 1.12;
+    pipeline.imageProcessing.exposure = 1.04;
+    pipeline.bloomThreshold = 0.5;
+    ssr.strength = 0.72;
+    ssr.roughnessFactor = 0.18;
+    sunLight.intensity = 8.2;
   }
 
   if (terrain.materialWetness) {
-    pipeline.imageProcessing.exposure = 0.96;
-    pipeline.bloomThreshold = 0.24;
-    ssr.strength = 1.1;
-    ssr.roughnessFactor = 0.08;
-    sunLight.intensity = 8.5;
+    pipeline.imageProcessing.exposure = 1.02;
+    pipeline.bloomThreshold = 0.56;
+    ssr.strength = 0.78;
+    ssr.roughnessFactor = 0.14;
+    sunLight.intensity = 8.0;
   }
+
+  if (isOptimumInspired) {
+    pipeline.imageProcessing.contrast = 1.13;
+    pipeline.imageProcessing.exposure = 1.08;
+    pipeline.bloomThreshold = 0.5;
+    ssr.samples = Math.max(ssr.samples, 4);
+    ssr.strength = 0.76;
+    ssr.roughnessFactor = 0.16;
+    sunLight.intensity = 8.6;
+  }
+
+  if (isUniversalisInspired) {
+    pipeline.imageProcessing.contrast = 1.06;
+    pipeline.imageProcessing.exposure = 1.18;
+    pipeline.bloomThreshold = 0.58;
+    ssr.samples = Math.max(ssr.samples, 6);
+    ssr.strength = 0.84;
+    ssr.roughnessFactor = 0.1;
+    ssr.maxDistance = Math.max(ssr.maxDistance, 144);
+    sunLight.intensity = 9.1;
+  }
+
+  if (isPBRPremium) {
+    pipeline.imageProcessing.contrast = 1.08;
+    pipeline.imageProcessing.exposure = 1.3;
+    pipeline.imageProcessing.toneMappingEnabled = false;
+    pipeline.bloomThreshold = 0.62;
+    ssr.samples = 6;
+    ssr.strength = 0.66;
+    ssr.roughnessFactor = 0.24;
+    sunLight.intensity = 9.6;
+  }
+}
+
+function applyTerrainPhase1Atmosphere(scene: Scene, isPBRPremium: boolean) {
+  const terrain = EngineSettings.settings.terrain;
+  const isMaterialImport = terrain.benchmarkPreset === "material-import";
+  const isOptimumInspired = terrain.benchmarkPreset === "optimum-inspired";
+  const isUniversalisInspired = terrain.benchmarkPreset === "universalis-inspired";
+  if (
+    !terrain.visualV2 &&
+    !terrain.materialTriplanar &&
+    !terrain.materialWetness &&
+    !isMaterialImport &&
+    !isOptimumInspired &&
+    !isUniversalisInspired &&
+    !isPBRPremium
+  ) {
+    return;
+  }
+
+  scene.fogMode = Scene.FOGMODE_EXP2;
+  scene.fogDensity = isPBRPremium
+    ? 0.00245
+    : isUniversalisInspired
+      ? 0.0021
+    : isOptimumInspired
+      ? 0.0017
+    : terrain.materialWetness
+      ? 0.0024
+      : isMaterialImport
+        ? 0.00075
+      : 0.00145;
+
+  if (isMaterialImport) {
+    scene.fogEnabled = false;
+    scene.fogMode = Scene.FOGMODE_NONE;
+    scene.fogColor.set(0.74, 0.78, 0.8);
+    scene.clearColor.set(0.58, 0.64, 0.7, 1);
+    return;
+  }
+
+  if (isPBRPremium) {
+    scene.fogColor.set(0.62, 0.71, 0.8);
+    scene.clearColor.set(0.68, 0.78, 0.9, 1);
+    return;
+  }
+
+  if (terrain.materialWetness) {
+    scene.fogColor.set(0.62, 0.7, 0.8);
+    scene.clearColor.set(0.68, 0.77, 0.9, 1);
+    return;
+  }
+
+  if (isUniversalisInspired) {
+    scene.fogColor.set(0.56, 0.66, 0.76);
+    scene.clearColor.set(0.58, 0.7, 0.84, 1);
+    return;
+  }
+
+  if (isOptimumInspired) {
+    scene.fogColor.set(0.82, 0.84, 0.8);
+    scene.clearColor.set(0.88, 0.9, 0.86, 1);
+    return;
+  }
+
+  scene.fogColor.set(0.79, 0.84, 0.9);
+  scene.clearColor.set(0.84, 0.9, 0.97, 1);
 }
 
 function applyTerrainPhase1MaterialProfile(materials: MaterialInterface[]) {
   const terrain = EngineSettings.settings.terrain;
-  if (!terrain.visualV2 && !terrain.materialTriplanar && !terrain.materialWetness) {
+  const isPBRPremium = terrain.benchmarkPreset === "pbr-premium";
+  const isMaterialImport = terrain.benchmarkPreset === "material-import";
+  const isOptimumInspired = terrain.benchmarkPreset === "optimum-inspired";
+  const isUniversalisInspired = terrain.benchmarkPreset === "universalis-inspired";
+  if (
+    !terrain.visualV2 &&
+    !terrain.materialTriplanar &&
+    !terrain.materialWetness &&
+    !isMaterialImport &&
+    !isOptimumInspired &&
+    !isUniversalisInspired &&
+    !isPBRPremium
+  ) {
     return;
   }
 
@@ -67,51 +325,168 @@ function applyTerrainPhase1MaterialProfile(materials: MaterialInterface[]) {
     if (!(material instanceof DVEBRPBRMaterial)) continue;
 
     const pbr = material._material;
-    const isLiquid = material.id.includes("liquid");
-    const isFlora = material.id.includes("flora");
-    const isTransparent = material.id.includes("transparent");
-    const isGlow = material.id.includes("glow");
+    applyActiveTerrainMaterialProfiles(pbr, material.id, terrain);
 
-    if (terrain.visualV2) {
-      pbr.environmentIntensity = isLiquid ? 1.35 : 0.8;
-      pbr.directIntensity = isLiquid ? 0.95 : 1.1;
-      if (!isLiquid) {
-        pbr.roughness = isFlora ? 0.92 : 0.82;
-      }
-      if (isGlow) {
-        pbr.emissiveIntensity = 1.2;
-      }
-    }
-
-    if (terrain.materialTriplanar && !isLiquid && !isTransparent) {
-      const currentRoughness = pbr.roughness ?? 0;
-      pbr.roughness = Math.max(currentRoughness, isFlora ? 0.94 : 0.88);
-      pbr.environmentIntensity = Math.max(pbr.environmentIntensity, 0.9);
-    }
-
-    if (terrain.materialWetness) {
-      if (isLiquid) {
-        pbr.roughness = 0.02;
-        pbr.alpha = 0.82;
-        pbr.environmentIntensity = 1.65;
-        pbr.reflectivityColor.set(0.95, 0.95, 0.95);
-      } else if (!isTransparent && !isFlora) {
-        const currentRoughness = pbr.roughness ?? 0;
-        pbr.roughness = Math.min(currentRoughness, 0.58);
-        pbr.metallic = 0.02;
-        pbr.environmentIntensity = Math.max(pbr.environmentIntensity, 1.05);
-      }
-    }
-
-    pbr.metadata = {
-      ...(pbr.metadata || {}),
-      terrainPhase1: {
-        visualV2: terrain.visualV2,
-        materialTriplanar: terrain.materialTriplanar,
-        materialWetness: terrain.materialWetness,
-      },
-    };
+    pbr.markAsDirty(Material.AllDirtyFlag);
   }
+}
+
+const terrainPhase1StartupDirtyFlags = 127;
+
+function getTrackedPBRMaterials(materials: MaterialInterface[]) {
+  return materials
+    .filter((material): material is DVEBRPBRMaterial => {
+      return material instanceof DVEBRPBRMaterial;
+    })
+    .map((material) => material._material);
+}
+
+function getScenePBRMaterials(scene: Scene) {
+  return scene.materials.filter(
+    (
+      material
+    ): material is Material & {
+      markAsDirty: (flag: number) => void;
+      isReady?: () => boolean;
+      name?: string;
+    } =>
+      material.getClassName?.() === "PBRMaterial" ||
+      material.constructor?.name === "PBRMaterial"
+  );
+}
+
+function collectTerrainPhase1PBRMaterials(
+  scene: Scene,
+  materials: MaterialInterface[]
+) {
+  const uniqueMaterials = new Set<Material>();
+  const collectedMaterials: Array<
+    Material & {
+      markAsDirty: (flag: number) => void;
+      isReady?: () => boolean;
+      name?: string;
+    }
+  > = [];
+
+  for (const material of getTrackedPBRMaterials(materials)) {
+    uniqueMaterials.add(material);
+    collectedMaterials.push(material);
+  }
+
+  for (const material of getScenePBRMaterials(scene)) {
+    if (uniqueMaterials.has(material)) {
+      continue;
+    }
+    uniqueMaterials.add(material);
+    collectedMaterials.push(material);
+  }
+
+  return collectedMaterials;
+}
+
+function scheduleTerrainPhase1MaterialProfileRefresh(
+  scene: Scene,
+  materials: MaterialInterface[]
+) {
+  const minimumSceneMeshes = 160;
+  const minimumPBRMaterials = 6;
+  const maxPollFrames = 2400;
+  const maxRefreshFrames = 720;
+  const minimumRefreshFrames = 120;
+  const refreshIntervalFrames = 12;
+  const refreshDelayFrames = 30;
+  const requiredReadyFrames = 16;
+  const scheduleFrame =
+    typeof requestAnimationFrame === "function"
+      ? requestAnimationFrame
+      : (callback: FrameRequestCallback) => setTimeout(callback, 16);
+  let pollFrames = 0;
+  let refreshFrames = 0;
+  let delayFrames = 0;
+  let readyFrames = 0;
+  const tick = () => {
+    const sceneDisposed = Boolean(scene.isDisposed);
+    if (sceneDisposed) {
+      return;
+    }
+
+    const scenePBRMaterials = collectTerrainPhase1PBRMaterials(scene, materials);
+
+    if (
+      scene.meshes.length < minimumSceneMeshes ||
+      scenePBRMaterials.length < minimumPBRMaterials
+    ) {
+      pollFrames++;
+      if (pollFrames < maxPollFrames) {
+        scheduleFrame(tick);
+      }
+      return;
+    }
+
+    if (delayFrames < refreshDelayFrames) {
+      delayFrames++;
+      scheduleFrame(tick);
+      return;
+    }
+
+    const shouldRefreshNow = refreshFrames % refreshIntervalFrames === 0;
+    if (shouldRefreshNow) {
+      applyTerrainPhase1MaterialProfile(materials);
+      for (const material of scenePBRMaterials) {
+        material.markAsDirty(terrainPhase1StartupDirtyFlags);
+      }
+    }
+
+    refreshFrames++;
+    const hasPendingMaterials = scenePBRMaterials.some(
+      (material) => material.isReady?.() === false
+    );
+    readyFrames = hasPendingMaterials ? 0 : readyFrames + 1;
+
+    const shouldContinueRefreshing =
+      refreshFrames < minimumRefreshFrames ||
+      hasPendingMaterials ||
+      readyFrames < requiredReadyFrames;
+
+    if (shouldContinueRefreshing && refreshFrames < maxRefreshFrames) {
+      scheduleFrame(tick);
+    }
+  };
+
+  scheduleFrame(tick);
+}
+
+function scheduleTerrainPhase1PostRenderWarmup(
+  scene: Scene,
+  materials: MaterialInterface[]
+) {
+  const startRefreshFrame = 2;
+  const endRefreshFrame = 8;
+  let renderFrames = 0;
+
+  const observer = scene.onBeforeRenderObservable.add(() => {
+    if (scene.isDisposed) {
+      if (observer) {
+        scene.onBeforeRenderObservable.remove(observer);
+      }
+      return;
+    }
+
+    renderFrames++;
+    if (renderFrames < startRefreshFrame) {
+      return;
+    }
+
+    const trackedPBRMaterials = collectTerrainPhase1PBRMaterials(scene, materials);
+    applyTerrainPhase1MaterialProfile(materials);
+    for (const material of trackedPBRMaterials) {
+      material.markAsDirty(terrainPhase1StartupDirtyFlags);
+    }
+
+    if (renderFrames >= endRefreshFrame && observer) {
+      scene.onBeforeRenderObservable.remove(observer);
+    }
+  });
 }
 
 export default async function InitDVEPBR(initData: DVEBRPBRData) {
@@ -124,6 +499,10 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
   if (initData.getProgress) initData.getProgress(progress);
   progress.startTask("Init PBR Renderer");
   const scene = initData.scene;
+  const terrain = EngineSettings.settings.terrain;
+  const isPBRPremium = terrain.benchmarkPreset === "pbr-premium";
+  const isOptimumInspired = terrain.benchmarkPreset === "optimum-inspired";
+  const isUniversalisInspired = terrain.benchmarkPreset === "universalis-inspired";
   const activeCamera = scene.activeCamera ?? scene.cameras[0];
   if (!activeCamera) {
     throw new Error(
@@ -131,27 +510,28 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
     );
   }
   await CreateTextures(initData.scene, initData.textureData, progress);
-  scene.getEngine()!.createRenderTargetCubeTexture;
-  const probe = new ReflectionProbe("", 512, initData.scene);
-  initData.scene.environmentTexture = probe.cubeTexture;
-  initData.scene.environmentIntensity = 1;
+  const hdrTexture = new HDRCubeTexture("assets/skybox.hdr", scene, 512);
+  initData.scene.environmentTexture = hdrTexture;
+  initData.scene.environmentIntensity = isPBRPremium
+    ? 0.42
+    : isUniversalisInspired
+      ? 0.74
+    : isOptimumInspired
+      ? 0.62
+    : 0.58;
   const pipeline = new DefaultRenderingPipeline("atom", true, initData.scene, [
     activeCamera,
   ]);
-  const hdrTexture = new HDRCubeTexture("assets/skybox.hdr", scene, 512);
   activeCamera.maxZ = 600;
   const postprocess = pipeline.imageProcessing;
-  postprocess.toneMappingEnabled = true;
+  postprocess.toneMappingEnabled = !isPBRPremium;
   postprocess.toneMappingType = ImageProcessingConfiguration.TONEMAPPING_ACES;
-  pipeline.imageProcessing.contrast = 1.5;
-  pipeline.imageProcessing.exposure = 1;
+  pipeline.imageProcessing.contrast = 1.08;
+  pipeline.imageProcessing.exposure = 1.02;
   pipeline.bloomEnabled = true;
-  pipeline.bloomThreshold = 0.15;
+  pipeline.bloomThreshold = 0.52;
   // pipeline.sharpenEnabled = true;
-  pipeline.depthOfFieldEnabled = true;
-  pipeline.depthOfField.fStop = 50;
-  pipeline.depthOfField.focalLength = 300;
-  pipeline.depthOfField.focusDistance = 1000;
+  pipeline.depthOfFieldEnabled = false;
 
   pipeline.fxaaEnabled = true;
   pipeline.fxaa.adaptScaleToCurrentViewport = true;
@@ -160,16 +540,25 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
   glow.intensity = 1;
  */
   LevelParticles.init(scene);
+  applyTerrainPhase1Atmosphere(scene, isPBRPremium);
   const ssr = new SSRRenderingPipeline("ssr", initData.scene, [
     activeCamera,
   ]);
 
   // ssr.reflectionSpecularFalloffExponent = 2;
 
-  ssr.environmentTexture = probe.cubeTexture as any;
-  ssr.samples = 4;
-  ssr.strength = 1;
-  ssr.roughnessFactor = 0.2;
+  ssr.environmentTexture = hdrTexture as any;
+  ssr.environmentTextureIsProbe = false;
+  ssr.samples = isPBRPremium ? 4 : isUniversalisInspired ? 6 : 2;
+  ssr.strength = isPBRPremium ? 0.72 : isUniversalisInspired ? 0.82 : 0.8;
+  ssr.roughnessFactor = isPBRPremium ? 0.24 : isUniversalisInspired ? 0.12 : 0.22;
+  ssr.reflectivityThreshold = 0.12;
+  ssr.selfCollisionNumSkip = 2;
+  ssr.step = 2;
+  ssr.maxSteps = isPBRPremium ? 72 : isUniversalisInspired ? 84 : 64;
+  ssr.maxDistance = isPBRPremium ? 112 : isUniversalisInspired ? 144 : 128;
+  ssr.blurDownsample = 1;
+  ssr.thickness = isPBRPremium ? 1.05 : isUniversalisInspired ? 0.96 : 0.8;
   /*   ssrPipeline.thickness = 0.1;
   ssrPipeline.selfCollisionNumSkip = 2;
   ssrPipeline.blurDispersionStrength = 0;
@@ -177,7 +566,7 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
   //ssrPipeline.environmentTexture = probe.cubeTexture as any;
   // ssrPipeline.environmentTextureIsProbe = true;
 
-  const renderer = CreateDefaultRenderer({
+  const renderer = await CreateDefaultRenderer({
     progress,
     createMaterial: (renderer, scene, matData) => {
       const newMat = new DVEBRPBRMaterial(renderer.sceneOptions, matData.id, {
@@ -200,9 +589,9 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
       {
         const hemLight = new HemisphericLight("", new Vector3(0, 0, 0), scene);
         hemLight.specular.set(0, 0, 0);
-        hemLight.intensity = 0.2;
-        hemLight.diffuse.set(0.5, 0.5, 0.5);
-        hemLight.groundColor.set(1, 1, 1);
+        hemLight.intensity = 0.4;
+        hemLight.diffuse.set(0.6, 0.62, 0.66);
+        hemLight.groundColor.set(0.82, 0.85, 0.9);
       }
 
       /*     */
@@ -218,33 +607,41 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
         new Vector3(-1, -1, -0.5),
         initData.scene
       );
+      const isMaterialImport =
+        EngineSettings.settings.terrain.benchmarkPreset === "material-import";
 
       sunLight.intensity = 10;
       sunLight.shadowMinZ = 1;
       sunLight.shadowMaxZ = 500;
       sunLight.position.y = 200;
 
+      sunLight.diffuse.set(1, 0.95, 0.88);
       sunLight.specular.set(0, 0, 0);
-      const shadows = new ShadowGenerator(2048, sunLight);
-      // this.shadows.usePoissonSampling = true;
-      shadows.usePercentageCloserFiltering = true;
+      if (isMaterialImport) {
+        // Imported material arrays still destabilize the shadow compile path here.
+        // Keep this disabled until Etapa 1 can re-enable shadows without black-world startup regressions.
+        sunLight.shadowEnabled = false;
+      } else {
+        const shadows = new ShadowGenerator(2048, sunLight);
+        // this.shadows.usePoissonSampling = true;
+        shadows.usePercentageCloserFiltering = true;
 
-      //  shadows.forceBackFacesOnly = true;
-      shadows.useContactHardeningShadow = true;
-      //   shadows.contactHardeningLightSizeUVRatio = 0.05;
-      shadows.setDarkness(0.1);
+        //  shadows.forceBackFacesOnly = true;
+        shadows.useContactHardeningShadow = true;
+        shadows.contactHardeningLightSizeUVRatio = isPBRPremium ? 0.08 : 0.05;
+        shadows.setDarkness(0.1);
+      }
 
       // this.shadows.blurScale = 0;
       // initData.scene.useRightHandedSystem = false;
 
       applyTerrainPhase1RendererProfile(pipeline, ssr, sunLight);
       applyTerrainPhase1MaterialProfile(materials);
-
-      initData.scene.registerBeforeRender(() => {
-        const camera = initData.scene.activeCamera;
-        if (!camera) return;
-        probe.position.copyFrom(camera.position);
-      });
+      scheduleTerrainPhase1MaterialProfileRefresh(scene, materials);
+      scheduleTerrainPhase1PostRenderWarmup(scene, materials);
+      LevelParticles.startNatureAmbient(
+        isPBRPremium || isUniversalisInspired ? "premium" : "lush"
+      );
       /*  
       renderer.observers.meshCreated.subscribe(InitDVEPBR, (mesh) => {
         if (!probe.renderList) probe.renderList = [];
@@ -267,27 +664,22 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
         (material as DVEBRPBRMaterial)._material.disableLighting = false;
       });
  */
-      initData.scene.ambientColor.set(0, 0, 0);
+      initData.scene.ambientColor.set(0.32, 0.33, 0.38);
 
-      const skybox = CreateBox("skyBox", { size: 300.0 }, initData.scene);
-
-      const skyboxMaterial = new StandardMaterial("", scene);
-      skyboxMaterial.backFaceCulling = false;
-      skyboxMaterial.reflectionTexture = hdrTexture;
-      skyboxMaterial.disableLighting = true;
-      skyboxMaterial.reflectionTexture.coordinatesMode = Texture.SKYBOX_MODE;
-      skybox.material = skyboxMaterial;
-      probe.renderList!.push(skybox);
+      const proceduralSkybox = InitSkybox({ renderer: _renderer });
+      proceduralSkybox.renderingGroupId = 0;
+      proceduralSkybox.infiniteDistance = true;
+      proceduralSkybox.isPickable = false;
 
       /*    LevelParticles.start(
         new Color4(0, 1, 1, 1),
         new Color4(0, 1, 1, 0.7),
         new Color4(0, 1, 1, 0.5)
       ); */
-
-      //   skybox.material = renderer.nodes.materials.get("dve_skybox")!._material;
     },
   });
+
+  applyTerrainPhase1SkyProfile(renderer);
 
   return renderer;
 }

@@ -2,6 +2,7 @@ import { BoundingBox } from "@babylonjs/core/Culling/boundingBox";
 import { BoundingInfo } from "@babylonjs/core/Culling/boundingInfo";
 import { MultiMaterial } from "@babylonjs/core/Materials/multiMaterial";
 import { Scene } from "@babylonjs/core/scene";
+import { Mesh } from "@babylonjs/core/Meshes/mesh";
 import { SubMesh } from "@babylonjs/core/Meshes/subMesh";
 import { TransformNode } from "@babylonjs/core/Meshes/transformNode";
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
@@ -151,7 +152,7 @@ export class SingleBufferVoxelScene extends VoxelSceneInterface<SubBufferMesh> {
     subBufferMesh.baseMaterialId = getBaseMaterialId(data.materialId);
 
     const scene = bufferMesh.voxelScene.renderer.scene;
-    subBufferMesh.transform = new TransformNode("", scene) as any;
+    subBufferMesh.transform = new Mesh("", scene) as any;
     subBufferMesh.transform.position.set(x, y, z);
     subBufferMesh.transform.computeWorldMatrix();
 
