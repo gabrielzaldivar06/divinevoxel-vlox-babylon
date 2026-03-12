@@ -211,7 +211,13 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
       !isTransparent &&
       !isGlow &&
       !disableUnstablePBRSurfaceContext;
-    const enablePBRPremium = benchmarkPreset === "pbr-premium" && !isLiquid && !isTransparent;
+    const enableSurfaceHeightGradient =
+      terrain.surfaceHeightGradient &&
+      !isLiquid &&
+      !isTransparent &&
+      !isGlow &&
+      !disableUnstablePBRSurfaceContext;
+    const enablePBRPremium = (benchmarkPreset === "pbr-premium" || benchmarkPreset === "pbr-premium-v2") && !isLiquid && !isTransparent;
     const enableImportedMaterialMaps =
       this.shouldUseImportedMaterialMaps() && !isLiquid && !isTransparent;
     const baseLightFloor =
@@ -223,9 +229,11 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
             ? 0.58
             : benchmarkPreset === "pbr-premium"
               ? 0.54
-              : benchmarkPreset === "pbr-surface-lod"
-                ? 0.56
-                : 0.48;
+              : benchmarkPreset === "pbr-premium-v2"
+                ? 0.52
+                : benchmarkPreset === "pbr-surface-lod"
+                  ? 0.56
+                  : 0.48;
     const voxelLightMix =
       benchmarkPreset === "material-import"
         ? 0.18
@@ -235,9 +243,11 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
             ? 0.32
             : benchmarkPreset === "pbr-premium"
               ? 0.34
-              : benchmarkPreset === "pbr-surface-lod"
-                ? 0.32
-                : 1;
+              : benchmarkPreset === "pbr-premium-v2"
+                ? 0.33
+                : benchmarkPreset === "pbr-surface-lod"
+                  ? 0.32
+                  : 1;
     const textures = /* glsl */ `
 uniform sampler2DArray dve_voxel;
 uniform highp usampler2D dve_voxel_animation;
@@ -254,12 +264,14 @@ varying vec3 dveLight2;
 varying vec3 dveLight3;
 varying vec3 dveLight4;
   ${enableSurfaceMetadata ? "varying vec4 dveMetadata;" : ""}
+  ${enableSurfaceMetadata ? "varying vec3 dveWorldContext;" : ""}
 `;
 
     const attributes = /* glsl */ `
 attribute vec3 textureIndex;
 attribute vec4 voxelData;
   ${enableSurfaceMetadata ? "attribute vec4 metadata;" : ""}
+  ${enableSurfaceMetadata ? "attribute vec3 worldContext;" : ""}
 `;
     const coreFunctions = /* glsl */ `
 const uint dveLightMask = uint(0xf);
@@ -462,6 +474,7 @@ vec3 dveDecodeLightValue(uint value) {
   dveLight4 = dveDecodeLightValue(uint(voxelData.w));
   dveIUV = dveQuadUVArray[(uint(voxelData.z) >> dveVertexIndex) & dveVertexMask];
   ${enableSurfaceMetadata ? "dveMetadata = metadata;" : ""}
+  ${enableSurfaceMetadata ? "dveWorldContext = worldContext;" : ""}
 
 #endif
         `,
@@ -490,9 +503,14 @@ float dveSlope = 1.0 - abs(dveNormalW.y);
       float dveSurfaceSlope = dveSlope;
       float dveSurfaceCavity = 0.0;
       float dveSurfaceTop = smoothstep(0.45, 0.8, dveNormalW.y);
-  ${enableSurfaceMetadata ? "vec4 dveMetadataClamped = clamp(dveMetadata, 0.0, 1.0); float dveMetadataWeight = smoothstep(0.04, 0.28, dot(dveMetadataClamped, vec4(0.25))); dveSurfaceExposure = mix(dveSurfaceExposure, dveMetadataClamped.x, dveMetadataWeight * 0.72); dveSurfaceSlope = mix(dveSurfaceSlope, dveMetadataClamped.y, dveMetadataWeight * 0.72); dveSurfaceCavity = mix(dveSurfaceCavity, dveMetadataClamped.z, dveMetadataWeight * 0.72); dveSurfaceTop = mix(dveSurfaceTop, dveMetadataClamped.w, dveMetadataWeight * 0.72); dveTopExposure = mix(dveTopExposure, max(dveTopExposure, dveSurfaceExposure), dveMetadataWeight * 0.55);" : ""}
+      float dveBakedHeight = 0.0;
+  ${enableSurfaceMetadata ? "vec4 dveMetadataClamped = clamp(dveMetadata, 0.0, 1.0); float dveMetadataWeight = smoothstep(0.04, 0.28, dot(dveMetadataClamped, vec4(0.25))); dveSurfaceExposure = mix(dveSurfaceExposure, dveMetadataClamped.x, dveMetadataWeight * 0.72); dveSurfaceSlope = mix(dveSurfaceSlope, dveMetadataClamped.y, dveMetadataWeight * 0.72); dveSurfaceCavity = mix(dveSurfaceCavity, dveMetadataClamped.z, dveMetadataWeight * 0.72); dveSurfaceTop = mix(dveSurfaceTop, smoothstep(0.4, 0.85, dveMetadataClamped.x), dveMetadataWeight * 0.72); dveBakedHeight = dveMetadataClamped.w; dveTopExposure = mix(dveTopExposure, max(dveTopExposure, dveSurfaceExposure), dveMetadataWeight * 0.55);" : ""}
+      float dveSunExposure = ${enableSurfaceMetadata ? "clamp(dveWorldContext.x, 0.0, 1.0)" : "1.0"};
+      float dveEnclosure = ${enableSurfaceMetadata ? "clamp(dveWorldContext.y, 0.0, 1.0)" : "0.0"};
+      float dveEdgeBoundary = ${enableSurfaceMetadata ? "clamp(dveWorldContext.z, 0.0, 1.0)" : "1.0"};
+      float dveHeightNorm = ${enableSurfaceMetadata ? "dveBakedHeight" : enableSurfaceHeightGradient ? "clamp((vPositionW.y - 16.0) / 112.0, 0.0, 1.0)" : "0.0"};
       float dveBaseCavity = clamp(max(dveSurfaceCavity * 0.82, dveEdgeMask(fract(dveBaseUV * 0.85 + vec2(vPositionW.y * 0.03))) * 0.18), 0.0, 1.0);
-      float dveWetnessBase = clamp(dveComputeWetness(dveNormalW, vPositionW) * 0.72 + dveSurfaceCavity * 0.14 + (1.0 - dveSurfaceExposure) * 0.08, 0.0, 1.0);
+      float dveWetnessBase = clamp(dveComputeWetness(dveNormalW, vPositionW) * 0.56 + dveSurfaceCavity * 0.14 + (1.0 - dveSurfaceExposure) * 0.06 + (1.0 - dveHeightNorm) * 0.14 - dveHeightNorm * 0.08 + (1.0 - dveSunExposure) * 0.1 + dveEnclosure * 0.08, 0.0, 1.0);
 `
         : "";
       const visualV2Code = enableVisualV2
@@ -501,7 +519,9 @@ float dveSlope = 1.0 - abs(dveNormalW.y);
 float dveVisualCavity = clamp(dveBaseCavity * (0.42 + dveSurfaceSlope * 0.18), 0.0, 1.0);
 voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(1.1, 1.08, 1.04), dveTopExposure * 0.16);
 voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.88, 0.86, 0.84), dveVisualCavity * 0.08);
-voxelBaseColor.rgb += vec3(0.035, 0.03, 0.024) * dveEdgeWear * (0.08 + dveCloseBoost * 0.06);
+voxelBaseColor.rgb += vec3(0.035, 0.03, 0.024) * dveEdgeWear * (0.08 + dveCloseBoost * 0.06) * (0.7 + dveEdgeBoundary * 0.3);
+voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(1.06, 1.04, 0.98), dveSunExposure * dveEdgeBoundary * 0.06);
+voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.92, 0.94, 0.96), dveEnclosure * (1.0 - dveSunExposure) * 0.05);
 `
         : "";
       const macroVariationCode = enableMacroVariation
@@ -563,7 +583,10 @@ float dveOverlayDistance = mix(0.62, 1.0, dveCloseBoost);
 float dveOverlayExposure = clamp(dveSurfaceExposure * 0.84 + dveTopExposure * 0.16, 0.0, 1.0);
 float dveSideFaceMask = clamp(1.0 - dveSurfaceTop, 0.0, 1.0);
 float dveSideEdgeMask = dveEdgeMask(fract(dveBaseUV * 0.72 + vec2(0.0, vPositionW.y * 0.04))) * dveSideFaceMask;
-float dveShelterMask = clamp(dveBaseCavity * 0.52 + dveCenterBlend * 0.12 + (1.0 - dveOverlayExposure) * 0.18 + (1.0 - dveSurfaceSlope) * 0.08, 0.0, 1.0);
+float dveShelterMask = clamp(dveBaseCavity * 0.46 + dveCenterBlend * 0.1 + (1.0 - dveOverlayExposure) * 0.16 + (1.0 - dveSurfaceSlope) * 0.06 + dveEnclosure * 0.14, 0.0, 1.0);
+float dveLowlandBias = 1.0 - smoothstep(0.15, 0.45, dveHeightNorm);
+float dveHighlandBias = smoothstep(0.55, 0.85, dveHeightNorm);
+float dveMidlandBias = clamp(1.0 - abs(dveHeightNorm - 0.42) * 2.4, 0.0, 1.0);
 float dveHorizontalSeed = dveHash13(floor(vPositionW * vec3(0.85, 0.05, 0.85)) + vec3(dveTextureLayer * 0.03125, 100.0, dveSurfaceTop));
 vec3 dveNormalAbs = abs(dveNormalW);
 float dveAxisSwitch = step(dveNormalAbs.x, dveNormalAbs.z);
@@ -586,10 +609,10 @@ float dveFloraConnectedMask = clamp(dveSideFaceMask * (0.42 + (1.0 - dveOverlayE
 float dveSoilConnectedMask = clamp(dveConnectedPatch * 0.34 + dveSideFaceMask * 0.28 + dveShelterMask * 0.18 + (1.0 - dveSurfaceSlope) * 0.08, 0.0, 1.0) * mix(0.72, 1.0, dveCloseBoost) * (0.94 + dveEdgeProximity * 0.08);
 float dveEdgeDirBias = mix(0.94 + (fract(dveBaseUV.x) - 0.5) * 0.12, 0.94 + (fract(dveBaseUV.y) - 0.5) * 0.12, dveAxisSwitch);
 float dveDepositionMask = clamp(dveSurfaceTop * (1.0 - dveSurfaceSlope) * 0.62 + dveBaseCavity * 0.08 + dveOverlayNoise * 0.14 + dveCenterBlend * 0.06, 0.0, 1.0) * dveOverlayDistance;
-float dveMossMask = clamp(dveWetnessBase * 0.46 + dveBaseCavity * 0.28 + (1.0 - dveSurfaceSlope) * 0.08 + dveCenterBlend * 0.05 - dveOverlayExposure * 0.1, 0.0, 1.0) * mix(0.72, 1.0, dveCloseBoost);
-float dveDustMask = clamp(dveOverlayExposure * 0.28 + dveBaseCavity * 0.12 + (1.0 - dveWetnessBase) * 0.22 + dveOverlayNoise * 0.1, 0.0, 1.0) * mix(0.68, 1.0, dveCloseBoost);
-float dveSandDriftMask = clamp(dveDepositionMask * (0.48 + dveOverlayExposure * 0.22 + (1.0 - dveWetnessBase) * 0.26) + dveSideEdgeMask * 0.08 + dveShelterMask * 0.12 - dveMossMask * 0.22, 0.0, 1.0) * mix(0.72, 1.0, dveCloseBoost);
-float dveSandPocketMask = clamp(dveDepositionMask * (0.34 + dveShelterMask * 0.28) + dveBaseCavity * 0.16 + (1.0 - dveWetnessBase) * 0.12 - dveSurfaceSlope * 0.06, 0.0, 1.0) * mix(0.7, 1.0, dveCloseBoost);
+float dveMossMask = clamp(dveWetnessBase * 0.42 + dveBaseCavity * 0.24 + (1.0 - dveSurfaceSlope) * 0.06 + dveCenterBlend * 0.04 - dveOverlayExposure * 0.08 + dveMidlandBias * 0.1 + dveEnclosure * 0.1 + (1.0 - dveSunExposure) * 0.08, 0.0, 1.0) * mix(0.72, 1.0, dveCloseBoost);
+float dveDustMask = clamp(dveOverlayExposure * 0.24 + dveBaseCavity * 0.1 + (1.0 - dveWetnessBase) * 0.2 + dveOverlayNoise * 0.08 + dveHighlandBias * 0.12 + dveSunExposure * 0.1 - dveEnclosure * 0.14, 0.0, 1.0) * mix(0.68, 1.0, dveCloseBoost);
+float dveSandDriftMask = clamp(dveDepositionMask * (0.48 + dveOverlayExposure * 0.22 + (1.0 - dveWetnessBase) * 0.26) + dveSideEdgeMask * 0.08 + dveShelterMask * 0.12 + dveLowlandBias * 0.16 - dveMossMask * 0.22 - dveEnclosure * 0.12, 0.0, 1.0) * mix(0.72, 1.0, dveCloseBoost);
+float dveSandPocketMask = clamp(dveDepositionMask * (0.34 + dveShelterMask * 0.28) + dveBaseCavity * 0.16 + (1.0 - dveWetnessBase) * 0.12 + dveLowlandBias * 0.12 - dveSurfaceSlope * 0.06, 0.0, 1.0) * mix(0.7, 1.0, dveCloseBoost);
 float dveMossDominanceZone = clamp(dveMossMask * (1.4 - dveSurfaceTop * 0.35) - dveSandDriftMask * 0.18 - dveOverlayExposure * 0.12, 0.0, 1.0);
 float dveDryInteraction = (1.0 - dveWetnessBase) * clamp(dveOverlayExposure * 0.6 + dveTopExposure * 0.4, 0.0, 1.0);
 float dveGrainSettlingMask = clamp(dveDepositionMask * (0.34 + dveShelterMask * 0.32 + dveBaseCavity * 0.18) + dveOverlayNoise * 0.08 - dveSurfaceSlope * 0.12, 0.0, 1.0) * mix(0.7, 1.0, dveCloseBoost);
@@ -653,6 +676,19 @@ ${
 }
 `
         : "";
+      const heightGradientAlbedoCode = enableSurfaceHeightGradient
+        ? /* glsl */ `
+float dveHGBreakup = dveFbm3(vPositionW * 0.04 + vec3(7.3, -2.1, 5.5));
+float dveHGMask = clamp(dveHeightNorm + dveHGBreakup * 0.18 - 0.08, 0.0, 1.0);
+vec3 dveWarmTint = vec3(1.06, 1.02, 0.94);
+vec3 dveCoolTint = vec3(0.94, 0.97, 1.05);
+vec3 dveHGTint = mix(dveWarmTint, dveCoolTint, dveHGMask);
+voxelBaseColor.rgb *= mix(vec3(1.0), dveHGTint, 0.14);
+${isRock ? "voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.92, 0.95, 1.02), dveHGMask * dveSurfaceSlope * 0.1);" : ""}
+${isFlora ? "voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.96, 1.04, 0.94), (1.0 - dveHGMask) * dveSurfaceTop * 0.08);" : ""}
+${isSoil || isCultivated ? "voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(1.04, 0.98, 0.9), (1.0 - dveHGMask) * 0.06);" : ""}
+`
+        : "";
       const importedMaterialAlbedoCode = enableImportedMaterialMaps
         ? /* glsl */ `
 vec4 dveMaterialSample = dveSampleMaterialMap(dveBaseUV);
@@ -693,6 +729,19 @@ surfaceReflectivityColor = mix(
 #endif
 `
         : "";
+      const heightGradientMicroSurfaceCode =
+        enableSurfaceHeightGradient && enableSurfaceMetadata
+          ? /* glsl */ `
+#ifdef  DVE_${this.name}
+{
+  float dveHGCavityRough = dveBaseCavity * 0.12;
+  float dveHGHeightRough = dveHeightNorm * 0.08;
+  float dveHGSlopeRough = dveSurfaceSlope * 0.06;
+  microSurface = max(microSurface - dveHGCavityRough - dveHGHeightRough - dveHGSlopeRough, 0.02);
+}
+#endif
+`
+          : "";
       const importedMaterialMicroSurfaceCode = enableImportedMaterialMaps
   ? /* glsl */ `
 #ifdef  DVE_${this.name}
@@ -805,6 +854,7 @@ ${microVariationCode}
 ${surfaceOverlaysCode}
 ${nearCameraHighDetailCode}
 ${premiumAlbedoCode}
+${heightGradientAlbedoCode}
 ${importedMaterialAlbedoCode}
 ${unstableSurfaceContextLiftCode}
 surfaceAlbedo = toLinearSpace(vec3(voxelBaseColor.r, voxelBaseColor.g, voxelBaseColor.b));
@@ -844,6 +894,7 @@ alpha = ${benchmarkPreset === "material-import" ? "1.0" : "mix(0.82, 0.92, dveWa
 `,
   CUSTOM_FRAGMENT_UPDATE_MICROSURFACE: /*glsl*/ `
 ${wetnessMicroSurfaceCode}
+${heightGradientMicroSurfaceCode}
 ${importedMaterialMicroSurfaceCode}
 `,
   CUSTOM_FRAGMENT_BEFORE_LIGHTS: /*glsl*/ `

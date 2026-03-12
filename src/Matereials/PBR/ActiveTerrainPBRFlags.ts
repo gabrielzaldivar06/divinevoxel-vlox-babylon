@@ -5,6 +5,7 @@ type TerrainFlagSettings = Record<string, unknown> & {
   materialTriplanar?: boolean;
   materialWetness?: boolean;
   surfaceMetadata?: boolean;
+  surfaceHeightGradient?: boolean;
   surfaceOverlays?: boolean;
   nearCameraHighDetail?: boolean;
   microVariation?: boolean;
@@ -26,6 +27,7 @@ export function getEffectivePBRTerrainSettings<T extends TerrainFlagSettings>(te
     visualV2: false,
     materialTriplanar: false,
     surfaceMetadata: false,
+    surfaceHeightGradient: false,
     surfaceOverlays: false,
     nearCameraHighDetail: false,
     microVariation: false,

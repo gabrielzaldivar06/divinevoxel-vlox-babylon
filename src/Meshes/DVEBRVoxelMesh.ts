@@ -85,7 +85,7 @@ export class DVEBRVoxelMesh {
       new VertexBuffer(
         engine,
         buffer,
-        "color",
+        "worldContext",
         false,
         undefined,
         VoxelMeshVertexStructCursor.VertexFloatSize,

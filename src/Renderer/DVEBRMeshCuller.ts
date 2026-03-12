@@ -19,6 +19,7 @@ function getPremiumResidentSectorDistance() {
   const benchmarkPreset = String(terrain.benchmarkPreset || "");
   if (
     benchmarkPreset !== "pbr-premium" &&
+    benchmarkPreset !== "pbr-premium-v2" &&
     benchmarkPreset !== "pbr-surface-lod"
   ) {
     return 0;

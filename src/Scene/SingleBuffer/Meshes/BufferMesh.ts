@@ -175,7 +175,7 @@ export class BufferMesh extends Mesh {
       new VertexBuffer(
         engine,
         verticesBuffer,
-        "color",
+        "worldContext",
         true,
         undefined,
         VoxelMeshVertexStructCursor.VertexFloatSize,

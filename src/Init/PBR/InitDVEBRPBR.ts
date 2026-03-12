@@ -38,6 +38,7 @@ export type DVEBRPBRData = DVEBRDefaultMaterialBaseData & {
 function applyTerrainPhase1SkyProfile(renderer: Awaited<ReturnType<typeof CreateDefaultRenderer>>) {
   const terrain = EngineSettings.settings.terrain;
   const isPBRPremium = terrain.benchmarkPreset === "pbr-premium";
+  const isPBRPremiumV2 = terrain.benchmarkPreset === "pbr-premium-v2";
   const isMaterialImport = terrain.benchmarkPreset === "material-import";
   const isOptimumInspired = terrain.benchmarkPreset === "optimum-inspired";
   const isUniversalisInspired = terrain.benchmarkPreset === "universalis-inspired";
@@ -153,6 +154,21 @@ function applyTerrainPhase1SkyProfile(renderer: Awaited<ReturnType<typeof Create
     );
   }
 
+  if (isPBRPremiumV2) {
+    renderer.sceneOptions.sky.setColor(118, 154, 204);
+    renderer.sceneOptions.fog.setColor(132, 156, 188);
+    renderer.sceneOptions.fog.heightFactor = Math.max(
+      renderer.sceneOptions.fog.heightFactor,
+      0.50
+    );
+    renderer.sceneOptions.levels.baseLevel = Math.max(
+      renderer.sceneOptions.levels.baseLevel,
+      0.17
+    );
+    renderer.sceneOptions.sky.horizon = Math.max(renderer.sceneOptions.sky.horizon, 76);
+    renderer.sceneOptions.sky.horizonEnd = Math.max(renderer.sceneOptions.sky.horizonEnd, 140);
+  }
+
   renderer.sceneOptions.ubo.buffer?.update();
 }
 
@@ -163,6 +179,7 @@ function applyTerrainPhase1RendererProfile(
 ) {
   const terrain = EngineSettings.settings.terrain;
   const isPBRPremium = terrain.benchmarkPreset === "pbr-premium";
+  const isPBRPremiumV2 = terrain.benchmarkPreset === "pbr-premium-v2";
   const isMaterialImport = terrain.benchmarkPreset === "material-import";
   const isOptimumInspired = terrain.benchmarkPreset === "optimum-inspired";
   const isUniversalisInspired = terrain.benchmarkPreset === "universalis-inspired";
@@ -173,7 +190,8 @@ function applyTerrainPhase1RendererProfile(
     !isMaterialImport &&
     !isOptimumInspired &&
     !isUniversalisInspired &&
-    !isPBRPremium
+    !isPBRPremium &&
+    !isPBRPremiumV2
   ) {
     return;
   }
@@ -235,6 +253,17 @@ function applyTerrainPhase1RendererProfile(
     ssr.roughnessFactor = 0.24;
     sunLight.intensity = 9.6;
   }
+
+  if (isPBRPremiumV2) {
+    pipeline.imageProcessing.contrast = 1.1;
+    pipeline.imageProcessing.exposure = 1.24;
+    pipeline.bloomThreshold = 0.52;
+    ssr.samples = Math.max(ssr.samples, 4);
+    ssr.strength = 0.84;
+    ssr.roughnessFactor = 0.1;
+    ssr.maxDistance = Math.max(ssr.maxDistance, 128);
+    sunLight.intensity = 9.6;
+  }
 }
 
 function applyTerrainPhase1Atmosphere(scene: Scene, isPBRPremium: boolean) {
@@ -242,6 +271,7 @@ function applyTerrainPhase1Atmosphere(scene: Scene, isPBRPremium: boolean) {
   const isMaterialImport = terrain.benchmarkPreset === "material-import";
   const isOptimumInspired = terrain.benchmarkPreset === "optimum-inspired";
   const isUniversalisInspired = terrain.benchmarkPreset === "universalis-inspired";
+  const isPBRPremiumV2 = terrain.benchmarkPreset === "pbr-premium-v2";
   if (
     !terrain.visualV2 &&
     !terrain.materialTriplanar &&
@@ -249,13 +279,16 @@ function applyTerrainPhase1Atmosphere(scene: Scene, isPBRPremium: boolean) {
     !isMaterialImport &&
     !isOptimumInspired &&
     !isUniversalisInspired &&
-    !isPBRPremium
+    !isPBRPremium &&
+    !isPBRPremiumV2
   ) {
     return;
   }
 
   scene.fogMode = Scene.FOGMODE_EXP2;
-  scene.fogDensity = isPBRPremium
+  scene.fogDensity = isPBRPremiumV2
+    ? 0.0023
+    : isPBRPremium
     ? 0.00245
     : isUniversalisInspired
       ? 0.0021
@@ -272,6 +305,12 @@ function applyTerrainPhase1Atmosphere(scene: Scene, isPBRPremium: boolean) {
     scene.fogMode = Scene.FOGMODE_NONE;
     scene.fogColor.set(0.74, 0.78, 0.8);
     scene.clearColor.set(0.58, 0.64, 0.7, 1);
+    return;
+  }
+
+  if (isPBRPremiumV2) {
+    scene.fogColor.set(0.54, 0.66, 0.78);
+    scene.clearColor.set(0.58, 0.72, 0.86, 1);
     return;
   }
 
@@ -306,6 +345,7 @@ function applyTerrainPhase1Atmosphere(scene: Scene, isPBRPremium: boolean) {
 function applyTerrainPhase1MaterialProfile(materials: MaterialInterface[]) {
   const terrain = EngineSettings.settings.terrain;
   const isPBRPremium = terrain.benchmarkPreset === "pbr-premium";
+  const isPBRPremiumV2 = terrain.benchmarkPreset === "pbr-premium-v2";
   const isMaterialImport = terrain.benchmarkPreset === "material-import";
   const isOptimumInspired = terrain.benchmarkPreset === "optimum-inspired";
   const isUniversalisInspired = terrain.benchmarkPreset === "universalis-inspired";
@@ -316,7 +356,8 @@ function applyTerrainPhase1MaterialProfile(materials: MaterialInterface[]) {
     !isMaterialImport &&
     !isOptimumInspired &&
     !isUniversalisInspired &&
-    !isPBRPremium
+    !isPBRPremium &&
+    !isPBRPremiumV2
   ) {
     return;
   }
@@ -501,6 +542,7 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
   const scene = initData.scene;
   const terrain = EngineSettings.settings.terrain;
   const isPBRPremium = terrain.benchmarkPreset === "pbr-premium";
+  const isPBRPremiumV2 = terrain.benchmarkPreset === "pbr-premium-v2";
   const isOptimumInspired = terrain.benchmarkPreset === "optimum-inspired";
   const isUniversalisInspired = terrain.benchmarkPreset === "universalis-inspired";
   const activeCamera = scene.activeCamera ?? scene.cameras[0];
@@ -512,7 +554,9 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
   await CreateTextures(initData.scene, initData.textureData, progress);
   const hdrTexture = new HDRCubeTexture("assets/skybox.hdr", scene, 512);
   initData.scene.environmentTexture = hdrTexture;
-  initData.scene.environmentIntensity = isPBRPremium
+  initData.scene.environmentIntensity = isPBRPremiumV2
+    ? 0.68
+    : isPBRPremium
     ? 0.42
     : isUniversalisInspired
       ? 0.74
@@ -540,7 +584,7 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
   glow.intensity = 1;
  */
   LevelParticles.init(scene);
-  applyTerrainPhase1Atmosphere(scene, isPBRPremium);
+  applyTerrainPhase1Atmosphere(scene, isPBRPremium || isPBRPremiumV2);
   const ssr = new SSRRenderingPipeline("ssr", initData.scene, [
     activeCamera,
   ]);
@@ -549,16 +593,16 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
 
   ssr.environmentTexture = hdrTexture as any;
   ssr.environmentTextureIsProbe = false;
-  ssr.samples = isPBRPremium ? 4 : isUniversalisInspired ? 4 : isOptimumInspired ? 4 : 2;
-  ssr.strength = isPBRPremium ? 0.72 : isUniversalisInspired ? 0.82 : isOptimumInspired ? 0.76 : 0.8;
-  ssr.roughnessFactor = isPBRPremium ? 0.24 : isUniversalisInspired ? 0.12 : isOptimumInspired ? 0.16 : 0.22;
+  ssr.samples = isPBRPremiumV2 ? 4 : isPBRPremium ? 4 : isUniversalisInspired ? 4 : isOptimumInspired ? 4 : 2;
+  ssr.strength = isPBRPremiumV2 ? 0.8 : isPBRPremium ? 0.72 : isUniversalisInspired ? 0.82 : isOptimumInspired ? 0.76 : 0.8;
+  ssr.roughnessFactor = isPBRPremiumV2 ? 0.1 : isPBRPremium ? 0.24 : isUniversalisInspired ? 0.12 : isOptimumInspired ? 0.16 : 0.22;
   ssr.reflectivityThreshold = 0.12;
   ssr.selfCollisionNumSkip = 2;
-  ssr.step = isPBRPremium ? 3 : isUniversalisInspired ? 3 : isOptimumInspired ? 3 : 2;
-  ssr.maxSteps = isPBRPremium ? 52 : isUniversalisInspired ? 48 : isOptimumInspired ? 48 : 64;
-  ssr.maxDistance = isPBRPremium ? 112 : isUniversalisInspired ? 128 : 128;
-  ssr.blurDownsample = isPBRPremium ? 2 : isUniversalisInspired ? 2 : isOptimumInspired ? 2 : 1;
-  ssr.thickness = isPBRPremium ? 1.05 : isUniversalisInspired ? 0.96 : 0.8;
+  ssr.step = isPBRPremiumV2 ? 3 : isPBRPremium ? 3 : isUniversalisInspired ? 3 : isOptimumInspired ? 3 : 2;
+  ssr.maxSteps = isPBRPremiumV2 ? 50 : isPBRPremium ? 52 : isUniversalisInspired ? 48 : isOptimumInspired ? 48 : 64;
+  ssr.maxDistance = isPBRPremiumV2 ? 128 : isPBRPremium ? 112 : isUniversalisInspired ? 128 : 128;
+  ssr.blurDownsample = isPBRPremiumV2 ? 2 : isPBRPremium ? 2 : isUniversalisInspired ? 2 : isOptimumInspired ? 2 : 1;
+  ssr.thickness = isPBRPremiumV2 ? 0.98 : isPBRPremium ? 1.05 : isUniversalisInspired ? 0.96 : 0.8;
   /*   ssrPipeline.thickness = 0.1;
   ssrPipeline.selfCollisionNumSkip = 2;
   ssrPipeline.blurDispersionStrength = 0;
@@ -629,7 +673,7 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
 
         //  shadows.forceBackFacesOnly = true;
         shadows.useContactHardeningShadow = true;
-        shadows.contactHardeningLightSizeUVRatio = isPBRPremium ? 0.08 : 0.05;
+        shadows.contactHardeningLightSizeUVRatio = isPBRPremium || isPBRPremiumV2 ? 0.08 : 0.05;
         shadows.setDarkness(0.1);
       }
 
@@ -641,7 +685,7 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
       scheduleTerrainPhase1MaterialProfileRefresh(scene, materials);
       scheduleTerrainPhase1PostRenderWarmup(scene, materials);
       LevelParticles.startNatureAmbient(
-        isPBRPremium || isUniversalisInspired ? "premium" : "lush"
+        isPBRPremium || isPBRPremiumV2 || isUniversalisInspired ? "premium" : "lush"
       );
       /*  
       renderer.observers.meshCreated.subscribe(InitDVEPBR, (mesh) => {
@@ -671,6 +715,8 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
       proceduralSkybox.renderingGroupId = 0;
       proceduralSkybox.infiniteDistance = true;
       proceduralSkybox.isPickable = false;
+
+      DVEBRPBRMaterial.flushImportedMapLog();
 
       /*    LevelParticles.start(
         new Color4(0, 1, 1, 1),

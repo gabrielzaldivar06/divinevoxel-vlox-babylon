@@ -341,6 +341,7 @@ export function applyActiveTerrainMaterialProfiles(
   const isOptimumInspired = terrain.benchmarkPreset === "optimum-inspired";
   const isUniversalisInspired = terrain.benchmarkPreset === "universalis-inspired";
   const isPBRPremium = terrain.benchmarkPreset === "pbr-premium";
+  const isPBRPremiumV2 = terrain.benchmarkPreset === "pbr-premium-v2";
 
   if (isMaterialImport) {
     applyTerrainMaterialProfileLayer(pbr, getMaterialImportProfile(classification));
@@ -370,6 +371,11 @@ export function applyActiveTerrainMaterialProfiles(
     applyTerrainMaterialProfileLayer(pbr, getPBRPremiumProfile(classification));
   }
 
+  if (isPBRPremiumV2) {
+    applyTerrainMaterialProfileLayer(pbr, getUniversalisInspiredProfile(classification));
+    applyTerrainMaterialProfileLayer(pbr, getPBRPremiumProfile(classification));
+  }
+
   pbr.metadata = {
     ...(pbr.metadata || {}),
     terrainPhase1: {
@@ -381,6 +387,7 @@ export function applyActiveTerrainMaterialProfiles(
       optimumInspired: isOptimumInspired,
       universalisInspired: isUniversalisInspired,
       pbrPremium: isPBRPremium,
+      pbrPremiumV2: isPBRPremiumV2,
     },
   };
 

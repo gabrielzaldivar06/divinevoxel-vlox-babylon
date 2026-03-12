@@ -48,6 +48,7 @@ export type DVEBRPBRMaterialData = MaterialData<{
 
 export class DVEBRPBRMaterial implements MaterialInterface {
   static ready = false;
+  static _importedMapLog: string[] = [];
   _material: PBRMaterial;
   scene: Scene;
 
@@ -183,6 +184,7 @@ export class DVEBRPBRMaterial implements MaterialInterface {
       material.detailMap.roughnessBlendLevel = 0;
       material.detailMap.bumpLevel = 1;
       material.forceIrradianceInFragment = true;
+      DVEBRPBRMaterial._importedMapLog.push(this.id);
     }
 
     applyActiveTerrainMaterialProfiles(material, this.id, EngineSettings.settings.terrain);
@@ -194,6 +196,20 @@ export class DVEBRPBRMaterial implements MaterialInterface {
     return this._material;
   }
 
+  static flushImportedMapLog() {
+    const log = DVEBRPBRMaterial._importedMapLog;
+    if (log.length > 0) {
+      console.info(
+        `[material-import] Imported PBR maps bound to ${log.length} materials: ${log.join(", ")}`
+      );
+    } else if (DVEBRPBRMaterial.importedMaterialMapSamplerIds.length > 0) {
+      console.info(
+        `[material-import] No materials received imported PBR maps.`
+      );
+    }
+    DVEBRPBRMaterial._importedMapLog = [];
+  }
+
   hasImportedMaterialMaps() {
     return DVEBRPBRMaterial.importedMaterialMapSamplerIds.every((samplerId) => {
       return this.textures.has(samplerId);
@@ -201,9 +217,12 @@ export class DVEBRPBRMaterial implements MaterialInterface {
   }
 
   shouldUseImportedMaterialMaps() {
+    if (!this.hasImportedMaterialMaps()) return false;
+    // dve_solid is the main terrain substance that renders all solid voxels.
+    // Per-voxel differentiation happens via texture layers in the shader.
+    if (this.id === "dve_solid") return true;
     const classification = classifyTerrainMaterial(this.id);
     return (
-      this.hasImportedMaterialMaps() &&
       !classification.isLiquid &&
       !classification.isTransparent &&
       !classification.isGlow &&
