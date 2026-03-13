@@ -57,6 +57,10 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
     defines[`DVE_${this.name}`] = true;
     defines.UV1 = true;
     defines.NORMAL = true;
+    // R11: Enable POM when material maps are active and pomEnabled runtime flag is set
+    defines.DVE_POM_ENABLED =
+      this.hasImportedMaterialMapsEnabled() &&
+      !!((EngineSettings.settings.terrain as any)?.pomEnabled);
   }
 
   getClassName() {
@@ -220,6 +224,10 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
     const enablePBRPremium = (benchmarkPreset === "pbr-premium" || benchmarkPreset === "pbr-premium-v2") && !isLiquid && !isTransparent;
     const enableImportedMaterialMaps =
       this.shouldUseImportedMaterialMaps() && !isLiquid && !isTransparent;
+    // R11: POM enabled when imported material maps are active and runtime flag is set
+    const enablePOM =
+      enableImportedMaterialMaps &&
+      !!((terrain as any)?.pomEnabled);
     const baseLightFloor =
       benchmarkPreset === "material-import"
         ? 0.72
@@ -821,28 +829,61 @@ uniform float dve_time;
 ${textures}
 ${varying}
 ${functions}
+// R11: POM UV delta — vec2(0) when POM is disabled, computed each fragment when pomEnabled.
+vec2 dvePOMDelta = vec2(0.0);
 #endif
 `,
 
         CUSTOM_FRAGMENT_UPDATE_ALBEDO: /*glsl*/ `
 #ifdef  DVE_${this.name}
+${enablePOM ? `
+// R11: Parallax Occlusion Mapping — derivative-based TBN, 8-step ray march
+#ifdef DVE_POM_ENABLED
+{
+  vec3 dve_pomViewDir = normalize(vEyePosition.xyz - vPositionW);
+  vec3 dve_pomNorm = normalize(vNormalW);
+  vec3 dve_pomPosDx = dFdx(vPositionW), dve_pomPosDy = dFdy(vPositionW);
+  vec2 dve_uvDx = dFdx(dveBaseUV), dve_uvDy = dFdy(dveBaseUV);
+  float dve_pomDet = dve_uvDx.x * dve_uvDy.y - dve_uvDy.x * dve_uvDx.y;
+  if (abs(dve_pomDet) > 1e-5) {
+    float dve_invDet = 1.0 / dve_pomDet;
+    vec3 dve_pomT = normalize((dve_pomPosDx * dve_uvDy.y - dve_pomPosDy * dve_uvDx.y) * dve_invDet);
+    vec3 dve_pomB = normalize((dve_pomPosDy * dve_uvDx.x - dve_pomPosDx * dve_uvDy.x) * dve_invDet);
+    float dve_pomTz = max(dot(dve_pomViewDir, dve_pomNorm), 0.1);
+    vec2 dve_pomStep = vec2(dot(dve_pomViewDir, dve_pomT), dot(dve_pomViewDir, dve_pomB))
+                       / dve_pomTz * 0.04 / 8.0;
+    vec2 dve_pomCurUV = dveBaseUV;
+    float dve_pomH = 1.0;
+    for (int dve_pi = 0; dve_pi < 8; dve_pi++) {
+      // E02: Derive height from inverse roughness (G = roughness channel in standard PBR packs:
+      // smooth areas are "taller" surfaces, rough areas are recessed). This works without
+      // requiring a dedicated height map in the import pipeline.
+      float dve_h = 1.0 - texture(dve_voxel_material, vec3(dve_pomCurUV, dveTextureLayer)).g;
+      if (dve_pomH < dve_h) break;
+      dve_pomH -= 0.125;
+      dve_pomCurUV -= dve_pomStep;
+    }
+    dvePOMDelta = dve_pomCurUV - dveBaseUV;
+  }
+}
+#endif` : ""}
 
 #ifndef  DVE_dve_liquid
-vec4 voxelBaseColor = texture(dve_voxel, vec3(dveBaseUV, dveTextureLayer));
+vec4 voxelBaseColor = texture(dve_voxel, vec3(dveBaseUV + dvePOMDelta, dveTextureLayer));
 if (dveOverlayTextureIndex.x > 0.) {
-  vec4 oRGB = texture(dve_voxel, vec3(dveBaseUV, dveOverlayTextureIndex.x));
+  vec4 oRGB = texture(dve_voxel, vec3(dveBaseUV + dvePOMDelta, dveOverlayTextureIndex.x));
   if (oRGB.a > 0.5) voxelBaseColor = oRGB;
 }
 if (dveOverlayTextureIndex.y > 0.) {
-  vec4 oRGB = texture(dve_voxel, vec3(dveBaseUV, dveOverlayTextureIndex.y));
+  vec4 oRGB = texture(dve_voxel, vec3(dveBaseUV + dvePOMDelta, dveOverlayTextureIndex.y));
   if (oRGB.a > 0.5) voxelBaseColor = oRGB;
 }
 if (dveOverlayTextureIndex.z > 0.) {
-  vec4 oRGB = texture(dve_voxel, vec3(dveBaseUV, dveOverlayTextureIndex.z));
+  vec4 oRGB = texture(dve_voxel, vec3(dveBaseUV + dvePOMDelta, dveOverlayTextureIndex.z));
   if (oRGB.a > 0.5) voxelBaseColor = oRGB;
 }
 if (dveOverlayTextureIndex.w > 0.) {
-  vec4 oRGB = texture(dve_voxel, vec3(dveBaseUV, dveOverlayTextureIndex.w));
+  vec4 oRGB = texture(dve_voxel, vec3(dveBaseUV + dvePOMDelta, dveOverlayTextureIndex.w));
   if (oRGB.a > 0.5) voxelBaseColor = oRGB;
 }
 ${albedoEnhancement}
@@ -857,6 +898,12 @@ ${premiumAlbedoCode}
 ${heightGradientAlbedoCode}
 ${importedMaterialAlbedoCode}
 ${unstableSurfaceContextLiftCode}
+// R15: Snow/ice accumulation on exposed top surfaces at altitude
+float dveSnowEligibility = dveSurfaceTop * smoothstep(0.55, 0.75, dveHeightNorm);
+float dveSnowNoise = dveFbm3(vPositionW * 0.15 + vec3(3.1, 0.0, 7.7));
+float dveSnowMask = smoothstep(0.3, 0.7, dveSnowEligibility + dveSnowNoise * 0.2);
+vec3 dveSnowColor = vec3(0.92, 0.94, 0.98);
+voxelBaseColor.rgb = mix(voxelBaseColor.rgb, dveSnowColor, dveSnowMask * 0.85);
 surfaceAlbedo = toLinearSpace(vec3(voxelBaseColor.r, voxelBaseColor.g, voxelBaseColor.b));
 alpha *= voxelBaseColor.a;
 #endif
@@ -896,6 +943,20 @@ alpha = ${benchmarkPreset === "material-import" ? "1.0" : "mix(0.82, 0.92, dveWa
 ${wetnessMicroSurfaceCode}
 ${heightGradientMicroSurfaceCode}
 ${importedMaterialMicroSurfaceCode}
+// R15: Snow microsurface — snow is glossy/icy on top surfaces at altitude
+#ifdef  DVE_${this.name}
+#ifndef  DVE_dve_liquid
+{
+  vec3 dveSnowNW = normalize(vNormalW);
+  float dveSnowTop = smoothstep(0.45, 0.8, dveSnowNW.y);
+  float dveSnowHN = clamp((vPositionW.y - 16.0) / 112.0, 0.0, 1.0);
+  float dveSnowE = dveSnowTop * smoothstep(0.55, 0.75, dveSnowHN);
+  float dveSnowN2 = dveFbm3(vPositionW * 0.15 + vec3(3.1, 0.0, 7.7));
+  float dveSnowM = smoothstep(0.3, 0.7, dveSnowE + dveSnowN2 * 0.2);
+  microSurface = mix(microSurface, 0.88, dveSnowM * 0.7);
+}
+#endif
+#endif
 `,
   CUSTOM_FRAGMENT_BEFORE_LIGHTS: /*glsl*/ `
 ${importedMaterialBeforeLightsCode}

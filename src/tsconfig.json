@@ -13,6 +13,13 @@
     "baseUrl": "./",
     "types": [],
     "allowJs": true,
-    "checkJs": false
-  }
+    "checkJs": false,
+    "paths": {
+      "@divinevoxel/vlox": ["../../vlox/src/index"],
+      "@divinevoxel/vlox/*": ["../../vlox/src/*"]
+    }
+  },
+  "references": [
+    { "path": "../../vlox/src" }
+  ]
 }

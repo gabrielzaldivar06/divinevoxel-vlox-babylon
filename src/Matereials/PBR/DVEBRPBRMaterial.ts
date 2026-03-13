@@ -6,6 +6,8 @@ import { Texture } from "@babylonjs/core/Materials/Textures/texture";
 import { PBRMaterial } from "@babylonjs/core/Materials/PBR/pbrMaterial";
 import { Vector3, Vector4 } from "@babylonjs/core/Maths/";
 import { DVEPBRMaterialPlugin } from "./DVEPBRMaterialPlugin";
+import { DVEDissolutionPlugin } from "./DVEDissolutionPlugin";
+import { DVELODMorphPlugin } from "./DVELODMorphPlugin";
 import { IMatrixLike } from "@babylonjs/core/Maths/math.like";
 import { MaterialData, MaterialInterface } from "../MaterialInterface.js";
 import { SceneOptions } from "../../Scene/SceneOptions";
@@ -114,6 +116,12 @@ export class DVEBRPBRMaterial implements MaterialInterface {
     const plugin = new newPlugin(material, pluginId, this, () => {});
     this.plugin = plugin;
     this._material = material;
+
+    // Dissolution shader plugin (conditionally active via EngineSettings)
+    new DVEDissolutionPlugin(material, `dissolution_${pluginId}`, data.scene);
+
+    // LOD morph shader plugin (conditionally active via EngineSettings)
+    new DVELODMorphPlugin(material, `lodmorph_${pluginId}`, data.scene);
 
     if (this.data.alphaTesting) {
       material.alphaMode = Material.MATERIAL_ALPHATEST;
@@ -275,6 +283,12 @@ export class DVEBRPBRMaterial implements MaterialInterface {
       this,
       () => {}
     ) as DVEPBRMaterialPlugin;
+
+    // Dissolution shader plugin for cloned material
+    new DVEDissolutionPlugin(newMat, `dissolution_${pluginId}`, scene);
+
+    // LOD morph shader plugin for cloned material
+    new DVELODMorphPlugin(newMat, `lodmorph_${pluginId}`, scene);
 
     const textures = new Map<string, Texture>();
     for (const [textId, texture] of this.textures) {

@@ -120,6 +120,44 @@ export class DVEBRVoxelMesh {
         4
       )
     );
+    // Dissolution padding attributes
+    geo.setVerticesBuffer(
+      new VertexBuffer(
+        engine, buffer, "dissolutionProximity", false, undefined,
+        VoxelMeshVertexStructCursor.VertexFloatSize, undefined, 3, 1
+      )
+    );
+    geo.setVerticesBuffer(
+      new VertexBuffer(
+        engine, buffer, "pullStrength", false, undefined,
+        VoxelMeshVertexStructCursor.VertexFloatSize, undefined, 7, 1
+      )
+    );
+    geo.setVerticesBuffer(
+      new VertexBuffer(
+        engine, buffer, "subdivLevel", false, undefined,
+        VoxelMeshVertexStructCursor.VertexFloatSize, undefined, 11, 1
+      )
+    );
+    geo.setVerticesBuffer(
+      new VertexBuffer(
+        engine, buffer, "pullDirectionBias", false, undefined,
+        VoxelMeshVertexStructCursor.VertexFloatSize, undefined, 17, 1
+      )
+    );
+    geo.setVerticesBuffer(
+      new VertexBuffer(
+        engine, buffer, "phNormalized", false, undefined,
+        VoxelMeshVertexStructCursor.VertexFloatSize, undefined, 27, 1
+      )
+    );
+    // R06: Vertex-baked AO — packed at padding[26]
+    geo.setVerticesBuffer(
+      new VertexBuffer(
+        engine, buffer, "subdivAO", false, undefined,
+        VoxelMeshVertexStructCursor.VertexFloatSize, undefined, 26, 1
+      )
+    );
     geo.setIndices(indices);
     return buffer;
   }

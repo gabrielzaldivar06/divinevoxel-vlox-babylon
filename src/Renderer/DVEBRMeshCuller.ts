@@ -10,6 +10,10 @@ const max = new Vector3(16, 16, 16);
 const boundingBox = new BoundingBox(min, max);
 const addMeshes: Mesh[] = [];
 const removedMeshes: Mesh[] = [];
+
+/** Draw-call budget enforcement — tracks consecutive over-budget frames. */
+let _budgetWarningCooldown = 0;
+const _BUDGET_WARN_INTERVAL = 300; // frames between warnings
 const sectorCenter = new Vector3();
 const sectorDirection = new Vector3();
 const forwardDirection = new Vector3();
@@ -219,6 +223,24 @@ function CullSectors(scene: Scene) {
   }
   addMeshes.length = 0;
   removedMeshes.length = 0;
+
+  // Draw-call budget enforcement
+  const budget = EngineSettings.settings.terrain.maxSceneMeshes;
+  const activeMeshCount = scene.meshes.length;
+  if (activeMeshCount > budget) {
+    if (_budgetWarningCooldown <= 0) {
+      console.warn(
+        `[DVE] Scene mesh budget exceeded: ${activeMeshCount}/${budget} active meshes. ` +
+        `Each mesh = 1+ draw call per render pass. ` +
+        `Increase terrain.maxSceneMeshes or reduce visible sections/materials.`
+      );
+      _budgetWarningCooldown = _BUDGET_WARN_INTERVAL;
+    } else {
+      _budgetWarningCooldown--;
+    }
+  } else {
+    _budgetWarningCooldown = Math.max(0, _budgetWarningCooldown - 1);
+  }
 }
 
 export class DVEBRMeshCuller {

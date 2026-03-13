@@ -8,9 +8,12 @@ import { CreateBox } from "@babylonjs/core/Meshes/Builders/boxBuilder";
 import { DirectionalLight } from "@babylonjs/core/Lights/directionalLight";
 import { HemisphericLight } from "@babylonjs/core/Lights/hemisphericLight";
 import { ShadowGenerator } from "@babylonjs/core/Lights/Shadows/shadowGenerator";
+import { CascadedShadowGenerator } from "@babylonjs/core/Lights/Shadows/cascadedShadowGenerator";
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { SSRRenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPipeline/Pipelines/ssrRenderingPipeline";
+import { SSAO2RenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPipeline/Pipelines/ssao2RenderingPipeline";
 import { ImageProcessingConfiguration } from "@babylonjs/core/Materials/imageProcessingConfiguration";
+import { ColorCurves } from "@babylonjs/core/Materials/colorCurves";
 import { Material } from "@babylonjs/core/Materials/material";
 import { DefaultRenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPipeline/Pipelines/defaultRenderingPipeline";
 import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
@@ -574,11 +577,39 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
   pipeline.imageProcessing.exposure = 1.02;
   pipeline.bloomEnabled = true;
   pipeline.bloomThreshold = 0.52;
-  // pipeline.sharpenEnabled = true;
+  // R20: Enable sharpening to compensate FXAA blur
+  pipeline.sharpenEnabled = true;
+  pipeline.sharpen.edgeAmount = 0.2;
+  pipeline.sharpen.colorAmount = 1.0;
   pipeline.depthOfFieldEnabled = false;
+
+  // R14: Color grading via color curves — warm shadows, cool highlights
+  pipeline.imageProcessing.colorCurvesEnabled = true;
+  const curves = new ColorCurves();
+  curves.shadowsHue = 30;           // orange tint in shadows
+  curves.shadowsDensity = 15;       // subtle
+  curves.shadowsSaturation = 20;
+  curves.highlightsHue = 200;       // teal tint in highlights
+  curves.highlightsDensity = 10;
+  curves.highlightsSaturation = 15;
+  curves.midtonesHue = 20;
+  curves.midtonesDensity = 5;
+  curves.midtonesSaturation = 10;
+  pipeline.imageProcessing.colorCurves = curves;
 
   pipeline.fxaaEnabled = true;
   pipeline.fxaa.adaptScaleToCurrentViewport = true;
+
+  // F02: Filmic vignette — MULTIPLY blend darkens screen edges for cinematic depth.
+  pipeline.imageProcessing.vignetteEnabled = true;
+  pipeline.imageProcessing.vignetteWeight = 2.2;
+  pipeline.imageProcessing.vignetteCentreX = 0.0;
+  pipeline.imageProcessing.vignetteCentreY = 0.0;
+  pipeline.imageProcessing.vignetteBlendMode = 0; // 0 = VIGNETTEMODE_MULTIPLY
+  // F02: Animated film grain — breaks color banding, adds high-frequency cinematic texture.
+  pipeline.grainEnabled = true;
+  pipeline.grain.intensity = isPBRPremiumV2 || isPBRPremium ? 16 : 12;
+  pipeline.grain.animated = true;
 
   /*   const glow = new GlowLayer("", scene);
   glow.intensity = 1;
@@ -603,6 +634,18 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
   ssr.maxDistance = isPBRPremiumV2 ? 128 : isPBRPremium ? 112 : isUniversalisInspired ? 128 : 128;
   ssr.blurDownsample = isPBRPremiumV2 ? 2 : isPBRPremium ? 2 : isUniversalisInspired ? 2 : isOptimumInspired ? 2 : 1;
   ssr.thickness = isPBRPremiumV2 ? 0.98 : isPBRPremium ? 1.05 : isUniversalisInspired ? 0.96 : 0.8;
+
+  // R20: SSAO2 — contact shadows for voxel geometry
+  const ssao = new SSAO2RenderingPipeline("ssao", initData.scene, {
+    ssaoRatio: 0.5,
+    blurRatio: 0.5,
+  }, [activeCamera]);
+  ssao.radius = 1.5;
+  ssao.totalStrength = isPBRPremiumV2 || isPBRPremium ? 0.9 : isUniversalisInspired ? 0.85 : 0.8;
+  ssao.base = 0.1;
+  ssao.samples = isPBRPremiumV2 ? 16 : isPBRPremium ? 14 : isUniversalisInspired ? 14 : 12;
+  ssao.maxZ = 200;
+  ssao.minZAspect = 0.5;
   /*   ssrPipeline.thickness = 0.1;
   ssrPipeline.selfCollisionNumSkip = 2;
   ssrPipeline.blurDispersionStrength = 0;
@@ -631,7 +674,9 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
     afterCreate: async (_renderer, materials) => {
       scene.ambientColor.set(1, 1, 1);
       {
-        const hemLight = new HemisphericLight("", new Vector3(0, 0, 0), scene);
+        // direction=(0,1,0): sky is "up", ground hemisphere is "down".
+        // (0,0,0) is an invalid direction that produces undefined behaviour in some GL drivers.
+        const hemLight = new HemisphericLight("", new Vector3(0, 1, 0), scene);
         hemLight.specular.set(0, 0, 0);
         hemLight.intensity = 0.4;
         hemLight.diffuse.set(0.6, 0.62, 0.66);
@@ -660,25 +705,71 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
       sunLight.position.y = 200;
 
       sunLight.diffuse.set(1, 0.95, 0.88);
-      sunLight.specular.set(0, 0, 0);
+      // Enable specular on the sun light so PBR surfaces (especially water) receive
+      // sun glint and specular highlights. Previously disabled (0,0,0) which caused
+      // the water to appear uniformly flat with no solar sparkle.
+      sunLight.specular.set(1, 0.95, 0.88);
       if (isMaterialImport) {
         // Imported material arrays still destabilize the shadow compile path here.
         // Keep this disabled until Etapa 1 can re-enable shadows without black-world startup regressions.
         sunLight.shadowEnabled = false;
       } else {
-        const shadowMapSize = 1024;
-        const shadows = new ShadowGenerator(shadowMapSize, sunLight);
-        // this.shadows.usePoissonSampling = true;
+        // R13: Cascaded Shadow Generator — 2 cascades (near + far) for quality gradient + PCF softening.
+        // Performance notes: numCascades=2 saves ~20% draw calls vs 3; autoCalcDepthBounds=false avoids
+        // per-frame GPU readback; stabilizeCascades=true reduces cascade-boundary shimmer on movement.
+        const shadowMapSize = 512;
+        const shadows = new CascadedShadowGenerator(shadowMapSize, sunLight);
+        shadows.numCascades = 2;
+        shadows.lambda = 0.9;          // slight spread — near cascade covers crisp region, far covers mid-range
+        shadows.stabilizeCascades = true;
         shadows.usePercentageCloserFiltering = true;
-
-        //  shadows.forceBackFacesOnly = true;
-        shadows.useContactHardeningShadow = true;
-        shadows.contactHardeningLightSizeUVRatio = isPBRPremium || isPBRPremiumV2 ? 0.08 : 0.05;
+        shadows.filteringQuality = ShadowGenerator.QUALITY_MEDIUM;
         shadows.setDarkness(0.1);
+
+        // R13: Register terrain chunks as shadow casters and receivers.
+        // DVE terrain meshes use empty names ("") — filter on that identifier.
+        scene.onNewMeshAddedObservable.add((mesh) => {
+          if (mesh.name === "") {
+            shadows.addShadowCaster(mesh);
+            mesh.receiveShadows = true;
+          }
+        });
+        scene.onMeshRemovedObservable.add((mesh) => {
+          if (mesh.name === "") {
+            shadows.removeShadowCaster(mesh);
+          }
+        });
       }
 
       // this.shadows.blurScale = 0;
       // initData.scene.useRightHandedSystem = false;
+
+      // R17: Weather state controller — per-frame fog/light/SSR modulation driven by
+      // (terrain as any).weatherState (0=clear, 1=full rain). Game layer sets this value;
+      // the observer applies corresponding scene-level changes each frame.
+      const dve_baseFogDensity = scene.fogDensity;
+      const dve_baseSunIntensity = sunLight.intensity;
+      scene.onBeforeRenderObservable.add(() => {
+        // R04: Update LOD camera position so mesher-side SubdivisionBuilder can cap N by distance.
+        // Written each frame; read lazily when a chunk builds and accesses lodCameraPos.
+        const dve_cam = scene.activeCamera;
+        if (dve_cam) {
+          const cp = dve_cam.globalPosition;
+          (EngineSettings.settings.terrain as any).lodCameraPos = [cp.x, cp.y, cp.z];
+        }
+
+        const dve_ws = (EngineSettings.settings.terrain as any).weatherState ?? 0.0;
+        if (dve_ws < 0.001) {
+          scene.fogDensity = dve_baseFogDensity;
+          sunLight.intensity = dve_baseSunIntensity;
+          return;
+        }
+        const dve_rAmt = Math.max(0, Math.min(1, (dve_ws - 0.3) / 0.55));
+        const dve_t = dve_rAmt * dve_rAmt * (3 - 2 * dve_rAmt); // smoothstep
+        scene.fogDensity = dve_baseFogDensity * (1 + dve_t * 0.65);
+        sunLight.intensity = dve_baseSunIntensity * (1 - dve_t * 0.42);
+        ssr.strength = Math.min(0.82 + dve_t * 0.18, 1.0);
+      });
 
       applyTerrainPhase1RendererProfile(pipeline, ssr, sunLight);
       applyTerrainPhase1MaterialProfile(materials);
@@ -687,28 +778,6 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
       LevelParticles.startNatureAmbient(
         isPBRPremium || isPBRPremiumV2 || isUniversalisInspired ? "premium" : "lush"
       );
-      /*  
-      renderer.observers.meshCreated.subscribe(InitDVEPBR, (mesh) => {
-        if (!probe.renderList) probe.renderList = [];
-  if (mesh._mesh.id.includes("glow")) {
-
-          glow.referenceMeshToUseItsOwnMaterial(mesh._mesh);
-        }
-        shadows.addShadowCaster(mesh._mesh);
-
-        mesh._mesh.receiveShadows = true;
-        probe.renderList.push(mesh._mesh);
-      });
-      renderer.observers.meshDisposed.subscribe(InitDVEPBR, ({ _mesh }) => {
-        if (!probe.renderList) return;
-        shadows.removeShadowCaster(_mesh);
-        probe.renderList = probe.renderList.filter((_) => _ == _mesh);
-      });
-
-      renderer.materials.materials.forEach((material, key) => {
-        (material as DVEBRPBRMaterial)._material.disableLighting = false;
-      });
- */
       initData.scene.ambientColor.set(0.32, 0.33, 0.38);
 
       const proceduralSkybox = InitSkybox({ renderer: _renderer });
