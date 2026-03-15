@@ -136,6 +136,14 @@ export class LODSectorTracker {
     for (const key of this._states.keys()) {
       if (!activeKeys.has(key)) {
         this._states.delete(key);
+        // BUG-L01: purge stale remesh requests for this sector so the mesher doesn't
+        // attempt to rebuild geometry for coordinates that no longer exist in MeshRegister.
+        for (let i = this._remeshQueue.length - 1; i >= 0; i--) {
+          const r = this._remeshQueue[i];
+          if (sectorKey(r.dimensionId, r.x, r.y, r.z) === key) {
+            this._remeshQueue.splice(i, 1);
+          }
+        }
       }
     }
 

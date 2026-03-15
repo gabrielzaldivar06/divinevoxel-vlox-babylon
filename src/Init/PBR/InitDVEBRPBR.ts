@@ -17,6 +17,7 @@ import { ColorCurves } from "@babylonjs/core/Materials/colorCurves";
 import { Material } from "@babylonjs/core/Materials/material";
 import { DefaultRenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPipeline/Pipelines/defaultRenderingPipeline";
 import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
+import { ShaderMaterial } from "@babylonjs/core/Materials/shaderMaterial";
 import { Texture } from "@babylonjs/core/Materials/Textures/texture";
 import { HDRCubeTexture } from "@babylonjs/core/Materials/Textures/hdrCubeTexture";
 import { Scene } from "@babylonjs/core/scene";
@@ -24,12 +25,14 @@ import "@babylonjs/core/Lights/Shadows/shadowGeneratorSceneComponent";
 import "@babylonjs/core/Rendering/depthRendererSceneComponent";
 import "@babylonjs/core/Rendering/geometryBufferRendererSceneComponent";
 import "@babylonjs/core/Rendering/prePassRendererSceneComponent";
+import "@babylonjs/core/PostProcesses/RenderPipeline/postProcessRenderPipelineManagerSceneComponent";
 
 import { LevelParticles } from "./LevelParticles";
 import { WorkItemProgress } from "@divinevoxel/vlox/Util/WorkItemProgress";
 import { EngineSettings } from "@divinevoxel/vlox/Settings/EngineSettings";
 import { MaterialInterface } from "../../Matereials/MaterialInterface";
 import { InitSkybox } from "../Skybox/InitSkybox";
+import { BilateralNormalSmoothPostProcess } from "../../PostProcess/BilateralNormalSmooth";
 import {
   applyActiveTerrainMaterialProfiles,
   classifyTerrainMaterial,
@@ -38,6 +41,73 @@ export type DVEBRPBRData = DVEBRDefaultMaterialBaseData & {
   getProgress?: (progress: WorkItemProgress) => void;
 };
 
+// ─── Preset renderer configuration lookup table ─────────────────────────────
+// Fix 4: All per-preset numeric values live here. Adding a new preset only
+// requires a single entry in this table — no more scattered if-chains.
+// Fix 2: Safe SSR fallback (step=3, maxSteps=48, blurDownsample=2) prevents
+// the documented ~1 FPS regression on unrecognised or future presets.
+interface SSRPresetCfg {
+  samples: number; strength: number; roughnessFactor: number;
+  step: number; maxSteps: number; maxDistance: number;
+  blurDownsample: number; thickness: number;
+}
+interface RendererPresetCfg {
+  environmentIntensity: number;
+  grainIntensity: number;
+  bilateralStrength: number;   // 0 = SE-02 disabled for this preset
+  depthOfField?: { enabled: boolean }; // T6: opt-in DoF for ground-plane grid softening
+  ssr: SSRPresetCfg;
+  ssao: { totalStrength: number; samples: number; radius: number };
+}
+const DEFAULT_RENDERER_PRESET: RendererPresetCfg = {
+  environmentIntensity: 0.58,
+  grainIntensity: 12,
+  bilateralStrength: 0,
+  ssr:  { samples: 2, strength: 0.8, roughnessFactor: 0.22, step: 3, maxSteps: 48, maxDistance: 128, blurDownsample: 2, thickness: 0.8 },
+  ssao: { totalStrength: 0.8, samples: 12, radius: 1.5 },
+};
+const RENDERER_PRESET_CONFIGS: Readonly<Record<string, RendererPresetCfg>> = {
+  "pbr-premium": {
+    environmentIntensity: 0.42, grainIntensity: 16, bilateralStrength: 0.65,
+    ssr:  { samples: 4, strength: 0.72, roughnessFactor: 0.24, step: 3, maxSteps: 52, maxDistance: 112, blurDownsample: 2, thickness: 1.05 },
+    ssao: { totalStrength: 0.9, samples: 14, radius: 2.5 },
+  },
+  "pbr-premium-v2": {
+    environmentIntensity: 0.68, grainIntensity: 16, bilateralStrength: 0.65,
+    depthOfField: { enabled: true },
+    ssr:  { samples: 4, strength: 0.8, roughnessFactor: 0.1, step: 3, maxSteps: 50, maxDistance: 128, blurDownsample: 2, thickness: 0.98 },
+    ssao: { totalStrength: 0.9, samples: 16, radius: 2.2 },
+  },
+  "optimum-inspired": {
+    environmentIntensity: 0.62, grainIntensity: 12, bilateralStrength: 0,
+    ssr:  { samples: 4, strength: 0.76, roughnessFactor: 0.16, step: 3, maxSteps: 48, maxDistance: 128, blurDownsample: 2, thickness: 0.8 },
+    ssao: { totalStrength: 0.8, samples: 12, radius: 1.5 },
+  },
+  "universalis-inspired": {
+    environmentIntensity: 0.74, grainIntensity: 12, bilateralStrength: 0,
+    ssr:  { samples: 4, strength: 0.82, roughnessFactor: 0.12, step: 3, maxSteps: 48, maxDistance: 128, blurDownsample: 2, thickness: 0.96 },
+    ssao: { totalStrength: 0.85, samples: 14, radius: 2.2 },
+  },
+  "definitivo": {
+    environmentIntensity: 0.78, grainIntensity: 14, bilateralStrength: 0.65,
+    depthOfField: { enabled: true },
+    ssr:  { samples: 4, strength: 0.84, roughnessFactor: 0.11, step: 3, maxSteps: 50, maxDistance: 128, blurDownsample: 2, thickness: 0.96 },
+    ssao: { totalStrength: 0.97, samples: 16, radius: 3.2 },
+  },
+  // BUG-A01: these premium presets were missing — they fell to DEFAULT (ssr.samples=2, SE-02 off)
+  "pbr-surface-lod": {
+    environmentIntensity: 0.64, grainIntensity: 14, bilateralStrength: 0.55,
+    ssr:  { samples: 4, strength: 0.78, roughnessFactor: 0.14, step: 3, maxSteps: 50, maxDistance: 128, blurDownsample: 2, thickness: 0.9 },
+    ssao: { totalStrength: 0.85, samples: 14, radius: 2.2 },
+  },
+  "phase-4-geometry": {
+    environmentIntensity: 0.66, grainIntensity: 14, bilateralStrength: 0.60,
+    ssr:  { samples: 4, strength: 0.82, roughnessFactor: 0.12, step: 3, maxSteps: 50, maxDistance: 128, blurDownsample: 2, thickness: 0.92 },
+    ssao: { totalStrength: 0.88, samples: 14, radius: 2.2 },
+  },
+};
+// ────────────────────────────────────────────────────────────────────────────
+
 function applyTerrainPhase1SkyProfile(renderer: Awaited<ReturnType<typeof CreateDefaultRenderer>>) {
   const terrain = EngineSettings.settings.terrain;
   const isPBRPremium = terrain.benchmarkPreset === "pbr-premium";
@@ -45,6 +115,7 @@ function applyTerrainPhase1SkyProfile(renderer: Awaited<ReturnType<typeof Create
   const isMaterialImport = terrain.benchmarkPreset === "material-import";
   const isOptimumInspired = terrain.benchmarkPreset === "optimum-inspired";
   const isUniversalisInspired = terrain.benchmarkPreset === "universalis-inspired";
+  const isDefinitivo = terrain.benchmarkPreset === "definitivo";
 
   renderer.sceneOptions.shade.doSun = true;
   renderer.sceneOptions.shade.doRGB = true;
@@ -172,6 +243,24 @@ function applyTerrainPhase1SkyProfile(renderer: Awaited<ReturnType<typeof Create
     renderer.sceneOptions.sky.horizonEnd = Math.max(renderer.sceneOptions.sky.horizonEnd, 140);
   }
 
+  if (isDefinitivo) {
+    // Deep azure zenith sky; warm amber-tinted horizon fog simulates late-afternoon sun scatter.
+    renderer.sceneOptions.sky.setColor(102, 146, 210);  // deep azure zenith
+    renderer.sceneOptions.fog.setColor(172, 148, 122);  // amber horizon haze
+    renderer.sceneOptions.fog.heightFactor = Math.max(
+      renderer.sceneOptions.fog.heightFactor,
+      0.56
+    );
+    renderer.sceneOptions.levels.baseLevel = Math.max(
+      renderer.sceneOptions.levels.baseLevel,
+      0.22
+    );
+    renderer.sceneOptions.sky.horizon    = Math.max(renderer.sceneOptions.sky.horizon, 68);
+    renderer.sceneOptions.sky.horizonEnd = Math.max(renderer.sceneOptions.sky.horizonEnd, 130);
+    renderer.sceneOptions.sky.startBlend = Math.max(renderer.sceneOptions.sky.startBlend, 80);
+    renderer.sceneOptions.sky.endBlend   = Math.max(renderer.sceneOptions.sky.endBlend, 128);
+  }
+
   renderer.sceneOptions.ubo.buffer?.update();
 }
 
@@ -186,6 +275,7 @@ function applyTerrainPhase1RendererProfile(
   const isMaterialImport = terrain.benchmarkPreset === "material-import";
   const isOptimumInspired = terrain.benchmarkPreset === "optimum-inspired";
   const isUniversalisInspired = terrain.benchmarkPreset === "universalis-inspired";
+  const isDefinitivo = terrain.benchmarkPreset === "definitivo";
   if (
     !terrain.visualV2 &&
     !terrain.materialTriplanar &&
@@ -194,7 +284,8 @@ function applyTerrainPhase1RendererProfile(
     !isOptimumInspired &&
     !isUniversalisInspired &&
     !isPBRPremium &&
-    !isPBRPremiumV2
+    !isPBRPremiumV2 &&
+    !isDefinitivo
   ) {
     return;
   }
@@ -203,7 +294,7 @@ function applyTerrainPhase1RendererProfile(
     pipeline.imageProcessing.contrast = 1.16;
     pipeline.imageProcessing.exposure = 0.9;
     pipeline.bloomThreshold = 0.62;
-    ssr.strength = 0.64;
+    ssr.strength = 0.64;       // material-import not in RENDERER_PRESET_CONFIGS — keep here
     ssr.roughnessFactor = 0.24;
     sunLight.intensity = 6.8;
   }
@@ -212,7 +303,7 @@ function applyTerrainPhase1RendererProfile(
     pipeline.imageProcessing.contrast = 1.12;
     pipeline.imageProcessing.exposure = 1.04;
     pipeline.bloomThreshold = 0.5;
-    ssr.strength = 0.72;
+    ssr.strength = 0.72;       // feature-flag path — not in table, keep here
     ssr.roughnessFactor = 0.18;
     sunLight.intensity = 8.2;
   }
@@ -220,18 +311,19 @@ function applyTerrainPhase1RendererProfile(
   if (terrain.materialWetness) {
     pipeline.imageProcessing.exposure = 1.02;
     pipeline.bloomThreshold = 0.56;
-    ssr.strength = 0.78;
+    ssr.strength = 0.78;       // feature-flag path — not in table, keep here
     ssr.roughnessFactor = 0.14;
     sunLight.intensity = 8.0;
   }
 
+  // BUG-A02: SSR params for named presets are now authoritative in RENDERER_PRESET_CONFIGS.
+  // Only pipeline visual params (contrast, exposure, bloom, sunLight) remain here;
+  // ssr.strength/samples/roughnessFactor/maxDistance were removed to eliminate the
+  // dual-source-of-truth conflict where this function silently overrode the lookup table.
   if (isOptimumInspired) {
     pipeline.imageProcessing.contrast = 1.13;
     pipeline.imageProcessing.exposure = 1.08;
     pipeline.bloomThreshold = 0.5;
-    ssr.samples = Math.max(ssr.samples, 4);
-    ssr.strength = 0.76;
-    ssr.roughnessFactor = 0.16;
     sunLight.intensity = 8.6;
   }
 
@@ -239,10 +331,6 @@ function applyTerrainPhase1RendererProfile(
     pipeline.imageProcessing.contrast = 1.08;
     pipeline.imageProcessing.exposure = 1.22;
     pipeline.bloomThreshold = 0.54;
-    ssr.samples = Math.max(ssr.samples, 4);
-    ssr.strength = 0.88;
-    ssr.roughnessFactor = 0.08;
-    ssr.maxDistance = Math.max(ssr.maxDistance, 128);
     sunLight.intensity = 9.4;
   }
 
@@ -251,9 +339,6 @@ function applyTerrainPhase1RendererProfile(
     pipeline.imageProcessing.exposure = 1.3;
     pipeline.imageProcessing.toneMappingEnabled = false;
     pipeline.bloomThreshold = 0.62;
-    ssr.samples = 6;
-    ssr.strength = 0.66;
-    ssr.roughnessFactor = 0.24;
     sunLight.intensity = 9.6;
   }
 
@@ -261,11 +346,19 @@ function applyTerrainPhase1RendererProfile(
     pipeline.imageProcessing.contrast = 1.1;
     pipeline.imageProcessing.exposure = 1.24;
     pipeline.bloomThreshold = 0.52;
-    ssr.samples = Math.max(ssr.samples, 4);
-    ssr.strength = 0.84;
-    ssr.roughnessFactor = 0.1;
-    ssr.maxDistance = Math.max(ssr.maxDistance, 128);
     sunLight.intensity = 9.6;
+  }
+
+  if (isDefinitivo) {
+    pipeline.imageProcessing.contrast = 1.18;  // punchy cinema contrast
+    pipeline.imageProcessing.exposure = 1.28;  // brighter exposure, let ACES handle rolloff
+    pipeline.bloomThreshold = 0.42;            // more surfaces contribute to haze
+    sunLight.intensity = 11.5;                 // strong golden-hour sun
+    sunLight.direction.set(-0.55, -0.76, -0.35); // low NW angle: late afternoon slant
+    sunLight.diffuse.set(1.0, 0.91, 0.72);    // warm amber sunlight
+    sunLight.specular.set(1.0, 0.93, 0.78);   // warm specular glint
+    // Extra sharpening for organic terrain micro-detail
+    pipeline.sharpen.edgeAmount = 0.36;
   }
 }
 
@@ -275,6 +368,7 @@ function applyTerrainPhase1Atmosphere(scene: Scene, isPBRPremium: boolean) {
   const isOptimumInspired = terrain.benchmarkPreset === "optimum-inspired";
   const isUniversalisInspired = terrain.benchmarkPreset === "universalis-inspired";
   const isPBRPremiumV2 = terrain.benchmarkPreset === "pbr-premium-v2";
+  const isDefinitivo = terrain.benchmarkPreset === "definitivo";
   if (
     !terrain.visualV2 &&
     !terrain.materialTriplanar &&
@@ -283,13 +377,16 @@ function applyTerrainPhase1Atmosphere(scene: Scene, isPBRPremium: boolean) {
     !isOptimumInspired &&
     !isUniversalisInspired &&
     !isPBRPremium &&
-    !isPBRPremiumV2
+    !isPBRPremiumV2 &&
+    !isDefinitivo
   ) {
     return;
   }
 
   scene.fogMode = Scene.FOGMODE_EXP2;
-  scene.fogDensity = isPBRPremiumV2
+  scene.fogDensity = isDefinitivo
+    ? 0.0022
+    : isPBRPremiumV2
     ? 0.0023
     : isPBRPremium
     ? 0.00245
@@ -323,6 +420,13 @@ function applyTerrainPhase1Atmosphere(scene: Scene, isPBRPremium: boolean) {
     return;
   }
 
+  if (isDefinitivo) {
+    // Warm afternoon haze — golden sun warms the low-frequency fog; sky stays azure.
+    scene.fogColor.set(0.68, 0.62, 0.54);    // warm dusty amber-fog at horizon
+    scene.clearColor.set(0.46, 0.64, 0.88, 1); // deeper azure sky
+    return;
+  }
+
   if (terrain.materialWetness) {
     scene.fogColor.set(0.62, 0.7, 0.8);
     scene.clearColor.set(0.68, 0.77, 0.9, 1);
@@ -352,6 +456,7 @@ function applyTerrainPhase1MaterialProfile(materials: MaterialInterface[]) {
   const isMaterialImport = terrain.benchmarkPreset === "material-import";
   const isOptimumInspired = terrain.benchmarkPreset === "optimum-inspired";
   const isUniversalisInspired = terrain.benchmarkPreset === "universalis-inspired";
+  const isDefinitivo = terrain.benchmarkPreset === "definitivo";
   if (
     !terrain.visualV2 &&
     !terrain.materialTriplanar &&
@@ -360,7 +465,8 @@ function applyTerrainPhase1MaterialProfile(materials: MaterialInterface[]) {
     !isOptimumInspired &&
     !isUniversalisInspired &&
     !isPBRPremium &&
-    !isPBRPremiumV2
+    !isPBRPremiumV2 &&
+    !isDefinitivo
   ) {
     return;
   }
@@ -548,6 +654,10 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
   const isPBRPremiumV2 = terrain.benchmarkPreset === "pbr-premium-v2";
   const isOptimumInspired = terrain.benchmarkPreset === "optimum-inspired";
   const isUniversalisInspired = terrain.benchmarkPreset === "universalis-inspired";
+  const isDefinitivo = terrain.benchmarkPreset === "definitivo";
+  // Fix 4: resolve all numeric preset config from the lookup table.
+  // Unknown/future presets fall back to DEFAULT_RENDERER_PRESET (safe SSR values).
+  const presetCfg = RENDERER_PRESET_CONFIGS[terrain.benchmarkPreset] ?? DEFAULT_RENDERER_PRESET;
   const activeCamera = scene.activeCamera ?? scene.cameras[0];
   if (!activeCamera) {
     throw new Error(
@@ -557,15 +667,10 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
   await CreateTextures(initData.scene, initData.textureData, progress);
   const hdrTexture = new HDRCubeTexture("assets/skybox.hdr", scene, 512);
   initData.scene.environmentTexture = hdrTexture;
-  initData.scene.environmentIntensity = isPBRPremiumV2
-    ? 0.68
-    : isPBRPremium
-    ? 0.42
-    : isUniversalisInspired
-      ? 0.74
-    : isOptimumInspired
-      ? 0.62
-    : 0.58;
+  // BUG-G02: dispose the HDR texture (~3–6 MB VRAM) when the scene is torn down;
+  // without this, reloads leak the old texture in GPU memory indefinitely.
+  scene.onDisposeObservable.addOnce(() => hdrTexture.dispose());
+  initData.scene.environmentIntensity = presetCfg.environmentIntensity;
   const pipeline = new DefaultRenderingPipeline("atom", true, initData.scene, [
     activeCamera,
   ]);
@@ -577,24 +682,37 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
   pipeline.imageProcessing.exposure = 1.02;
   pipeline.bloomEnabled = true;
   pipeline.bloomThreshold = 0.52;
+  // Bloom shape: wider kernel for softer atmospheric glow (cinematic haze)
+  pipeline.bloomKernel = 96;
+  pipeline.bloomWeight = 0.72;
+  pipeline.bloomScale  = 0.9;
   // R20: Enable sharpening to compensate FXAA blur
   pipeline.sharpenEnabled = true;
-  pipeline.sharpen.edgeAmount = 0.2;
+  pipeline.sharpen.edgeAmount = 0.28;
   pipeline.sharpen.colorAmount = 1.0;
-  pipeline.depthOfFieldEnabled = false;
+  // T6: DoF opt-in — ground-plane blur softens the distant cubic grid pattern.
+  // Enabled only for presets that declare depthOfField.enabled in RENDERER_PRESET_CONFIGS.
+  pipeline.depthOfFieldEnabled = presetCfg.depthOfField?.enabled ?? false;
+  if (pipeline.depthOfFieldEnabled) {
+    pipeline.depthOfField.focalLength   = 55;    // 55mm telephoto — natural FOV compression
+    pipeline.depthOfField.fStop         = 2.4;   // f/2.4 — shallow but not distracting
+    pipeline.depthOfField.focusDistance = 10000; // 10 m midground: near terrain sharp, far horizon soft
+    pipeline.depthOfField.lensSize      = 50;
+  }
 
-  // R14: Color grading via color curves — warm shadows, cool highlights
+  // R14: Color grading via color curves — cinematic teal/orange split
+  // Warm amber shadows + cold teal highlights = film look without a LUT texture.
   pipeline.imageProcessing.colorCurvesEnabled = true;
   const curves = new ColorCurves();
-  curves.shadowsHue = 30;           // orange tint in shadows
-  curves.shadowsDensity = 15;       // subtle
-  curves.shadowsSaturation = 20;
-  curves.highlightsHue = 200;       // teal tint in highlights
-  curves.highlightsDensity = 10;
-  curves.highlightsSaturation = 15;
-  curves.midtonesHue = 20;
-  curves.midtonesDensity = 5;
-  curves.midtonesSaturation = 10;
+  curves.shadowsHue        = 22;   // amber-orange shadows (sunset warmth)
+  curves.shadowsDensity    = 30;
+  curves.shadowsSaturation = 36;
+  curves.highlightsHue        = 194; // teal highlights (sky bounce)
+  curves.highlightsDensity    = 22;
+  curves.highlightsSaturation = 28;
+  curves.midtonesHue        = 18;   // slight golden midtone cast
+  curves.midtonesDensity    = 10;
+  curves.midtonesSaturation = 16;
   pipeline.imageProcessing.colorCurves = curves;
 
   pipeline.fxaaEnabled = true;
@@ -602,13 +720,13 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
 
   // F02: Filmic vignette — MULTIPLY blend darkens screen edges for cinematic depth.
   pipeline.imageProcessing.vignetteEnabled = true;
-  pipeline.imageProcessing.vignetteWeight = 2.2;
+  pipeline.imageProcessing.vignetteWeight = 3.0;  // stronger oval frame
   pipeline.imageProcessing.vignetteCentreX = 0.0;
-  pipeline.imageProcessing.vignetteCentreY = 0.0;
+  pipeline.imageProcessing.vignetteCentreY = 0.08; // very slightly off-centre toward top
   pipeline.imageProcessing.vignetteBlendMode = 0; // 0 = VIGNETTEMODE_MULTIPLY
   // F02: Animated film grain — breaks color banding, adds high-frequency cinematic texture.
   pipeline.grainEnabled = true;
-  pipeline.grain.intensity = isPBRPremiumV2 || isPBRPremium ? 16 : 12;
+  pipeline.grain.intensity = presetCfg.grainIntensity;
   pipeline.grain.animated = true;
 
   /*   const glow = new GlowLayer("", scene);
@@ -624,28 +742,41 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
 
   ssr.environmentTexture = hdrTexture as any;
   ssr.environmentTextureIsProbe = false;
-  ssr.samples = isPBRPremiumV2 ? 4 : isPBRPremium ? 4 : isUniversalisInspired ? 4 : isOptimumInspired ? 4 : 2;
-  ssr.strength = isPBRPremiumV2 ? 0.8 : isPBRPremium ? 0.72 : isUniversalisInspired ? 0.82 : isOptimumInspired ? 0.76 : 0.8;
-  ssr.roughnessFactor = isPBRPremiumV2 ? 0.1 : isPBRPremium ? 0.24 : isUniversalisInspired ? 0.12 : isOptimumInspired ? 0.16 : 0.22;
+  // Fix 2+4: SSR values from lookup table. Safe fallback guarantees step=3,
+  // maxSteps=48, blurDownsample=2 — preventing the documented ~1 FPS regression
+  // seen with step=2/maxSteps=64/blurDownsample=1 on unrecognised presets.
+  ssr.samples           = presetCfg.ssr.samples;
+  ssr.strength          = presetCfg.ssr.strength;
+  ssr.roughnessFactor   = presetCfg.ssr.roughnessFactor;
   ssr.reflectivityThreshold = 0.12;
-  ssr.selfCollisionNumSkip = 2;
-  ssr.step = isPBRPremiumV2 ? 3 : isPBRPremium ? 3 : isUniversalisInspired ? 3 : isOptimumInspired ? 3 : 2;
-  ssr.maxSteps = isPBRPremiumV2 ? 50 : isPBRPremium ? 52 : isUniversalisInspired ? 48 : isOptimumInspired ? 48 : 64;
-  ssr.maxDistance = isPBRPremiumV2 ? 128 : isPBRPremium ? 112 : isUniversalisInspired ? 128 : 128;
-  ssr.blurDownsample = isPBRPremiumV2 ? 2 : isPBRPremium ? 2 : isUniversalisInspired ? 2 : isOptimumInspired ? 2 : 1;
-  ssr.thickness = isPBRPremiumV2 ? 0.98 : isPBRPremium ? 1.05 : isUniversalisInspired ? 0.96 : 0.8;
+  ssr.selfCollisionNumSkip  = 2;
+  ssr.step              = presetCfg.ssr.step;
+  ssr.maxSteps          = presetCfg.ssr.maxSteps;
+  ssr.maxDistance       = presetCfg.ssr.maxDistance;
+  ssr.blurDownsample    = presetCfg.ssr.blurDownsample;
+  ssr.thickness         = presetCfg.ssr.thickness;
 
   // R20: SSAO2 — contact shadows for voxel geometry
   const ssao = new SSAO2RenderingPipeline("ssao", initData.scene, {
     ssaoRatio: 0.5,
     blurRatio: 0.5,
   }, [activeCamera]);
-  ssao.radius = 1.5;
-  ssao.totalStrength = isPBRPremiumV2 || isPBRPremium ? 0.9 : isUniversalisInspired ? 0.85 : 0.8;
+  ssao.radius = presetCfg.ssao.radius;  // T5: per-preset radius; premium=2.2–2.5 for chamfer visual effect
+  ssao.totalStrength = presetCfg.ssao.totalStrength;
   ssao.base = 0.1;
-  ssao.samples = isPBRPremiumV2 ? 16 : isPBRPremium ? 14 : isUniversalisInspired ? 14 : 12;
+  ssao.samples = presetCfg.ssao.samples;
   ssao.maxZ = 200;
   ssao.minZAspect = 0.5;
+
+  // SE-02: Bilateral normal filter — edge-preserving colour blend at cube face boundaries.
+  // Fix 3: capture instance for runtime toggle/strength tuning and deterministic cleanup.
+  const bilateralNormalSmooth = presetCfg.bilateralStrength > 0
+    ? new BilateralNormalSmoothPostProcess(initData.scene, activeCamera, presetCfg.bilateralStrength)
+    : null;
+  if (bilateralNormalSmooth) {
+    scene.onDisposeObservable.addOnce(() => bilateralNormalSmooth.dispose());
+  }
+
   /*   ssrPipeline.thickness = 0.1;
   ssrPipeline.selfCollisionNumSkip = 2;
   ssrPipeline.blurDispersionStrength = 0;
@@ -678,9 +809,17 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
         // (0,0,0) is an invalid direction that produces undefined behaviour in some GL drivers.
         const hemLight = new HemisphericLight("", new Vector3(0, 1, 0), scene);
         hemLight.specular.set(0, 0, 0);
-        hemLight.intensity = 0.4;
-        hemLight.diffuse.set(0.6, 0.62, 0.66);
-        hemLight.groundColor.set(0.82, 0.85, 0.9);
+        // Definitivo: sky hemisphere is cooler blue-tinted (azure bounce from clear sky),
+        // ground hemisphere is warm ochre (reflected amber from sun-lit terrain).
+        if (isDefinitivo) {
+          hemLight.intensity    = 0.52;
+          hemLight.diffuse.set(0.56, 0.62, 0.78);     // cool blue sky bouncelight
+          hemLight.groundColor.set(0.88, 0.80, 0.62);  // warm ochre ground bounce
+        } else {
+          hemLight.intensity = 0.4;
+          hemLight.diffuse.set(0.6, 0.62, 0.66);
+          hemLight.groundColor.set(0.82, 0.85, 0.9);
+        }
       }
 
       /*     */
@@ -728,16 +867,23 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
 
         // R13: Register terrain chunks as shadow casters and receivers.
         // DVE terrain meshes use empty names ("") — filter on that identifier.
-        scene.onNewMeshAddedObservable.add((mesh) => {
+        // BUG-G01: capture observer references so they can be removed on scene dispose;
+        // without cleanup, each reload accumulates N duplicate observers → N shadow draw calls per chunk.
+        const onMeshAdded = scene.onNewMeshAddedObservable.add((mesh) => {
           if (mesh.name === "") {
             shadows.addShadowCaster(mesh);
             mesh.receiveShadows = true;
           }
         });
-        scene.onMeshRemovedObservable.add((mesh) => {
+        const onMeshRemoved = scene.onMeshRemovedObservable.add((mesh) => {
           if (mesh.name === "") {
             shadows.removeShadowCaster(mesh);
           }
+        });
+        scene.onDisposeObservable.addOnce(() => {
+          scene.onNewMeshAddedObservable.remove(onMeshAdded);
+          scene.onMeshRemovedObservable.remove(onMeshRemoved);
+          shadows.dispose();
         });
       }
 
@@ -766,9 +912,9 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
         }
         const dve_rAmt = Math.max(0, Math.min(1, (dve_ws - 0.3) / 0.55));
         const dve_t = dve_rAmt * dve_rAmt * (3 - 2 * dve_rAmt); // smoothstep
-        scene.fogDensity = dve_baseFogDensity * (1 + dve_t * 0.65);
-        sunLight.intensity = dve_baseSunIntensity * (1 - dve_t * 0.42);
-        ssr.strength = Math.min(0.82 + dve_t * 0.18, 1.0);
+        scene.fogDensity = dve_baseFogDensity * (1 + dve_t * 0.22);
+        sunLight.intensity = dve_baseSunIntensity * (1 - dve_t * 0.18);
+        ssr.strength = Math.min(0.82 + dve_t * 0.10, 1.0);
       });
 
       applyTerrainPhase1RendererProfile(pipeline, ssr, sunLight);
@@ -776,7 +922,7 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
       scheduleTerrainPhase1MaterialProfileRefresh(scene, materials);
       scheduleTerrainPhase1PostRenderWarmup(scene, materials);
       LevelParticles.startNatureAmbient(
-        isPBRPremium || isPBRPremiumV2 || isUniversalisInspired ? "premium" : "lush"
+        isPBRPremium || isPBRPremiumV2 || isUniversalisInspired || isDefinitivo ? "premium" : "lush"
       );
       initData.scene.ambientColor.set(0.32, 0.33, 0.38);
 
@@ -784,6 +930,12 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
       proceduralSkybox.renderingGroupId = 0;
       proceduralSkybox.infiniteDistance = true;
       proceduralSkybox.isPickable = false;
+
+      // Sync sun direction to skybox shader every frame so the sun disk matches the DirectionalLight.
+      const skyboxMat = proceduralSkybox.material as ShaderMaterial;
+      scene.onBeforeRenderObservable.add(() => {
+        skyboxMat.setVector3("dveSunDirection", sunLight.direction);
+      });
 
       DVEBRPBRMaterial.flushImportedMapLog();
 

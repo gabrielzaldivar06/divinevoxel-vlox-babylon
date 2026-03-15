@@ -61,6 +61,9 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
     defines.DVE_POM_ENABLED =
       this.hasImportedMaterialMapsEnabled() &&
       !!((EngineSettings.settings.terrain as any)?.pomEnabled);
+    // T2: track imported-map availability as a define so a define-change triggers
+    // shader recompilation when normal/material textures finish loading after first compile.
+    defines.DVE_IMPORTED_MAPS = this.shouldUseImportedMaterialMaps();
   }
 
   getClassName() {
@@ -363,7 +366,8 @@ float dveFbm3(vec3 p) {
 }
 
 vec3 dveBlendWeights(vec3 normalDir) {
-  vec3 weights = pow(abs(normalDir), vec3(6.0));
+  // T1: N=2.5 widens the blend band to ~35° (was 6.0 → ~10°), smoothing triplanar seams
+  vec3 weights = pow(abs(normalDir), vec3(2.5));
   return weights / max(dot(weights, vec3(1.0)), 0.0001);
 }
 
@@ -530,6 +534,12 @@ voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.88, 0.8
 voxelBaseColor.rgb += vec3(0.035, 0.03, 0.024) * dveEdgeWear * (0.08 + dveCloseBoost * 0.06) * (0.7 + dveEdgeBoundary * 0.3);
 voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(1.06, 1.04, 0.98), dveSunExposure * dveEdgeBoundary * 0.06);
 voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.92, 0.94, 0.96), dveEnclosure * (1.0 - dveSunExposure) * 0.05);
+// Idea 3 — vSubdivAO depth cue: shines exposed crests slightly and deepens occluded
+// crevices, reinforcing the 3D silhouette without an explicit AO pass.
+#if defined(DVE_DISSOLUTION) || defined(DVE_SUBDIV_AO)
+voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(1.09, 1.07, 1.03), vSubdivAO * dveCloseBoost * 0.11);
+voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.75, 0.73, 0.71), (1.0 - vSubdivAO) * dveNearField * 0.12);
+#endif
 `
         : "";
       const macroVariationCode = enableMacroVariation
@@ -537,17 +547,33 @@ voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.92, 0.9
 float dveMacro = clamp(dveFbm3(vPositionW * 0.035) * 1.1, 0.0, 1.0);
 float dveMacroPatch = dveFbm3(vPositionW * 0.012 + vec3(-9.7, 5.2, 11.1));
 float dveMacroTintMask = clamp(dveMacro * 0.6 + dveMacroPatch * 0.32 + dveSurfaceExposure * 0.08 - dveBaseCavity * 0.06, 0.0, 1.0);
-vec3 dveMacroTint = mix(vec3(0.86, 0.82, 0.78), vec3(1.08, 1.04, 0.98), dveMacroTintMask);
+vec3 dveMacroTint = mix(vec3(0.80, 0.75, 0.70), vec3(1.14, 1.08, 1.00), dveMacroTintMask);
 voxelBaseColor.rgb *= dveMacroTint;
+// Per-block brightness variation: breaks uniform same-type blocks.
+// Not applied to liquid — water is a continuous surface; per-tile hash creates
+// a visible 1×1 grid seam pattern on the water surface.
+#ifndef DVE_dve_liquid
+vec3 dveBlockSeed = vec3(floor(vPositionW.x), floor(vPositionW.z), dveTextureLayer * 0.03125 + 17.3);
+float dveBlockVar = (dveHash13(dveBlockSeed) * 2.0 - 1.0) * 0.08;    // ±8% brightness
+float dveBlockHue = (dveHash13(dveBlockSeed + vec3(5.1, 3.7, 2.9)) - 0.5) * 0.04;  // ±4% hue twist
+voxelBaseColor.rgb *= (1.0 + dveBlockVar);
+voxelBaseColor.r   += dveBlockHue;
+voxelBaseColor.b   -= dveBlockHue * 0.5;
+#endif
 `
         : "";
       const triplanarCode = enableTriplanar
         ? /* glsl */ `
 vec3 dveBlend = dveBlendWeights(dveNormalW);
 vec3 dveWorldUV = vPositionW * 0.12;
-vec4 dveXColor = dveProjectedColor(dveWorldUV.yz);
-vec4 dveYColor = dveProjectedColor(dveWorldUV.xz);
-vec4 dveZColor = dveProjectedColor(dveWorldUV.xy);
+// Anti-mirror offsets (Golus): prevent XY/XZ planes from producing perfectly
+// mirrored UV at shared corners, which creates visible seam artefacts.
+vec2 dveUVX = dveWorldUV.yz;
+vec2 dveUVY = dveWorldUV.xz + vec2(0.33);
+vec2 dveUVZ = dveWorldUV.xy + vec2(0.67);
+vec4 dveXColor = dveProjectedColor(dveUVX);
+vec4 dveYColor = dveProjectedColor(dveUVY);
+vec4 dveZColor = dveProjectedColor(dveUVZ);
 vec4 dveTriplanarColor = dveXColor * dveBlend.x + dveYColor * dveBlend.y + dveZColor * dveBlend.z;
 float dveTriplanarMix = smoothstep(0.18, 0.82, max(dveSlope, dveSurfaceSlope)) * 0.65;
 voxelBaseColor = mix(voxelBaseColor, dveTriplanarColor, dveTriplanarMix);
@@ -565,23 +591,33 @@ voxelBaseColor.rgb = mix(
       const microVariationCode = enableMicroVariation
         ? /* glsl */ `
 float dveMicro = dveFbm3(vPositionW * 0.42 + dveNormalW * 1.8);
-float dveMicroEdge = dveEdgeMask(fract(dveBaseUV)) * (0.18 + max(dveSlope, dveSurfaceSlope) * 0.22);
+// Edge seam: weight by slope so flat terrain shows minimal grid; only steep/curved
+// surfaces get the full block-boundary darkening (reduces "mattress" effect).
+float dveSlopeEdgeGate = smoothstep(0.15, 0.55, max(dveSlope, dveSurfaceSlope));
+float dveMicroEdge = dveEdgeMask(fract(dveBaseUV)) * (0.08 + dveSlopeEdgeGate * 0.14);
+// Idea 3 — vSubdivAO amplitude modulation: exposed bump crests get stronger micro
+// contrast, dark occluded crevices stay muted — makes the 3D form read clearly.
+#if defined(DVE_DISSOLUTION) || defined(DVE_SUBDIV_AO)
+float dveMicroAO = 0.65 + smoothstep(0.1, 0.9, vSubdivAO) * 0.70;
+#else
+float dveMicroAO = 1.0;
+#endif
 voxelBaseColor.rgb = mix(
   voxelBaseColor.rgb,
-  voxelBaseColor.rgb * mix(vec3(0.92, 0.9, 0.88), vec3(1.08, 1.05, 1.02), dveMicro),
-  dveNearField * 0.08
+  voxelBaseColor.rgb * mix(vec3(0.86, 0.84, 0.82), vec3(1.14, 1.10, 1.05), dveMicro),
+  dveNearField * 0.16 * dveMicroAO
 );
 voxelBaseColor.rgb = mix(
   voxelBaseColor.rgb,
-  voxelBaseColor.rgb * vec3(1.03, 1.02, 1.0),
-  dveCenterBlend * dveNearField * 0.06
+  voxelBaseColor.rgb * vec3(1.05, 1.04, 1.01),
+  dveCenterBlend * dveNearField * 0.10
 );
 voxelBaseColor.rgb = mix(
   voxelBaseColor.rgb,
-  voxelBaseColor.rgb * vec3(0.84, 0.82, 0.8),
-  dveMicroEdge * dveNearField * 0.07
+  voxelBaseColor.rgb * vec3(0.82, 0.80, 0.78),
+  dveMicroEdge * dveNearField * 0.09
 );
-voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.9, 0.88, 0.86), dveBaseCavity * dveNearField * 0.05);
+voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.87, 0.85, 0.83), dveBaseCavity * dveNearField * 0.08);
 `
         : "";
       const surfaceOverlaysCode = enableSurfaceOverlays
@@ -767,8 +803,23 @@ surfaceReflectivityColor *= mix(vec3(1.0), vec3(0.96), dveAmbientOcclusion * 0.0
   : "";
       const importedMaterialBeforeLightsCode = enableImportedMaterialMaps
         ? /* glsl */ `
-#ifdef  DVE_${this.name}
-// Stage 1 keeps imported arrays live without overriding the mesh normal basis.
+#ifdef DVE_${this.name}
+// T2: Triplanar Whiteout detail-normal blend for imported material maps.
+// Samples dve_voxel_normal from three world-space axes and applies the Whiteout
+// reorientation (Mikkelsen 2017) to blend into normalW before lighting.
+{
+  vec3 dveT2GeomNorm = normalize(vNormalW);
+  vec3 dveT2Blend = dveBlendWeights(dveT2GeomNorm);
+  vec3 dveT2UV = vPositionW * 0.12;
+  vec3 dveT2nX = dveSampleDetailNormal(dveT2UV.yz);
+  vec3 dveT2nY = dveSampleDetailNormal(dveT2UV.xz + vec2(0.33));
+  vec3 dveT2nZ = dveSampleDetailNormal(dveT2UV.xy + vec2(0.67));
+  dveT2nX = vec3(dveT2nX.xy + dveT2GeomNorm.zy, abs(dveT2nX.z));
+  dveT2nY = vec3(dveT2nY.xy + dveT2GeomNorm.xz, abs(dveT2nY.z));
+  dveT2nZ = vec3(dveT2nZ.xy + dveT2GeomNorm.xy, abs(dveT2nZ.z));
+  vec3 dveT2Detail = normalize(dveT2nX.zyx * dveT2Blend.x + dveT2nY.xzy * dveT2Blend.y + dveT2nZ.xyz * dveT2Blend.z);
+  normalW = normalize(normalW + dveT2Detail * 0.5);
+}
 #endif
 `
         : "";
@@ -960,6 +1011,33 @@ ${importedMaterialMicroSurfaceCode}
 `,
   CUSTOM_FRAGMENT_BEFORE_LIGHTS: /*glsl*/ `
 ${importedMaterialBeforeLightsCode}
+#ifdef DVE_${this.name}
+#ifndef DVE_dve_liquid
+// SE-01: Screen-space edge normal softening via dFdx/dFdy reconstruction.
+// At flat face interiors the derivative normal matches the geometry normal → edgeFactor ≈ 0 → no change.
+// At edge pixels where the hardware 2×2 derivative quad spans two adjacent face orientations,
+// derivNormal blends both face normals → softer specular highlight at cube corners and ridges.
+// ~4 FLOPs per fragment; no geometry or mesher changes required.
+// BUG-N02: guard against zero cross product (silhouette/degenerate pixels) that would
+//   make normalize() return NaN on some WebGL drivers.
+// BUG-N01: use >= 0.0 instead of sign() — sign() returns 0.0 when dot==0.0, producing vec3(0).
+{
+  vec3 dve_dX = dFdx(vPositionW);
+  vec3 dve_dY = dFdy(vPositionW);
+  vec3 dve_cross = cross(dve_dX, dve_dY);
+  float dve_edgeFactor = 0.0;  // T8: hoisted so specular occlusion below can read it
+  if (dot(dve_cross, dve_cross) > 1e-6) {
+    vec3 dve_derivN = normalize(dve_cross);
+    dve_derivN *= (dot(dve_derivN, normalW) >= 0.0) ? 1.0 : -1.0;
+    dve_edgeFactor = smoothstep(0.04, 0.55, 1.0 - abs(dot(normalize(normalW), dve_derivN)));
+    normalW = normalize(mix(normalW, dve_derivN, dve_edgeFactor * 0.72));
+  }
+  // T8 NOTE: surfaceReflectivityColor is not available at CUSTOM_FRAGMENT_BEFORE_LIGHTS
+  // (it lives inside reflectivityOut which is computed after this injection point).
+  // Specular occlusion removed to avoid GLSL compile error; edge normal softening still active above.
+}
+#endif
+#endif
 #ifdef DVE_dve_liquid
 {
   vec2 dveBL_uv1 = vPositionW.xz * 0.08 + vec2(dve_time * 0.03, dve_time * 0.02);

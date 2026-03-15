@@ -22,6 +22,7 @@ export function InitSkybox({ renderer }: { renderer: DVEBabylonRenderer }) {
     "viewProjection",
     "worldOrigin",
     "cameraPosition",
+    "dveSunDirection",
   ];
   if (!sceneOptions.ubo.suppourtsUBO) {
     uniforms.push(...sceneOptions.ubo.allUniformsNames);

@@ -27,7 +27,7 @@ export class DVEBRItemMesh {
     vertices: Float32Array,
     indices: Uint16Array<any> | Uint32Array<any>
   ) {
-    const buffer = new Buffer(engine, vertices, false);
+    const buffer = new Buffer(engine, vertices, true);
     const geo = mesh.geometry ? mesh.geometry : mesh;
    
     geo.setVerticesBuffer(
@@ -60,6 +60,8 @@ export class DVEBRItemMesh {
       new VertexBuffer(
         engine,
         buffer,
+        // 1 component: diffuse atlas index only.
+        // VoxelMesh uses 3 components (diffuse+normal+MER) — do NOT unify these two.
         "textureIndex",
         false,
         undefined,

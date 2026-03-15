@@ -7,35 +7,47 @@ import { Texture } from "@babylonjs/core/Materials/Textures/texture";
 import { RawTexture } from "@babylonjs/core/Materials/Textures/rawTexture";
 import { DirectionalLight } from "@babylonjs/core/Lights/directionalLight";
 import { classifyTerrainMaterial } from "./MaterialFamilyProfiles";
+import { SharedVoxelAttributes } from "./SharedVoxelAttributes";
 import { EngineSettings } from "@divinevoxel/vlox/Settings/EngineSettings";
 
-// 64×64 blue noise texture generated procedurally (void-and-cluster algorithm approximation)
+// 64×64 procedural noise texture.
+// NOTE: This is stratified uniform noise (Fisher-Yates shuffle over a uniform
+// grid), NOT true blue noise. Acceptable for dissolution grain effects.
+// Before using for TAA reprojection or transparency dithering, replace with a
+// pre-baked Void-and-Cluster blue noise texture (64×64 R8).
 let _blueNoiseTexture: Texture | null = null;
 
 function getOrCreateBlueNoiseTexture(scene: Scene): Texture {
   if (_blueNoiseTexture) return _blueNoiseTexture;
 
-  // Generate 64×64 blue noise via R8 progressive multi-jittered sampling
   const size = 64;
-  const data = new Uint8Array(size * size * 4);
-  // Use a deterministic stratified + shuffled pattern for blue noise approximation
-  const total = size * size;
+  const total = size * size; // 4096 pixels
+  const data = new Uint8Array(total * 4);
+
+  // Build a properly normalized 0–255 range distributed over all 4096 pixels.
+  // Using Math.round(i * 255 / (total-1)) gives exactly one copy of 0 and 255
+  // and proportional distribution in between (avoids the ×16 duplication of i%256).
   const values = new Uint8Array(total);
-  for (let i = 0; i < total; i++) values[i] = i & 0xff;
-  // Fisher-Yates shuffle with deterministic seed
-  let seed = 0x9e3779b9;
+  for (let i = 0; i < total; i++) values[i] = Math.round((i * 255) / (total - 1));
+
+  // Fisher-Yates shuffle with xorshift32 PRNG (deterministic, period 2^32-1).
+  let seed = 0x9e3779b9 >>> 0;
+  const xorshift32 = () => {
+    seed ^= seed << 13;
+    seed ^= seed >>> 17;
+    seed ^= seed << 5;
+    return seed >>> 0;
+  };
   for (let i = total - 1; i > 0; i--) {
-    seed = ((seed ^ (seed << 13)) >>> 0);
-    seed = ((seed ^ (seed >> 17)) >>> 0);
-    seed = ((seed ^ (seed << 5)) >>> 0);
-    const j = (seed >>> 0) % (i + 1);
+    const j = xorshift32() % (i + 1);
     const tmp = values[i];
     values[i] = values[j];
     values[j] = tmp;
   }
+
   for (let i = 0; i < total; i++) {
     const idx = i * 4;
-    data[idx] = values[i];
+    data[idx]     = values[i];
     data[idx + 1] = values[i];
     data[idx + 2] = values[i];
     data[idx + 3] = 255;
@@ -62,6 +74,7 @@ export class DVEDissolutionPlugin extends MaterialPluginBase {
   ) {
     super(material, name, 21, {
       DVE_DISSOLUTION: true,
+      DVE_SUBDIV_AO: false,
     });
     this._enable(true);
   }
@@ -73,13 +86,24 @@ export class DVEDissolutionPlugin extends MaterialPluginBase {
 
   prepareDefines(defines: any) {
     const terrain = EngineSettings.settings.terrain;
-    if (!terrain.dissolution) return;
+    if (!terrain.dissolution) {
+      defines.DVE_DISSOLUTION = false;
+      defines.DVE_SUBDIV_AO = false;
+      return;
+    }
 
     const mc = classifyTerrainMaterial(this.name);
     const isOrganic =
       mc.isSoil || mc.isFlora || mc.isWood || mc.isRock ||
       mc.isCultivated || mc.isExotic;
-    if (!isOrganic || mc.isLiquid) return;
+    if (!isOrganic || mc.isLiquid) {
+      defines.DVE_DISSOLUTION = false;
+      // DVE_SUBDIV_AO: dve_solid renders ALL terrain including organic/subdivision voxels.
+      // Pass the subdivAO varying through so dveMicroAO (T3) can modulate micro contrast
+      // without enabling the untested full dissolution fragment code.
+      defines.DVE_SUBDIV_AO = this.name === "dissolution_dve_solid";
+      return;
+    }
 
     defines.DVE_DISSOLUTION = true;
     if (terrain.dissolutionTemporal) defines.DVE_DISSOLUTION_TEMPORAL = true;
@@ -101,12 +125,12 @@ export class DVEDissolutionPlugin extends MaterialPluginBase {
 
   getAttributes(attributes: string[]) {
     attributes.push(
-      "dissolutionProximity",
-      "pullStrength",
-      "subdivLevel",
-      "pullDirectionBias",
-      "phNormalized",
-      "subdivAO"
+      SharedVoxelAttributes.DissolutionProximity,
+      SharedVoxelAttributes.PullStrength,
+      SharedVoxelAttributes.SubdivLevel,
+      SharedVoxelAttributes.PullDirectionBias,
+      SharedVoxelAttributes.PhNormalized,
+      SharedVoxelAttributes.SubdivAO
     );
   }
 
@@ -179,7 +203,35 @@ export class DVEDissolutionPlugin extends MaterialPluginBase {
     const isOrganic =
       mc.isSoil || mc.isFlora || mc.isWood || mc.isRock ||
       mc.isCultivated || mc.isExotic;
-    if (!isOrganic || mc.isLiquid) return null;
+    if (!isOrganic || mc.isLiquid) {
+      // For dve_solid: inject only the subdivAO pass-through for T3 dveMicroAO.
+      if (this.name !== "dissolution_dve_solid") return null;
+      if (shaderType === "vertex") {
+        return {
+          CUSTOM_VERTEX_DEFINITIONS: /*glsl*/ `
+#ifdef DVE_SUBDIV_AO
+attribute float subdivAO;
+varying float vSubdivAO;
+#endif
+`,
+          CUSTOM_VERTEX_MAIN_BEGIN: /*glsl*/ `
+#ifdef DVE_SUBDIV_AO
+vSubdivAO = subdivAO;
+#endif
+`,
+        };
+      }
+      if (shaderType === "fragment") {
+        return {
+          CUSTOM_FRAGMENT_DEFINITIONS: /*glsl*/ `
+#ifdef DVE_SUBDIV_AO
+varying float vSubdivAO;
+#endif
+`,
+        };
+      }
+      return null;
+    }
 
     const isSoil = mc.isSoil || mc.isCultivated;
     const isRock = mc.isRock;
@@ -216,16 +268,17 @@ vSubdivAO = subdivAO;
 `,
         CUSTOM_VERTEX_UPDATE_POSITION: /*glsl*/ `
 #ifdef DVE_DISSOLUTION
-  // R22: GPU micro-displacement — high-frequency organic jitter
-  // Hash based on world position for deterministic per-vertex variation
-  float dve_microHash = fract(sin(dot(positionUpdated.xyz, vec3(12.9898, 78.233, 45.164))) * 43758.5453);
-  float dve_microHash2 = fract(sin(dot(positionUpdated.zyx, vec3(63.7264, 10.873, 28.689))) * 23421.631);
-  // Displacement amplitude scales with pullStrength: flat interior = calm, pulled edges = rough
-  float dve_microAmp = pullStrength * 0.06;
-  // Add second harmonic for more organic feel
-  float dve_microDisp = (dve_microHash - 0.5) * dve_microAmp
-                      + (dve_microHash2 - 0.5) * dve_microAmp * 0.4;
-  positionUpdated.xyz += normalUpdated * dve_microDisp;
+  // Idea 3 — Smooth LOD morph: as camera distance approaches the CPU LOD threshold
+  // (48–96 m), blend displaced positions back to the undisplaced flat base so the
+  // mesher's N-drop from 5→1 becomes invisible rather than a visual pop.
+  if (subdivLevel > 0.01 && pullStrength > 0.001) {
+    vec3 dve_wpos    = (world * vec4(positionUpdated.xyz, 1.0)).xyz;
+    float dve_lodDist = length(dve_wpos - vEyePosition.xyz);
+    float dve_morphT  = smoothstep(44.0, 76.0, dve_lodDist) * subdivLevel;
+    // Reverse the CPU pull (pull ≈ normal * pullStrength * MAX_PULL=0.45)
+    vec3 dve_flatPos  = positionUpdated.xyz - normalUpdated * pullStrength * 0.45;
+    positionUpdated.xyz = mix(positionUpdated.xyz, dve_flatPos, dve_morphT);
+  }
 #endif
 `,
       };

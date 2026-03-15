@@ -186,13 +186,17 @@ void main() {
   float alpha;
 
   if (vShapeType < 0.5) {
-    // 0 — Circular: standard gaussian
-    alpha = exp(-r2 * sharpness);
+    // 0 — Circular: soft gaussian with slight FBM-style edge wobble
+    float seed = hash12(gl_FragCoord.xy * 0.012);
+    float wobble = hash12(centered * 4.2 + seed) * 0.14 - 0.07;
+    alpha = exp(-(r2 + wobble) * sharpness);
   } else if (vShapeType < 1.5) {
-    // 1 — Irregular (soil): gaussian + noise disruption
+    // 1 — Irregular (soil/patch): organic SDF blend — no hard step, smooth organic edge
     float seed = hash12(gl_FragCoord.xy * 0.01);
-    float noise = hash12(centered * 3.0 + seed);
-    alpha = exp(-r2 * sharpness) * step(0.3, noise);
+    float noise1 = hash12(centered * 2.6 + vec2(seed * 13.1, seed * 7.3));
+    float noise2 = hash12(centered * 5.8 + vec2(seed * 27.3, seed * 41.7));
+    float organicR = length(centered) * (1.0 + (noise1 * 0.7 + noise2 * 0.3) * 0.55 - 0.27);
+    alpha = smoothstep(1.1, 0.55, organicR);
   } else if (vShapeType < 2.5) {
     // 2 — Angular (rock): box falloff
     alpha = 1.0 - smoothstep(0.3, 0.5, max(abs(centered.x), abs(centered.y)));

@@ -19,6 +19,7 @@ import type { UniformBuffer } from "@babylonjs/core/Materials/uniformBuffer";
 import { MaterialPluginBase } from "@babylonjs/core/Materials/materialPluginBase";
 import { EngineSettings } from "@divinevoxel/vlox/Settings/EngineSettings";
 import { classifyTerrainMaterial } from "./MaterialFamilyProfiles";
+import { SharedVoxelAttributes } from "./SharedVoxelAttributes";
 
 export class DVELODMorphPlugin extends MaterialPluginBase {
   /** Current morph factor — set by the LOD system each frame. */
@@ -64,9 +65,12 @@ export class DVELODMorphPlugin extends MaterialPluginBase {
   }
 
   getAttributes(attributes: string[]) {
-    // Re-use the same attributes declared by DVEDissolutionPlugin
-    // (pullStrength, subdivLevel). No new attributes needed since
-    // they are already registered.
+    // Declare explicitly so this plugin works regardless of whether
+    // DVEDissolutionPlugin is also present. BabylonJS deduplicates attributes.
+    attributes.push(
+      SharedVoxelAttributes.PullStrength,
+      SharedVoxelAttributes.SubdivLevel
+    );
   }
 
   getUniforms() {

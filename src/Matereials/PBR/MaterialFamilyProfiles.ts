@@ -50,54 +50,65 @@ export type ActiveTerrainProfileSettings = {
   materialWetness?: boolean;
 };
 
+/**
+ * Ordered keyword registry: first match wins. Place more-specific or
+ * higher-priority entries before general ones.
+ * This eliminates ambiguity for names like "muddy_log" where both
+ * "mud" (Soil) and "log" (Wood) would match — explicit ordering decides.
+ */
+const FAMILY_KEYWORD_REGISTRY: ReadonlyArray<[string, TerrainMaterialFamily]> = [
+  // Liquids — highest priority
+  ["liquid",   TerrainMaterialFamily.Liquid],
+  ["foam",     TerrainMaterialFamily.Liquid],
+  ["ether",    TerrainMaterialFamily.Liquid],
+  // Cultivated
+  ["farmland", TerrainMaterialFamily.Cultivated],
+  // Exotic
+  ["dream",    TerrainMaterialFamily.Exotic],
+  ["dread",    TerrainMaterialFamily.Exotic],
+  // Flora
+  ["flora",    TerrainMaterialFamily.Flora],
+  ["grass",    TerrainMaterialFamily.Flora],
+  ["leaves",   TerrainMaterialFamily.Flora],
+  ["vine",     TerrainMaterialFamily.Flora],
+  ["wheat",    TerrainMaterialFamily.Flora],
+  // Wood — before Soil so "muddy_log" → Wood
+  ["log",      TerrainMaterialFamily.Wood],
+  ["wood",     TerrainMaterialFamily.Wood],
+  // Soil
+  ["dirt",     TerrainMaterialFamily.Soil],
+  ["mud",      TerrainMaterialFamily.Soil],
+  ["sand",     TerrainMaterialFamily.Soil],
+  // Rock
+  ["rock",     TerrainMaterialFamily.Rock],
+  ["stone",    TerrainMaterialFamily.Rock],
+  ["gravel",   TerrainMaterialFamily.Rock],
+  ["pillar",   TerrainMaterialFamily.Rock],
+];
+
 export function classifyTerrainMaterial(id: string): TerrainMaterialClassification {
   const lowerId = id.toLowerCase();
-  const isLiquid =
-    lowerId.includes("liquid") ||
-    lowerId.includes("foam") ||
-    lowerId.includes("ether");
-  const isTransparent = lowerId.includes("transparent");
-  const isGlow = lowerId.includes("glow");
-  const isFlora =
-    lowerId.includes("flora") ||
-    lowerId.includes("grass") ||
-    lowerId.includes("leaves") ||
-    lowerId.includes("vine") ||
-    lowerId.includes("wheat");
-  const isCultivated = lowerId.includes("farmland");
-  const isSoil =
-    lowerId.includes("dirt") ||
-    lowerId.includes("mud") ||
-    lowerId.includes("sand");
-  const isWood = lowerId.includes("log") || lowerId.includes("wood");
-  const isExotic = lowerId.includes("dream") || lowerId.includes("dread");
-  const isRock =
-    lowerId.includes("rock") ||
-    lowerId.includes("stone") ||
-    lowerId.includes("gravel") ||
-    lowerId.includes("pillar");
 
   let family: TerrainMaterialFamily = TerrainMaterialFamily.Default;
-  if (isLiquid) family = TerrainMaterialFamily.Liquid;
-  else if (isFlora) family = TerrainMaterialFamily.Flora;
-  else if (isCultivated) family = TerrainMaterialFamily.Cultivated;
-  else if (isSoil) family = TerrainMaterialFamily.Soil;
-  else if (isWood) family = TerrainMaterialFamily.Wood;
-  else if (isExotic) family = TerrainMaterialFamily.Exotic;
-  else if (isRock) family = TerrainMaterialFamily.Rock;
+  for (const [keyword, fam] of FAMILY_KEYWORD_REGISTRY) {
+    if (lowerId.includes(keyword)) {
+      family = fam;
+      break;
+    }
+  }
 
   return {
     id,
     family,
-    isLiquid,
-    isTransparent,
-    isGlow,
-    isFlora,
-    isRock,
-    isWood,
-    isSoil,
-    isCultivated,
-    isExotic,
+    isLiquid:     family === TerrainMaterialFamily.Liquid,
+    isTransparent: lowerId.includes("transparent"),
+    isGlow:        lowerId.includes("glow"),
+    isFlora:      family === TerrainMaterialFamily.Flora,
+    isRock:       family === TerrainMaterialFamily.Rock,
+    isWood:       family === TerrainMaterialFamily.Wood,
+    isSoil:       family === TerrainMaterialFamily.Soil,
+    isCultivated: family === TerrainMaterialFamily.Cultivated,
+    isExotic:     family === TerrainMaterialFamily.Exotic,
   };
 }
 
@@ -274,6 +285,33 @@ export function getUniversalisInspiredProfile(
   };
 }
 
+export function getDefinitivoProfile(
+  material: TerrainMaterialClassification
+): TerrainMaterialProfileLayer | null {
+  if (material.isLiquid) {
+    return {
+      disableLighting: false,
+      alpha: 0.82,
+      roughnessAtMost: 0.04,
+      metallic: 0,
+      environmentIntensityAtLeast: 1.26,
+      directIntensityAtLeast: 0.84,
+      albedoColor: [0.16, 0.28, 0.38],
+      reflectivityColor: [0.88, 0.92, 0.98],
+      reflectionColor: [0.22, 0.3, 0.38],
+      emissiveColor: [0.04, 0.08, 0.1],
+    };
+  }
+
+  if (material.isTransparent) return null;
+
+  return {
+    directIntensityAtLeast: 1.06,
+    environmentIntensityAtLeast: material.isFlora ? 0.84 : 0.94,
+    roughnessAtMost: material.isFlora ? 0.96 : 0.82,
+  };
+}
+
 export function getPBRPremiumProfile(
   material: TerrainMaterialClassification
 ): TerrainMaterialProfileLayer | null {
@@ -342,6 +380,7 @@ export function applyActiveTerrainMaterialProfiles(
   const isUniversalisInspired = terrain.benchmarkPreset === "universalis-inspired";
   const isPBRPremium = terrain.benchmarkPreset === "pbr-premium";
   const isPBRPremiumV2 = terrain.benchmarkPreset === "pbr-premium-v2";
+  const isDefinitivo = terrain.benchmarkPreset === "definitivo";
 
   if (isMaterialImport) {
     applyTerrainMaterialProfileLayer(pbr, getMaterialImportProfile(classification));
@@ -376,6 +415,11 @@ export function applyActiveTerrainMaterialProfiles(
     applyTerrainMaterialProfileLayer(pbr, getPBRPremiumProfile(classification));
   }
 
+  if (isDefinitivo) {
+    applyTerrainMaterialProfileLayer(pbr, getMaterialImportProfile(classification));
+    applyTerrainMaterialProfileLayer(pbr, getDefinitivoProfile(classification));
+  }
+
   pbr.metadata = {
     ...(pbr.metadata || {}),
     terrainPhase1: {
@@ -388,6 +432,7 @@ export function applyActiveTerrainMaterialProfiles(
       universalisInspired: isUniversalisInspired,
       pbrPremium: isPBRPremium,
       pbrPremiumV2: isPBRPremiumV2,
+      definitivo: isDefinitivo,
     },
   };
 

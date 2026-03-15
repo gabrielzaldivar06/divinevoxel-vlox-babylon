@@ -17,6 +17,20 @@ const _BUDGET_WARN_INTERVAL = 300; // frames between warnings
 const sectorCenter = new Vector3();
 const sectorDirection = new Vector3();
 const forwardDirection = new Vector3();
+// Lazily-computed squared near-distance below which viewCone culling is skipped.
+// Sectors within 2× the sector diagonal are too close for the center-dot test
+// to be reliable — the frustum check handles them correctly instead.
+let _nearViewConeSq = 0;
+function getNearViewConeSq() {
+  if (_nearViewConeSq === 0) {
+    const bx = WorldSpaces.sector.bounds.x;
+    const by = WorldSpaces.sector.bounds.y;
+    const bz = WorldSpaces.sector.bounds.z;
+    const diag = Math.sqrt(bx * bx + by * by + bz * bz);
+    _nearViewConeSq = (diag * 2) * (diag * 2);
+  }
+  return _nearViewConeSq;
+}
 
 function getPremiumResidentSectorDistance() {
   const terrain = EngineSettings.settings.terrain;
@@ -134,6 +148,10 @@ function passesSectorCulling(sector: any, scene: Scene) {
     sectorDirection.copyFrom(sectorCenter).subtractInPlace(camera.globalPosition);
     const sectorLengthSquared = sectorDirection.lengthSquared();
     if (sectorLengthSquared > 0.0001) {
+      // Near-sector bypass: when the camera is within 2× the sector diagonal,
+      // the sector subtends a large angle and the center-direction test becomes
+      // unreliable — skip cone culling and let the frustum check decide.
+      if (sectorLengthSquared < getNearViewConeSq()) return true;
       sectorDirection.scaleInPlace(1 / Math.sqrt(sectorLengthSquared));
       const cameraTarget = (camera as any).getTarget?.();
       if (cameraTarget) {
