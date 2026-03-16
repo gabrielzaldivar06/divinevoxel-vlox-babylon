@@ -493,7 +493,7 @@ if (vDissolutionProximity > 0.01 && dve_dissolveStartTime > -900.0) {
 #endif
 // R02: Shore transition zone — wet sand darkening + foam ring at waterline.
 // Uses world-Y vs dve_seaLevel as water-adjacency proxy (no extra vertex attribute needed).
-#ifdef DVE_FAMILY_SAND
+#if defined(DVE_FAMILY_SAND) || defined(DVE_FAMILY_ROCK)
 {
   float dve_shoreProx = clamp(1.0 - smoothstep(dve_seaLevel, dve_seaLevel + 3.5, vPositionW.y), 0.0, 1.0);
   if (dve_shoreProx > 0.02) {
@@ -521,8 +521,8 @@ if (vDissolutionProximity > 0.01) {
   // Slight reflectivity increase for wet/exposed mineral surfaces
   reflectivityOut *= (1.0 + vDissolutionProximity * 0.15);
 }
-// R02: Shore zone microSurface gloss — sand near sea level is always glossy (wet surface).
-#ifdef DVE_FAMILY_SAND
+// R02: Shore zone microSurface gloss — sand and rock near sea level is always glossy (wet surface).
+#if defined(DVE_FAMILY_SAND) || defined(DVE_FAMILY_ROCK)
 {
   float dve_shoreGloss = clamp(1.0 - smoothstep(dve_seaLevel, dve_seaLevel + 3.5, vPositionW.y), 0.0, 1.0);
   microSurface = mix(microSurface, 0.89, dve_shoreGloss * 0.65);

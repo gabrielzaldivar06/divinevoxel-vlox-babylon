@@ -177,7 +177,7 @@ export async function CreateDefaultRenderer(
       }
     }
     renderer.sceneOptions.ubo.updateTime(time);
-    time += 0.1;
+    time += scene.deltaTime * 0.001;
     if (needUBOSync) {
       renderer.sceneOptions.ubo.observers.beforeSync.notifyObservers(null);
       for (const mat of mats) {

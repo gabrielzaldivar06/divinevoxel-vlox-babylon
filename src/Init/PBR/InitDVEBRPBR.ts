@@ -804,6 +804,10 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
     substances: initData.substances,
     afterCreate: async (_renderer, materials) => {
       scene.ambientColor.set(1, 1, 1);
+      // Prevenir que el depth buffer se limpie entre render groups, permitiendo 
+      // que el shader de líquidos (Group 1) colisione con el terreno (Group 0).
+      scene.setRenderingAutoClearDepthStencil(1, false, false, false);
+      
       {
         // direction=(0,1,0): sky is "up", ground hemisphere is "down".
         // (0,0,0) is an invalid direction that produces undefined behaviour in some GL drivers.
@@ -848,6 +852,10 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
       // sun glint and specular highlights. Previously disabled (0,0,0) which caused
       // the water to appear uniformly flat with no solar sparkle.
       sunLight.specular.set(1, 0.95, 0.88);
+
+      // R14: Enable Scene Depth Renderer for soft liquid intersection and wet shores
+      scene.enableDepthRenderer(scene.activeCamera || undefined, false, true);
+
       if (isMaterialImport) {
         // Imported material arrays still destabilize the shadow compile path here.
         // Keep this disabled until Etapa 1 can re-enable shadows without black-world startup regressions.

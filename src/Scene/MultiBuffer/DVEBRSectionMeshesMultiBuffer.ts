@@ -60,7 +60,7 @@ export class DVEBRSectionMeshesMultiBuffer extends DVESectionMeshes {
         mesh = section.meshes.get(subMeshMaterial) as Mesh;
       } else {
         const newMesh = new Mesh("", this.scene);
-        newMesh.renderingGroupId = 1;
+        newMesh.renderingGroupId = subMeshMaterial.includes("liquid") ? 1 : 0;
         newMesh.isPickable = false;
         newMesh.checkCollisions = false;
         newMesh.doNotSerialize = true;

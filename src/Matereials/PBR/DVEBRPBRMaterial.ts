@@ -125,6 +125,7 @@ export class DVEBRPBRMaterial implements MaterialInterface {
 
     if (this.data.alphaTesting) {
       material.alphaMode = Material.MATERIAL_ALPHATEST;
+      material.transparencyMode = Material.MATERIAL_ALPHATEST;
     }
     /*   if (this.data.stencil) {
       material.stencil.enabled = true;
@@ -141,8 +142,12 @@ export class DVEBRPBRMaterial implements MaterialInterface {
       material.reflectivityColor.set(0.8, 0.8, 0.8);
       //  material.wireframe = true;
       material.alphaMode = Material.MATERIAL_ALPHABLEND;
+      material.transparencyMode = Material.MATERIAL_ALPHABLEND;
+      material.needAlphaBlending = () => true;
+      material.needDepthPrePass = false;
+      material.backFaceCulling = false;
 
-      material.alpha = 0.7;
+      material.alpha = 1.0;
     } else {
       material.metallic = 0.0;
       material.roughness = 0.92;
@@ -153,6 +158,11 @@ export class DVEBRPBRMaterial implements MaterialInterface {
       material.backFaceCulling = false;
       material.twoSidedLighting = true;
       material.forceNormalForward = true;
+      if (this.data.alphaTesting) {
+        material.transparencyMode = Material.MATERIAL_ALPHATEST;
+      } else {
+        material.transparencyMode = Material.MATERIAL_OPAQUE;
+      }
     }
     (material as any).useVertexColors = false;
     (material as any).hasVertexAlpha = false;

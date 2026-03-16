@@ -11,6 +11,7 @@ import { EngineSettings } from "@divinevoxel/vlox/Settings/EngineSettings";
 
 export class DVEPBRMaterialPlugin extends MaterialPluginBase {
   uniformBuffer: UniformBuffer;
+  private static frameTimes = new WeakMap<Scene, { frameId: number; time: number }>();
 
   id = crypto.randomUUID();
 
@@ -74,6 +75,7 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
     if (this.hasImportedMaterialMapsEnabled()) {
       samplers.push("dve_voxel_normal", "dve_voxel_material");
     }
+    samplers.push("dve_depthTexture");
   }
 
   getAttributes(attributes: string[]) {
@@ -82,7 +84,7 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
 
   getUniforms() {
     return {
-      ubo: [{ name: "dve_voxel_animation_size" }, { name: "dve_time" }],
+      ubo: [{ name: "dve_voxel_animation_size" }, { name: "dve_time" }, { name: "dve_cameraNearFar", size: 2 }, { name: "dve_screenSize", size: 2 }],
     };
   }
 
@@ -142,7 +144,7 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
  */
   _textureBound = false;
   bindForSubMesh(uniformBuffer: UniformBuffer, scene: Scene, engine: Engine) {
-    this.bindResources(uniformBuffer);
+    this.bindResources(uniformBuffer, scene);
   }
 
   hardBindForSubMesh(
@@ -150,7 +152,7 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
     scene: Scene,
     engine: Engine
   ) {
-    this.bindResources(uniformBuffer);
+    this.bindResources(uniformBuffer, scene);
   }
 
   isReadyForSubMesh(): boolean {
@@ -162,7 +164,7 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
     return true;
   }
 
-  private bindResources(uniformBuffer: UniformBuffer) {
+  private bindResources(uniformBuffer: UniformBuffer, scene?: Scene) {
     if (!this.uniformBuffer) {
       this.uniformBuffer = uniformBuffer;
       this.onUBSet(uniformBuffer);
@@ -176,7 +178,25 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
     for (const [uniformId, size] of this.dveMaterial.animationSizes) {
       effect.setInt(uniformId, size);
     }
-    effect.setFloat("dve_time", performance.now() * 0.001);
+    if (scene) {
+      const frameId = scene.getFrameId();
+      let frameTime = DVEPBRMaterialPlugin.frameTimes.get(scene);
+      if (!frameTime || frameTime.frameId !== frameId) {
+        frameTime = { frameId, time: performance.now() * 0.001 };
+        DVEPBRMaterialPlugin.frameTimes.set(scene, frameTime);
+      }
+      effect.setFloat("dve_time", frameTime.time);
+
+      const activeCamera = scene.activeCamera;
+      if (activeCamera) {
+          const depthRenderer = scene.enableDepthRenderer(activeCamera, false, true);
+          effect.setTexture("dve_depthTexture", depthRenderer.getDepthMap());
+          effect.setFloat2("dve_cameraNearFar", activeCamera.minZ, activeCamera.maxZ);
+          effect.setFloat2("dve_screenSize", scene.getEngine().getRenderWidth(), scene.getEngine().getRenderHeight());
+      }
+    } else {
+      effect.setFloat("dve_time", performance.now() * 0.001);
+    }
   }
 
   //@ts-ignore
@@ -263,6 +283,9 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
 uniform sampler2DArray dve_voxel;
 uniform highp usampler2D dve_voxel_animation;
 uniform highp int dve_voxel_animation_size;
+uniform sampler2D dve_depthTexture;
+uniform vec2 dve_cameraNearFar;
+uniform vec2 dve_screenSize;
   ${enableImportedMaterialMaps ? "uniform sampler2DArray dve_voxel_normal;\nuniform sampler2DArray dve_voxel_material;" : ""}
 `;
     const varying = /* glsl */ `
@@ -492,9 +515,10 @@ vec3 dveDecodeLightValue(uint value) {
         `,
         CUSTOM_VERTEX_UPDATE_POSITION: /*glsl*/ `
 ${isLiquid ? `
-  float dveWaveA = sin(position.x * 1.8 + dve_time * 1.2) * 0.04;
-  float dveWaveB = sin(position.z * 2.4 + dve_time * 0.9 + 1.7) * 0.03;
-  float dveWaveC = sin((position.x + position.z) * 1.1 + dve_time * 1.6) * 0.02;
+  float dveLiquidTime = dve_time * 0.42;
+  float dveWaveA = sin(position.x * 1.8 + dveLiquidTime * 1.35) * 0.024;
+  float dveWaveB = sin(position.z * 2.4 + dveLiquidTime * 1.05 + 1.7) * 0.018;
+  float dveWaveC = sin((position.x + position.z) * 1.1 + dveLiquidTime * 1.8) * 0.012;
   positionUpdated.y += dveWaveA + dveWaveB + dveWaveC;
 ` : ""}
 `,
@@ -942,6 +966,7 @@ ${visualV2Code}
 ${macroVariationCode}
 ${triplanarCode}
 ${wetnessAlbedoCode}
+
 ${microVariationCode}
 ${surfaceOverlaysCode}
 ${nearCameraHighDetailCode}
@@ -966,26 +991,33 @@ if (dveOverlayTextureIndex.x > 0.) {
   if (oRGB.a > 0.5) dveLiquidSample = oRGB;
 }
 // Dual-normal scrolling for wave detail
-vec2 dveWaterUV1 = vPositionW.xz * 0.08 + vec2(dve_time * 0.03, dve_time * 0.02);
-vec2 dveWaterUV2 = vPositionW.xz * 0.12 + vec2(-dve_time * 0.025, dve_time * 0.035);
-float dveWaveN1 = dveNoise3(vec3(dveWaterUV1 * 8.0, dve_time * 0.4)) * 2.0 - 1.0;
-float dveWaveN2 = dveNoise3(vec3(dveWaterUV2 * 6.0, dve_time * 0.3 + 5.0)) * 2.0 - 1.0;
+float dveLiquidTime = dve_time * 0.42;
+vec2 dveWaterUV1 = vPositionW.xz * 0.08 + vec2(dveLiquidTime * 0.045, dveLiquidTime * 0.03);
+vec2 dveWaterUV2 = vPositionW.xz * 0.12 + vec2(-dveLiquidTime * 0.035, dveLiquidTime * 0.05);
+float dveWaveN1 = dveNoise3(vec3(dveWaterUV1 * 8.0, dveLiquidTime * 0.5)) * 2.0 - 1.0;
+float dveWaveN2 = dveNoise3(vec3(dveWaterUV2 * 6.0, dveLiquidTime * 0.38 + 5.0)) * 2.0 - 1.0;
 float dveDualWave = (dveWaveN1 + dveWaveN2) * 0.5;
-// Absorption tinting — deeper water gets darker and bluer
+// Simple world-Y absorption tinting
 float dveWaterDepthFactor = clamp((64.0 - vPositionW.y) * 0.02, 0.0, 1.0);
 vec3 dveShallowColor = vec3(0.22, 0.52, 0.72);
 vec3 dveDeepColor = vec3(0.06, 0.18, 0.34);
 vec3 dveAbsorptionColor = mix(dveShallowColor, dveDeepColor, dveWaterDepthFactor);
-// Blend texture with absorption-tinted water
 vec3 dveLiquidColor = mix(dveLiquidSample.rgb * vec3(0.3, 0.6, 0.82), dveAbsorptionColor, 0.6);
-// Micro-shimmer from wave interaction
-float dveShimmer = dveDualWave * 0.08 + 0.04;
-dveLiquidColor += vec3(dveShimmer * 0.3, dveShimmer * 0.4, dveShimmer * 0.5);
+float dveShimmer = dveDualWave * 0.028 + 0.016;
+dveLiquidColor += vec3(dveShimmer * 0.2, dveShimmer * 0.3, dveShimmer * 0.4);
+
+// Keep liquid alpha stable. The previous shore fade compared a normalized depth
+// texture sample against view-space Z, which produced fast-moving false holes.
+float dveCrestLight = max(dveDualWave, 0.0);
+dveLiquidColor = mix(
+  dveLiquidColor,
+  vec3(0.82, 0.9, 0.98),
+  dveCrestLight * 0.14
+);
+
 vec4 voxelBaseColor = vec4(dveLiquidColor, 1.0);
 surfaceAlbedo = toLinearSpace(voxelBaseColor.rgb);
-alpha = ${benchmarkPreset === "material-import" ? "1.0" : "mix(0.82, 0.92, dveWaterDepthFactor)"};
-
-#endif
+alpha = ${benchmarkPreset === "material-import" ? "1.0" : "0.82"};
 
 
 #endif
@@ -1040,11 +1072,12 @@ ${importedMaterialBeforeLightsCode}
 #endif
 #ifdef DVE_dve_liquid
 {
-  vec2 dveBL_uv1 = vPositionW.xz * 0.08 + vec2(dve_time * 0.03, dve_time * 0.02);
-  vec2 dveBL_uv2 = vPositionW.xz * 0.12 + vec2(-dve_time * 0.025, dve_time * 0.035);
-  float dveBL_n1 = dveNoise3(vec3(dveBL_uv1 * 8.0, dve_time * 0.4)) * 2.0 - 1.0;
-  float dveBL_n2 = dveNoise3(vec3(dveBL_uv2 * 6.0, dve_time * 0.3 + 5.0)) * 2.0 - 1.0;
-  normalW = normalize(normalW + vec3(dveBL_n1 * 0.12, 0.0, dveBL_n2 * 0.12));
+  float dveLiquidTimeBL = dve_time * 0.42;
+  vec2 dveBL_uv1 = vPositionW.xz * 0.08 + vec2(dveLiquidTimeBL * 0.045, dveLiquidTimeBL * 0.03);
+  vec2 dveBL_uv2 = vPositionW.xz * 0.12 + vec2(-dveLiquidTimeBL * 0.035, dveLiquidTimeBL * 0.05);
+  float dveBL_n1 = dveNoise3(vec3(dveBL_uv1 * 8.0, dveLiquidTimeBL * 0.5)) * 2.0 - 1.0;
+  float dveBL_n2 = dveNoise3(vec3(dveBL_uv2 * 6.0, dveLiquidTimeBL * 0.38 + 5.0)) * 2.0 - 1.0;
+  normalW = normalize(normalW + vec3(dveBL_n1 * 0.075, 0.0, dveBL_n2 * 0.075));
 }
 #endif
 `,
@@ -1060,6 +1093,7 @@ ${liquidSSSCode}
 `,
         CUSTOM_FRAGMENT_MAIN_END: /*glsl*/ `
 #ifdef  DVE_${this.name}
+
 if (glFragColor.a < 0.05) {
   discard;
 }
