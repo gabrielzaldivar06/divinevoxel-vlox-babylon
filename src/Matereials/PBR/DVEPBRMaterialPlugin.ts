@@ -79,7 +79,7 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
   }
 
   getAttributes(attributes: string[]) {
-    attributes.push("textureIndex", "uv", "voxelData", "metadata");
+    attributes.push("textureIndex", "uv", "voxelData", "metadata", "worldContext");
   }
 
   getUniforms() {
@@ -238,6 +238,7 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
       !isTransparent &&
       !isGlow &&
       !disableUnstablePBRSurfaceContext;
+    const enableLiquidSurfaceContext = isLiquid;
     const enableSurfaceHeightGradient =
       terrain.surfaceHeightGradient &&
       !isLiquid &&
@@ -298,14 +299,14 @@ varying vec3 dveLight2;
 varying vec3 dveLight3;
 varying vec3 dveLight4;
   ${enableSurfaceMetadata ? "varying vec4 dveMetadata;" : ""}
-  ${enableSurfaceMetadata ? "varying vec3 dveWorldContext;" : ""}
+  ${(enableSurfaceMetadata || enableLiquidSurfaceContext) ? "varying vec3 dveWorldContext;" : ""}
 `;
 
     const attributes = /* glsl */ `
 attribute vec3 textureIndex;
 attribute vec4 voxelData;
   ${enableSurfaceMetadata ? "attribute vec4 metadata;" : ""}
-  ${enableSurfaceMetadata ? "attribute vec3 worldContext;" : ""}
+  ${(enableSurfaceMetadata || enableLiquidSurfaceContext) ? "attribute vec3 worldContext;" : ""}
 `;
     const coreFunctions = /* glsl */ `
 const uint dveLightMask = uint(0xf);
@@ -509,17 +510,20 @@ vec3 dveDecodeLightValue(uint value) {
   dveLight4 = dveDecodeLightValue(uint(voxelData.w));
   dveIUV = dveQuadUVArray[(uint(voxelData.z) >> dveVertexIndex) & dveVertexMask];
   ${enableSurfaceMetadata ? "dveMetadata = metadata;" : ""}
-  ${enableSurfaceMetadata ? "dveWorldContext = worldContext;" : ""}
+  ${(enableSurfaceMetadata || enableLiquidSurfaceContext) ? "dveWorldContext = worldContext;" : ""}
 
 #endif
         `,
         CUSTOM_VERTEX_UPDATE_POSITION: /*glsl*/ `
 ${isLiquid ? `
   float dveLiquidTime = dve_time * 0.42;
+  float dveCoastMask = smoothstep(0.08, 0.58, clamp(dveWorldContext.y + (1.0 - dveWorldContext.z) * 0.35, 0.0, 1.0));
+  float dveWaveAmp = mix(1.0, 0.2, dveCoastMask);
   float dveWaveA = sin(position.x * 1.8 + dveLiquidTime * 1.35) * 0.024;
   float dveWaveB = sin(position.z * 2.4 + dveLiquidTime * 1.05 + 1.7) * 0.018;
   float dveWaveC = sin((position.x + position.z) * 1.1 + dveLiquidTime * 1.8) * 0.012;
-  positionUpdated.y += dveWaveA + dveWaveB + dveWaveC;
+  float dveCoastLift = dveCoastMask * 0.01;
+  positionUpdated.y += (dveWaveA + dveWaveB + dveWaveC) * dveWaveAmp + dveCoastLift;
 ` : ""}
 `,
       };
