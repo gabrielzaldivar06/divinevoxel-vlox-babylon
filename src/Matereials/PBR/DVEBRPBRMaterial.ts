@@ -6,6 +6,7 @@ import { Texture } from "@babylonjs/core/Materials/Textures/texture";
 import { PBRMaterial } from "@babylonjs/core/Materials/PBR/pbrMaterial";
 import { Vector3, Vector4 } from "@babylonjs/core/Maths/";
 import { DVEPBRMaterialPlugin } from "./DVEPBRMaterialPlugin";
+import { DVEWaterMaterialPlugin } from "./DVEWaterMaterialPlugin";
 import { DVEDissolutionPlugin } from "./DVEDissolutionPlugin";
 import { DVELODMorphPlugin } from "./DVELODMorphPlugin";
 import { IMatrixLike } from "@babylonjs/core/Maths/math.like";
@@ -44,9 +45,25 @@ export type DVEBRPBRMaterialData = MaterialData<{
   effectId: string;
 
   material?: PBRBaseMaterial;
-  plugin?: DVEPBRMaterialPlugin;
+  plugin?: DVEPBRMaterialPlugin | DVEWaterMaterialPlugin;
   textures?: Map<string, Texture>;
 }>;
+
+function createMaterialPluginClass(
+  pluginBase: typeof DVEPBRMaterialPlugin | typeof DVEWaterMaterialPlugin,
+  pluginId: string
+) {
+  return new Function(
+    "extendedClass",
+    /* js */ `
+    return class ${pluginId} extends extendedClass {
+      getClassName() {
+        return ${pluginId};
+      }
+    };
+  `
+  )(pluginBase);
+}
 
 export class DVEBRPBRMaterial implements MaterialInterface {
   static ready = false;
@@ -54,7 +71,7 @@ export class DVEBRPBRMaterial implements MaterialInterface {
   _material: PBRMaterial;
   scene: Scene;
 
-  plugin: DVEPBRMaterialPlugin;
+  plugin: DVEPBRMaterialPlugin | DVEWaterMaterialPlugin;
   animationSizes = new Map<string, number>();
   static importedMaterialMapSamplerIds = ["dve_voxel_normal", "dve_voxel_material"] as const;
 
@@ -100,18 +117,12 @@ export class DVEBRPBRMaterial implements MaterialInterface {
 
     const material = new PBRMaterial(this.id, data.scene);
     const pluginId = `${this.id.replace("#", "")}`;
+    const isLiquidMaterial = this.id.includes("liquid");
 
-    const pluginBase = DVEPBRMaterialPlugin;
-    const newPlugin = new Function(
-      "extendedClass",
-      /* js */ `
-      return class ${pluginId} extends extendedClass {
-        getClassName() {
-          return ${pluginId};
-        }
-      };
-    `
-    )(pluginBase);
+    const pluginBase = isLiquidMaterial
+      ? DVEWaterMaterialPlugin
+      : DVEPBRMaterialPlugin;
+    const newPlugin = createMaterialPluginClass(pluginBase, pluginId);
 
     const plugin = new newPlugin(material, pluginId, this, () => {});
     this.plugin = plugin;
@@ -135,17 +146,29 @@ export class DVEBRPBRMaterial implements MaterialInterface {
     if (this.data.backFaceCulling !== undefined) {
       material.backFaceCulling = this.data.backFaceCulling;
     }
-    if (this.id.includes("liquid")) {
-      material.roughness = 0.1;
-      material.reflectionColor.set(0.1, 0.1, 0.1);
-      material.metallic = 1;
-      material.reflectivityColor.set(0.8, 0.8, 0.8);
-      //  material.wireframe = true;
-      material.alphaMode = Material.MATERIAL_ALPHABLEND;
-      material.transparencyMode = Material.MATERIAL_ALPHABLEND;
-      material.needAlphaBlending = () => true;
+    if (isLiquidMaterial) {
+      material.roughness = 0.02;
+      material.reflectionColor.set(1.0, 1.0, 1.0);
+      material.metallic = 0;
+      material.reflectivityColor.set(0.24, 0.3, 0.36);
+      material.environmentIntensity = 1.28;
+      material.directIntensity = 1;
+      material.emissiveColor.set(0.015, 0.045, 0.06);
+      material.alphaMode = Material.MATERIAL_OPAQUE;
+      material.transparencyMode = Material.MATERIAL_OPAQUE;
+      material.needAlphaBlending = () => false;
       material.needDepthPrePass = false;
+      material.forceDepthWrite = true;
       material.backFaceCulling = false;
+      material.twoSidedLighting = true;
+      material.forceNormalForward = true;
+      material.separateCullingPass = false;
+      material.useRadianceOverAlpha = true;
+      material.forceIrradianceInFragment = true;
+
+      if (this.scene.environmentTexture) {
+        material.reflectionTexture = this.scene.environmentTexture as any;
+      }
 
       material.alpha = 1.0;
     } else {
@@ -205,7 +228,9 @@ export class DVEBRPBRMaterial implements MaterialInterface {
       DVEBRPBRMaterial._importedMapLog.push(this.id);
     }
 
-    applyActiveTerrainMaterialProfiles(material, this.id, EngineSettings.settings.terrain);
+    if (!isLiquidMaterial) {
+      applyActiveTerrainMaterialProfiles(material, this.id, EngineSettings.settings.terrain);
+    }
 
     material.markAsDirty(Material.AllDirtyFlag);
 
@@ -271,17 +296,10 @@ export class DVEBRPBRMaterial implements MaterialInterface {
     }
     const pluginId = `${this.id.replace("#", "")}`;
 
-    const pluginBase = DVEPBRMaterialPlugin;
-    const newPlugin = new Function(
-      "extendedClass",
-      /* js */ `
-      return class ${pluginId} extends extendedClass {
-        getClassName() {
-          return ${pluginId};
-        }
-      };
-    `
-    )(pluginBase);
+    const pluginBase = this.id.includes("liquid")
+      ? DVEWaterMaterialPlugin
+      : DVEPBRMaterialPlugin;
+    const newPlugin = createMaterialPluginClass(pluginBase, pluginId);
     const newMat = PBRMaterial.Parse(
       this._material.serialize(),
       scene,
@@ -292,7 +310,7 @@ export class DVEBRPBRMaterial implements MaterialInterface {
       pluginId,
       this,
       () => {}
-    ) as DVEPBRMaterialPlugin;
+    ) as DVEPBRMaterialPlugin | DVEWaterMaterialPlugin;
 
     // Dissolution shader plugin for cloned material
     new DVEDissolutionPlugin(newMat, `dissolution_${pluginId}`, scene);

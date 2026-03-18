@@ -5,6 +5,7 @@ import { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { EngineSettings } from "@divinevoxel/vlox/Settings/EngineSettings";
 import { MeshRegister } from "@divinevoxel/vlox/Renderer/MeshRegister";
 import { WorldSpaces } from "@divinevoxel/vlox/World/WorldSpaces";
+import { classifyTerrainMaterial } from "../Matereials/PBR/MaterialFamilyProfiles";
 const min = new Vector3();
 const max = new Vector3(16, 16, 16);
 const boundingBox = new BoundingBox(min, max);
@@ -17,6 +18,8 @@ const _BUDGET_WARN_INTERVAL = 300; // frames between warnings
 const sectorCenter = new Vector3();
 const sectorDirection = new Vector3();
 const forwardDirection = new Vector3();
+const SECTOR_FRUSTUM_PADDING = 1;
+const LIQUID_SECTOR_FRUSTUM_PADDING = 8;
 // Lazily-computed squared near-distance below which viewCone culling is skipped.
 // Sectors within 2× the sector diagonal are too close for the center-dot test
 // to be reliable — the frustum check handles them correctly instead.
@@ -72,6 +75,21 @@ function isResidentSector(sector: any, cameraPosition: Vector3) {
 
 function isTransitionGeometryMesh(mesh: Mesh) {
   return mesh.metadata?.transitionGeometry === true;
+}
+
+function isLiquidMaterialId(materialId?: string) {
+  if (!materialId) return false;
+  return classifyTerrainMaterial(materialId).isLiquid;
+}
+
+function sectorHasLiquidMeshes(sector: any) {
+  for (const section of sector.sections) {
+    if (!section) continue;
+    for (const [, mesh] of section.meshes as Map<string, Mesh>) {
+      if (isLiquidMaterialId(mesh.metadata?.baseMaterialId)) return true;
+    }
+  }
+  return false;
 }
 
 function getDistanceSquared(a: Vector3, b: Vector3) {
@@ -183,11 +201,18 @@ function CullSectors(scene: Scene) {
   for (const [, dimension] of MeshRegister._dimensions) {
     for (const [, sector] of dimension) {
       const residentSector = isResidentSector(sector, camera.globalPosition);
-      min.set(sector.position[0], sector.position[1], sector.position[2]);
+      const sectorPadding = sectorHasLiquidMeshes(sector)
+        ? LIQUID_SECTOR_FRUSTUM_PADDING
+        : SECTOR_FRUSTUM_PADDING;
+      min.set(
+        sector.position[0] - sectorPadding,
+        sector.position[1] - sectorPadding,
+        sector.position[2] - sectorPadding
+      );
       max.set(
-        sector.position[0] + WorldSpaces.sector.bounds.x,
-        sector.position[1] + WorldSpaces.sector.bounds.y,
-        sector.position[2] + WorldSpaces.sector.bounds.z
+        sector.position[0] + WorldSpaces.sector.bounds.x + sectorPadding,
+        sector.position[1] + WorldSpaces.sector.bounds.y + sectorPadding,
+        sector.position[2] + WorldSpaces.sector.bounds.z + sectorPadding
       );
       boundingBox.reConstruct(min, max);
       const sectorVisible =

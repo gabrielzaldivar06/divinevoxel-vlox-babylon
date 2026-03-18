@@ -13,9 +13,11 @@ import {
 import { LocationData } from "@divinevoxel/vlox/Math";
 import { SubBufferMesh } from "./Meshes/SubBufferMesh";
 import { SingleBufferVoxelScene } from "./SingleBufferVoxelScene";
+import { classifyTerrainMaterial } from "../../Matereials/PBR/MaterialFamilyProfiles";
 const meshData = new CompactedMeshData();
 const location: LocationData = [0, 0, 0, 0];
 const found = new Set<string>();
+const LIQUID_MESH_BOUND_PADDING = 6;
 export class DVEBRSectionMeshesSingleBuffer extends DVESectionMeshes {
   static meshCache: Mesh[] = [];
   pickable = false;

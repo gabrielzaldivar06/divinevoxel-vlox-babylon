@@ -1,75 +1,48 @@
-import { ShaderMaterial } from "@babylonjs/core/Materials/shaderMaterial";
-import { CreateSphere } from "@babylonjs/core/Meshes/Builders/sphereBuilder";
-import { SkyboxShader } from "../../Shaders/Code/SkyboxShader";
-import { DVEBRShaderStore } from "../../Shaders/DVEBRShaderStore";
+import { PBRMaterial } from "@babylonjs/core/Materials/PBR/pbrMaterial";
+import { Texture } from "@babylonjs/core/Materials/Textures/texture";
+import { HDRCubeTexture } from "@babylonjs/core/Materials/Textures/hdrCubeTexture";
+import { CreateBox } from "@babylonjs/core/Meshes/Builders/boxBuilder";
 import { DVEBabylonRenderer } from "Renderer/DVEBabylonRenderer";
+
+const DEFAULT_VISIBLE_SKYBOX_HDRI = "assets/skybox-blouberg-sunrise-2.hdr";
+
 export function InitSkybox({ renderer }: { renderer: DVEBabylonRenderer }) {
-  const sceneOptions = renderer.sceneOptions;
-  DVEBRShaderStore.storeShader(
-    "dve_skybox",
-    "vertex",
-    SkyboxShader.GetVertex()
-  );
-
-  DVEBRShaderStore.storeShader(
-    "dve_skybox",
-    "frag",
-    SkyboxShader.GetFragment()
-  );
-
-  const uniforms: string[] = [
-    "world",
-    "viewProjection",
-    "worldOrigin",
-    "cameraPosition",
-    "dveSunDirection",
-  ];
-  if (!sceneOptions.ubo.suppourtsUBO) {
-    uniforms.push(...sceneOptions.ubo.allUniformsNames);
+  const scene = renderer.scene;
+  const existingSkyboxes = scene.meshes.filter((mesh) => mesh.name === "skyBox");
+  for (const mesh of existingSkyboxes) {
+    mesh.material?.dispose(false, true);
+    mesh.dispose(false, true);
   }
-  const skyboxMat = new ShaderMaterial(
-    "skybox",
-    renderer.scene,
-    "dve_skybox",
-    {
-      uniforms,
-      attributes: ["position", "normal"],
-      ...(sceneOptions.ubo.suppourtsUBO
-        ? {
-            uniformBuffers: ["SceneOptions"],
-          }
-        : {}),
-      needAlphaBlending: false,
-      needAlphaTesting: false,
-    },
-    false
-  );
+
+  const sourceTexture =
+    scene.environmentTexture instanceof HDRCubeTexture
+      ? (scene.environmentTexture.clone() as HDRCubeTexture)
+      : new HDRCubeTexture(DEFAULT_VISIBLE_SKYBOX_HDRI, scene, 512);
+  const reflectionTexture = sourceTexture;
+  reflectionTexture.coordinatesMode = Texture.SKYBOX_MODE;
+  const skyboxMat = new PBRMaterial("skybox", scene);
+  skyboxMat.reflectionTexture = reflectionTexture;
+  skyboxMat.backFaceCulling = false;
+  skyboxMat.microSurface = 1.0;
+  skyboxMat.cameraExposure = 0.5;
+  skyboxMat.cameraContrast = 1.0;
+  skyboxMat.disableLighting = true;
+  skyboxMat.unlit = true;
+  skyboxMat.disableDepthWrite = true;
+  scene.onDisposeObservable.addOnce(() => reflectionTexture.dispose());
 
   const renderDistance = 250;
-  const skybox = CreateSphere(
+  const skybox = CreateBox(
     "skyBox",
     {
-      diameterX: renderDistance,
-      diameterZ: renderDistance,
-      diameterY: renderDistance,
+      size: renderDistance,
     },
-    renderer.scene
+    scene
   );
   skybox.renderingGroupId = 0;
   skybox.infiniteDistance = true;
-  skyboxMat.sideOrientation = 0;
-  skyboxMat.backFaceCulling = true;
+  skybox.isPickable = false;
   skybox.material = skyboxMat;
-  skyboxMat.disableDepthWrite = true;
-
-  if (sceneOptions.ubo.buffer) {
-    skyboxMat.setUniformBuffer("SceneOptions", sceneOptions.ubo.buffer);
-  } else {
-    sceneOptions.ubo.syncToShaderMaterial(true, skyboxMat);
-    sceneOptions.ubo.observers.beforeSync.add(() => {
-      sceneOptions.ubo.syncToShaderMaterial(false, skyboxMat);
-    });
-  }
 
   return skybox;
 }

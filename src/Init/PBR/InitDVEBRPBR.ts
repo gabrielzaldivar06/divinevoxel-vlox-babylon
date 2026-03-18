@@ -4,7 +4,6 @@ import {
   CreateDefaultRenderer,
   CreateTextures,
 } from "../Default/CreateDefaultRenderer";
-import { CreateBox } from "@babylonjs/core/Meshes/Builders/boxBuilder";
 import { DirectionalLight } from "@babylonjs/core/Lights/directionalLight";
 import { HemisphericLight } from "@babylonjs/core/Lights/hemisphericLight";
 import { ShadowGenerator } from "@babylonjs/core/Lights/Shadows/shadowGenerator";
@@ -17,7 +16,6 @@ import { ColorCurves } from "@babylonjs/core/Materials/colorCurves";
 import { Material } from "@babylonjs/core/Materials/material";
 import { DefaultRenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPipeline/Pipelines/defaultRenderingPipeline";
 import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
-import { ShaderMaterial } from "@babylonjs/core/Materials/shaderMaterial";
 import { Texture } from "@babylonjs/core/Materials/Textures/texture";
 import { HDRCubeTexture } from "@babylonjs/core/Materials/Textures/hdrCubeTexture";
 import { Scene } from "@babylonjs/core/scene";
@@ -106,6 +104,25 @@ const RENDERER_PRESET_CONFIGS: Readonly<Record<string, RendererPresetCfg>> = {
     ssao: { totalStrength: 0.88, samples: 14, radius: 2.2 },
   },
 };
+
+const WATER_NORMAL_ASSET_PATH = "assets/water/water-001-normal.jpg";
+const WATER_FOAM_ASSET_PATH = "assets/water/water-droplets-001-mask.jpg";
+const WATER_HDRI_ASSET_PATH = "assets/skybox-blouberg-sunrise-2.hdr";
+
+function createLinearWaterTexture(scene: Scene, path: string) {
+  const texture = new Texture(
+    path,
+    scene,
+    false,
+    false,
+    Texture.TRILINEAR_SAMPLINGMODE
+  );
+  texture.wrapU = Texture.WRAP_ADDRESSMODE;
+  texture.wrapV = Texture.WRAP_ADDRESSMODE;
+  texture.gammaSpace = false;
+  texture.anisotropicFilteringLevel = 4;
+  return texture;
+}
 // ────────────────────────────────────────────────────────────────────────────
 
 function applyTerrainPhase1SkyProfile(renderer: Awaited<ReturnType<typeof CreateDefaultRenderer>>) {
@@ -473,6 +490,7 @@ function applyTerrainPhase1MaterialProfile(materials: MaterialInterface[]) {
 
   for (const material of materials) {
     if (!(material instanceof DVEBRPBRMaterial)) continue;
+    if (classifyTerrainMaterial(material.id).isLiquid) continue;
 
     const pbr = material._material;
     applyActiveTerrainMaterialProfiles(pbr, material.id, terrain);
@@ -665,7 +683,7 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
     );
   }
   await CreateTextures(initData.scene, initData.textureData, progress);
-  const hdrTexture = new HDRCubeTexture("assets/skybox.hdr", scene, 512);
+  const hdrTexture = new HDRCubeTexture(WATER_HDRI_ASSET_PATH, scene, 512);
   initData.scene.environmentTexture = hdrTexture;
   // BUG-G02: dispose the HDR texture (~3–6 MB VRAM) when the scene is torn down;
   // without this, reloads leak the old texture in GPU memory indefinitely.
@@ -803,6 +821,18 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
     textureTypes: initData.textureTypes,
     substances: initData.substances,
     afterCreate: async (_renderer, materials) => {
+      const waterNormalTexture = createLinearWaterTexture(scene, WATER_NORMAL_ASSET_PATH);
+      const waterFoamTexture = createLinearWaterTexture(scene, WATER_FOAM_ASSET_PATH);
+      scene.onDisposeObservable.addOnce(() => {
+        waterNormalTexture.dispose();
+        waterFoamTexture.dispose();
+      });
+      for (const material of materials) {
+        if (!classifyTerrainMaterial(material.id).isLiquid) continue;
+        material.setTexture("dve_water_normal", waterNormalTexture);
+        material.setTexture("dve_water_foam", waterFoamTexture);
+      }
+
       scene.ambientColor.set(1, 1, 1);
       // Prevenir que el depth buffer se limpie entre render groups, permitiendo 
       // que el shader de líquidos (Group 1) colisione con el terreno (Group 0).
@@ -934,16 +964,10 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
       );
       initData.scene.ambientColor.set(0.32, 0.33, 0.38);
 
-      const proceduralSkybox = InitSkybox({ renderer: _renderer });
-      proceduralSkybox.renderingGroupId = 0;
-      proceduralSkybox.infiniteDistance = true;
-      proceduralSkybox.isPickable = false;
-
-      // Sync sun direction to skybox shader every frame so the sun disk matches the DirectionalLight.
-      const skyboxMat = proceduralSkybox.material as ShaderMaterial;
-      scene.onBeforeRenderObservable.add(() => {
-        skyboxMat.setVector3("dveSunDirection", sunLight.direction);
-      });
+      const visibleSkybox = InitSkybox({ renderer: _renderer });
+      visibleSkybox.renderingGroupId = 0;
+      visibleSkybox.infiniteDistance = true;
+      visibleSkybox.isPickable = false;
 
       DVEBRPBRMaterial.flushImportedMapLog();
 

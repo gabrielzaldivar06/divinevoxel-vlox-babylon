@@ -1,0 +1,56 @@
+import type { PBRMaterial } from "@babylonjs/core/Materials/PBR/pbrMaterial";
+export declare const TerrainMaterialFamily: {
+    readonly Default: "default";
+    readonly Soil: "soil";
+    readonly Rock: "rock";
+    readonly Flora: "flora";
+    readonly Liquid: "liquid";
+    readonly Wood: "wood";
+    readonly Cultivated: "cultivated";
+    readonly Exotic: "exotic";
+};
+export type TerrainMaterialFamily = (typeof TerrainMaterialFamily)[keyof typeof TerrainMaterialFamily];
+export type TerrainMaterialClassification = {
+    id: string;
+    family: TerrainMaterialFamily;
+    isLiquid: boolean;
+    isTransparent: boolean;
+    isGlow: boolean;
+    isFlora: boolean;
+    isRock: boolean;
+    isWood: boolean;
+    isSoil: boolean;
+    isCultivated: boolean;
+    isExotic: boolean;
+};
+export type TerrainMaterialProfileLayer = {
+    disableLighting?: boolean;
+    alpha?: number;
+    metallic?: number;
+    roughnessAtLeast?: number;
+    roughnessAtMost?: number;
+    environmentIntensityAtLeast?: number;
+    directIntensityAtLeast?: number;
+    emissiveIntensityAtLeast?: number;
+    albedoColor?: [number, number, number];
+    reflectivityColor?: [number, number, number];
+    reflectionColor?: [number, number, number];
+    emissiveColor?: [number, number, number];
+};
+export type ActiveTerrainProfileSettings = {
+    benchmarkPreset?: string;
+    visualV2?: boolean;
+    materialTriplanar?: boolean;
+    materialWetness?: boolean;
+};
+export declare function classifyTerrainMaterial(id: string): TerrainMaterialClassification;
+export declare function applyTerrainMaterialProfileLayer(pbr: PBRMaterial, layer?: TerrainMaterialProfileLayer | null): void;
+export declare function getMaterialImportProfile(material: TerrainMaterialClassification): TerrainMaterialProfileLayer | null;
+export declare function getVisualV2Profile(material: TerrainMaterialClassification): TerrainMaterialProfileLayer;
+export declare function getTriplanarProfile(material: TerrainMaterialClassification): TerrainMaterialProfileLayer | null;
+export declare function getWetnessProfile(material: TerrainMaterialClassification): TerrainMaterialProfileLayer | null;
+export declare function getOptimumInspiredProfile(material: TerrainMaterialClassification): TerrainMaterialProfileLayer | null;
+export declare function getUniversalisInspiredProfile(material: TerrainMaterialClassification): TerrainMaterialProfileLayer | null;
+export declare function getDefinitivoProfile(material: TerrainMaterialClassification): TerrainMaterialProfileLayer | null;
+export declare function getPBRPremiumProfile(material: TerrainMaterialClassification): TerrainMaterialProfileLayer | null;
+export declare function applyActiveTerrainMaterialProfiles(pbr: PBRMaterial, materialId: string, terrain: ActiveTerrainProfileSettings): TerrainMaterialClassification;

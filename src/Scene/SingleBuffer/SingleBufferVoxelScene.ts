@@ -19,10 +19,35 @@ import {
   getBaseMaterialId,
   isTransitionMaterialId,
 } from "@divinevoxel/vlox/Mesher/Voxels/Models/TransitionMaterialIds";
+import { classifyTerrainMaterial } from "../../Matereials/PBR/MaterialFamilyProfiles";
 
 const min = Vector3.Zero();
 const max = new Vector3(16, 16, 16);
 const boundingBox = new BoundingBox(min, max);
+const SECTOR_FRUSTUM_PADDING = 1;
+const MESH_BOUND_PADDING = 1;
+const LIQUID_SECTOR_FRUSTUM_PADDING = 8;
+const LIQUID_MESH_BOUND_PADDING = 6;
+
+function isLiquidMaterialId(materialId: string) {
+  return classifyTerrainMaterial(getBaseMaterialId(materialId)).isLiquid;
+}
+
+function getBoundsPadding(data: CompactedMeshData) {
+  return isLiquidMaterialId(data.materialId)
+    ? LIQUID_MESH_BOUND_PADDING
+    : MESH_BOUND_PADDING;
+}
+
+function sectorHasLiquidMeshes(sector: any) {
+  for (const section of sector.sections) {
+    if (!section) continue;
+    for (const [, mesh] of section.meshes as Map<string, SubBufferMesh>) {
+      if (isLiquidMaterialId(mesh.baseMaterialId)) return true;
+    }
+  }
+  return false;
+}
 
 export class SingleBufferVoxelScene extends VoxelSceneInterface<SubBufferMesh> {
   _material: MultiMaterial;
@@ -78,13 +103,14 @@ export class SingleBufferVoxelScene extends VoxelSceneInterface<SubBufferMesh> {
 
     const minBounds = data.minBounds;
     const maxBounds = data.maxBounds;
+    const boundsPadding = getBoundsPadding(data);
 
-    min.x = minBounds[0] + subBufferMesh.transform.position.x;
-    min.y = minBounds[1] + subBufferMesh.transform.position.y;
-    min.z = minBounds[2] + subBufferMesh.transform.position.z;
-    max.x = maxBounds[0] + subBufferMesh.transform.position.x;
-    max.y = maxBounds[1] + subBufferMesh.transform.position.y;
-    max.z = maxBounds[2] + subBufferMesh.transform.position.z;
+    min.x = minBounds[0] + subBufferMesh.transform.position.x - boundsPadding;
+    min.y = minBounds[1] + subBufferMesh.transform.position.y - boundsPadding;
+    min.z = minBounds[2] + subBufferMesh.transform.position.z - boundsPadding;
+    max.x = maxBounds[0] + subBufferMesh.transform.position.x + boundsPadding;
+    max.y = maxBounds[1] + subBufferMesh.transform.position.y + boundsPadding;
+    max.z = maxBounds[2] + subBufferMesh.transform.position.z + boundsPadding;
 
     subBufferMesh.mesh.indexCount = data.indexCount;
     subBufferMesh.mesh.verticesCount = data.vertexCount;
@@ -173,14 +199,15 @@ export class SingleBufferVoxelScene extends VoxelSceneInterface<SubBufferMesh> {
 
     const minBounds = data.minBounds;
     const maxBounds = data.maxBounds;
+  const boundsPadding = getBoundsPadding(data);
 
-    min.x = minBounds[0] + x;
-    min.y = minBounds[1] + y;
-    min.z = minBounds[2] + z;
+  min.x = minBounds[0] + x - boundsPadding;
+  min.y = minBounds[1] + y - boundsPadding;
+  min.z = minBounds[2] + z - boundsPadding;
 
-    max.x = maxBounds[0] + x;
-    max.y = maxBounds[1] + y;
-    max.z = maxBounds[2] + z;
+  max.x = maxBounds[0] + x + boundsPadding;
+  max.y = maxBounds[1] + y + boundsPadding;
+  max.z = maxBounds[2] + z + boundsPadding;
 
     subBufferMesh.mesh.setBoundingInfo(new BoundingInfo(min, max));
     bufferMesh.writeBuffers(
@@ -201,11 +228,18 @@ export class SingleBufferVoxelScene extends VoxelSceneInterface<SubBufferMesh> {
 
     for (const [, dimension] of MeshRegister._dimensions) {
       for (const [, sector] of dimension) {
-        min.set(sector.position[0], sector.position[1], sector.position[2]);
+        const sectorPadding = sectorHasLiquidMeshes(sector)
+          ? LIQUID_SECTOR_FRUSTUM_PADDING
+          : SECTOR_FRUSTUM_PADDING;
+        min.set(
+          sector.position[0] - sectorPadding,
+          sector.position[1] - sectorPadding,
+          sector.position[2] - sectorPadding
+        );
         max.set(
-          sector.position[0] + WorldSpaces.sector.bounds.x,
-          sector.position[1] + WorldSpaces.sector.bounds.y,
-          sector.position[2] + WorldSpaces.sector.bounds.z
+          sector.position[0] + WorldSpaces.sector.bounds.x + sectorPadding,
+          sector.position[1] + WorldSpaces.sector.bounds.y + sectorPadding,
+          sector.position[2] + WorldSpaces.sector.bounds.z + sectorPadding
         );
         boundingBox.reConstruct(min, max);
         const sectorVisible = camera.isInFrustum(boundingBox);

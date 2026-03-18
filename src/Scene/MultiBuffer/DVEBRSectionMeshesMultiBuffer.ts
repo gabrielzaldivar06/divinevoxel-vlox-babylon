@@ -19,6 +19,7 @@ import {
   getBaseMaterialId,
   isTransitionMaterialId,
 } from "@divinevoxel/vlox/Mesher/Voxels/Models/TransitionMaterialIds";
+import { classifyTerrainMaterial } from "../../Matereials/PBR/MaterialFamilyProfiles";
 const min = Vector3.Zero();
 const max = new Vector3(16, 16, 16);
 const empty = new Float32Array(1);
@@ -26,6 +27,14 @@ const emptyIndice = new Uint16Array(1);
 const meshData = new CompactedMeshData();
 const location: LocationData = [0, 0, 0, 0];
 const found = new Set<string>();
+const MESH_BOUND_PADDING = 1;
+const LIQUID_MESH_BOUND_PADDING = 6;
+
+function getBoundsPadding(materialId: string) {
+  return classifyTerrainMaterial(getBaseMaterialId(materialId)).isLiquid
+    ? LIQUID_MESH_BOUND_PADDING
+    : MESH_BOUND_PADDING;
+}
 export class DVEBRSectionMeshesMultiBuffer extends DVESectionMeshes {
   pickable = false;
   checkCollisions = false;
@@ -117,14 +126,15 @@ export class DVEBRSectionMeshesMultiBuffer extends DVESectionMeshes {
 
       const minBounds = meshData.minBounds;
       const maxBounds = meshData.maxBounds;
+  const boundsPadding = getBoundsPadding(subMeshMaterial);
 
-      min.x = minBounds[0];
-      min.y = minBounds[1];
-      min.z = minBounds[2];
+  min.x = minBounds[0] - boundsPadding;
+  min.y = minBounds[1] - boundsPadding;
+  min.z = minBounds[2] - boundsPadding;
 
-      max.x = maxBounds[0];
-      max.y = maxBounds[1];
-      max.z = maxBounds[2];
+  max.x = maxBounds[0] + boundsPadding;
+  max.y = maxBounds[1] + boundsPadding;
+  max.z = maxBounds[2] + boundsPadding;
 
       mesh.getBoundingInfo().reConstruct(min, max, mesh.getWorldMatrix());
       mesh.freezeWorldMatrix();

@@ -8,6 +8,7 @@ import { DVEBRPBRMaterial } from "./DVEBRPBRMaterial";
 import { classifyTerrainMaterial } from "./MaterialFamilyProfiles";
 import { isUnstablePBRSurfaceContextPreset } from "./ActiveTerrainPBRFlags";
 import { EngineSettings } from "@divinevoxel/vlox/Settings/EngineSettings";
+import { getDepthTextureBinding } from "./DepthTextureBinding";
 
 export class DVEPBRMaterialPlugin extends MaterialPluginBase {
   uniformBuffer: UniformBuffer;
@@ -186,17 +187,14 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
         DVEPBRMaterialPlugin.frameTimes.set(scene, frameTime);
       }
       effect.setFloat("dve_time", frameTime.time);
-
-      const activeCamera = scene.activeCamera;
-      if (activeCamera) {
-          const depthRenderer = scene.enableDepthRenderer(activeCamera, false, true);
-          effect.setTexture("dve_depthTexture", depthRenderer.getDepthMap());
-          effect.setFloat2("dve_cameraNearFar", activeCamera.minZ, activeCamera.maxZ);
-          effect.setFloat2("dve_screenSize", scene.getEngine().getRenderWidth(), scene.getEngine().getRenderHeight());
-      }
     } else {
       effect.setFloat("dve_time", performance.now() * 0.001);
     }
+
+    const depthBinding = getDepthTextureBinding(this._material, scene);
+    effect.setTexture("dve_depthTexture", depthBinding.depthTexture);
+    effect.setFloat2("dve_cameraNearFar", depthBinding.near, depthBinding.far);
+    effect.setFloat2("dve_screenSize", depthBinding.screenWidth, depthBinding.screenHeight);
   }
 
   //@ts-ignore
@@ -204,7 +202,6 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
     const terrain = EngineSettings.settings.terrain;
     const benchmarkPreset = String(terrain.benchmarkPreset);
     const materialClass = classifyTerrainMaterial(this.name);
-    const isLiquid = materialClass.isLiquid;
     const isTransparent = materialClass.isTransparent;
     const isGlow = materialClass.isGlow;
     const isRock = materialClass.isRock;
@@ -214,40 +211,35 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
     const isCultivated = materialClass.isCultivated;
     const isExotic = materialClass.isExotic;
     const disableUnstablePBRSurfaceContext = isUnstablePBRSurfaceContextPreset(benchmarkPreset);
-    const enableVisualV2 = terrain.visualV2 && !isLiquid && !disableUnstablePBRSurfaceContext;
-    const enableMacroVariation = terrain.macroVariation && !isLiquid && !isTransparent && !isGlow;
+    const enableVisualV2 = terrain.visualV2 && !disableUnstablePBRSurfaceContext;
+    const enableMacroVariation = terrain.macroVariation && !isTransparent && !isGlow;
     const enableTriplanar =
-      terrain.materialTriplanar && !isLiquid && !isTransparent && !disableUnstablePBRSurfaceContext;
-    const enableWetness = terrain.materialWetness && !isLiquid && !isTransparent && !isGlow;
+      terrain.materialTriplanar && !isTransparent && !disableUnstablePBRSurfaceContext;
+    const enableWetness = terrain.materialWetness && !isTransparent && !isGlow;
     const enableSurfaceOverlays =
       terrain.surfaceOverlays &&
       !disableUnstablePBRSurfaceContext &&
-      !isLiquid &&
       !isTransparent &&
       !isGlow;
     const enableMicroVariation =
-      terrain.microVariation && !isLiquid && !isTransparent && !disableUnstablePBRSurfaceContext;
+      terrain.microVariation && !isTransparent && !disableUnstablePBRSurfaceContext;
     const enableNearCameraHighDetail =
       terrain.nearCameraHighDetail &&
-      !isLiquid &&
       !isTransparent &&
       !disableUnstablePBRSurfaceContext;
     const enableSurfaceMetadata =
       terrain.surfaceMetadata &&
-      !isLiquid &&
       !isTransparent &&
       !isGlow &&
       !disableUnstablePBRSurfaceContext;
-    const enableLiquidSurfaceContext = isLiquid;
     const enableSurfaceHeightGradient =
       terrain.surfaceHeightGradient &&
-      !isLiquid &&
       !isTransparent &&
       !isGlow &&
       !disableUnstablePBRSurfaceContext;
-    const enablePBRPremium = (benchmarkPreset === "pbr-premium" || benchmarkPreset === "pbr-premium-v2") && !isLiquid && !isTransparent;
+    const enablePBRPremium = (benchmarkPreset === "pbr-premium" || benchmarkPreset === "pbr-premium-v2") && !isTransparent;
     const enableImportedMaterialMaps =
-      this.shouldUseImportedMaterialMaps() && !isLiquid && !isTransparent;
+      this.shouldUseImportedMaterialMaps() && !isTransparent;
     // R11: POM enabled when imported material maps are active and runtime flag is set
     const enablePOM =
       enableImportedMaterialMaps &&
@@ -299,14 +291,14 @@ varying vec3 dveLight2;
 varying vec3 dveLight3;
 varying vec3 dveLight4;
   ${enableSurfaceMetadata ? "varying vec4 dveMetadata;" : ""}
-  ${(enableSurfaceMetadata || enableLiquidSurfaceContext) ? "varying vec3 dveWorldContext;" : ""}
+  ${enableSurfaceMetadata ? "varying vec3 dveWorldContext;" : ""}
 `;
 
     const attributes = /* glsl */ `
 attribute vec3 textureIndex;
 attribute vec4 voxelData;
   ${enableSurfaceMetadata ? "attribute vec4 metadata;" : ""}
-  ${(enableSurfaceMetadata || enableLiquidSurfaceContext) ? "attribute vec3 worldContext;" : ""}
+  ${enableSurfaceMetadata ? "attribute vec3 worldContext;" : ""}
 `;
     const coreFunctions = /* glsl */ `
 const uint dveLightMask = uint(0xf);
@@ -510,27 +502,14 @@ vec3 dveDecodeLightValue(uint value) {
   dveLight4 = dveDecodeLightValue(uint(voxelData.w));
   dveIUV = dveQuadUVArray[(uint(voxelData.z) >> dveVertexIndex) & dveVertexMask];
   ${enableSurfaceMetadata ? "dveMetadata = metadata;" : ""}
-  ${(enableSurfaceMetadata || enableLiquidSurfaceContext) ? "dveWorldContext = worldContext;" : ""}
+  ${enableSurfaceMetadata ? "dveWorldContext = worldContext;" : ""}
 
 #endif
         `,
-        CUSTOM_VERTEX_UPDATE_POSITION: /*glsl*/ `
-${isLiquid ? `
-  float dveLiquidTime = dve_time * 0.42;
-  float dveCoastMask = smoothstep(0.08, 0.58, clamp(dveWorldContext.y + (1.0 - dveWorldContext.z) * 0.35, 0.0, 1.0));
-  float dveWaveAmp = mix(1.0, 0.2, dveCoastMask);
-  float dveWaveA = sin(position.x * 1.8 + dveLiquidTime * 1.35) * 0.024;
-  float dveWaveB = sin(position.z * 2.4 + dveLiquidTime * 1.05 + 1.7) * 0.018;
-  float dveWaveC = sin((position.x + position.z) * 1.1 + dveLiquidTime * 1.8) * 0.012;
-  float dveCoastLift = dveCoastMask * 0.01;
-  positionUpdated.y += (dveWaveA + dveWaveB + dveWaveC) * dveWaveAmp + dveCoastLift;
-` : ""}
-`,
       };
     }
     if (shaderType === "fragment") {
-      const albedoEnhancement = !isLiquid
-        ? /* glsl */ `
+      const albedoEnhancement = /* glsl */ `
 vec3 dveNormalW = normalize(vNormalW);
 float dveSlope = 1.0 - abs(dveNormalW.y);
       float dveCameraDistance = length(vPositionW - vEyePosition.xyz);
@@ -551,8 +530,7 @@ float dveSlope = 1.0 - abs(dveNormalW.y);
       float dveHeightNorm = ${enableSurfaceMetadata ? "dveBakedHeight" : enableSurfaceHeightGradient ? "clamp((vPositionW.y - 16.0) / 112.0, 0.0, 1.0)" : "0.0"};
       float dveBaseCavity = clamp(max(dveSurfaceCavity * 0.82, dveEdgeMask(fract(dveBaseUV * 0.85 + vec2(vPositionW.y * 0.03))) * 0.18), 0.0, 1.0);
       float dveWetnessBase = clamp(dveComputeWetness(dveNormalW, vPositionW) * 0.56 + dveSurfaceCavity * 0.14 + (1.0 - dveSurfaceExposure) * 0.06 + (1.0 - dveHeightNorm) * 0.14 - dveHeightNorm * 0.08 + (1.0 - dveSunExposure) * 0.1 + dveEnclosure * 0.08, 0.0, 1.0);
-`
-        : "";
+    `;
       const visualV2Code = enableVisualV2
         ? /* glsl */ `
   voxelBaseColor.rgb = pow(max(voxelBaseColor.rgb, vec3(0.0)), vec3(0.9));
@@ -578,16 +556,12 @@ float dveMacroTintMask = clamp(dveMacro * 0.6 + dveMacroPatch * 0.32 + dveSurfac
 vec3 dveMacroTint = mix(vec3(0.80, 0.75, 0.70), vec3(1.14, 1.08, 1.00), dveMacroTintMask);
 voxelBaseColor.rgb *= dveMacroTint;
 // Per-block brightness variation: breaks uniform same-type blocks.
-// Not applied to liquid — water is a continuous surface; per-tile hash creates
-// a visible 1×1 grid seam pattern on the water surface.
-#ifndef DVE_dve_liquid
 vec3 dveBlockSeed = vec3(floor(vPositionW.x), floor(vPositionW.z), dveTextureLayer * 0.03125 + 17.3);
 float dveBlockVar = (dveHash13(dveBlockSeed) * 2.0 - 1.0) * 0.08;    // ±8% brightness
 float dveBlockHue = (dveHash13(dveBlockSeed + vec3(5.1, 3.7, 2.9)) - 0.5) * 0.04;  // ±4% hue twist
 voxelBaseColor.rgb *= (1.0 + dveBlockVar);
 voxelBaseColor.r   += dveBlockHue;
 voxelBaseColor.b   -= dveBlockHue * 0.5;
-#endif
 `
         : "";
       const triplanarCode = enableTriplanar
@@ -773,7 +747,7 @@ voxelBaseColor.rgb = mix(
 `
         : "";
       const unstableSurfaceContextLiftCode =
-        disableUnstablePBRSurfaceContext && !isLiquid
+        disableUnstablePBRSurfaceContext
           ? /* glsl */ `
 float dveBaseLightLift = mix(0.18, 0.32, dveTopExposure);
 float dveCavityRecovery = (1.0 - dveBaseCavity) * 0.06;
@@ -858,46 +832,11 @@ float dveWetnessMask = dveComputeWetness(dveNormalW, vPositionW);
 finalDiffuse.rgb = mix(finalDiffuse.rgb, finalDiffuse.rgb * vec3(0.92, 0.94, 0.97), dveWetnessMask * 0.18);
 `
         : "";
-      const voxelLightFinalCode = !isLiquid
-        ? /* glsl */ `
+      const voxelLightFinalCode = /* glsl */ `
 vec3 dveVoxelLight = dveGetVoxelLight();
       finalDiffuse.rgb *= mix(vec3(1.0), dveVoxelLight, ${voxelLightMix.toFixed(2)});
 finalDiffuse.rgb += dveVoxelLight * 0.02;
-`
-        : /* glsl */ `
-vec3 dveVoxelLight = dveGetVoxelLight();
-finalDiffuse.rgb *= mix(vec3(1.0), dveVoxelLight, 0.22);
 `;
-
-      const liquidSSSCode = isLiquid
-        ? /* glsl */ `
-#ifdef DVE_dve_liquid
-{
-  // --- Sub-surface scattering approximation ---
-  float dveSSSfresnel = 1.0 - max(dot(viewDirectionW, normalW), 0.0);
-  float dveSSSedge = pow(dveSSSfresnel, 3.0);
-  float dveSSSdepth = clamp((64.0 - vPositionW.y) * 0.02, 0.0, 1.0);
-  float dveSSSthickness = 1.0 - dveSSSdepth;
-  vec3 dveSSScolor = vec3(0.04, 0.14, 0.22);
-  float dveSSSintensity = dveSSSedge * 0.28 + dveSSSthickness * 0.08;
-  finalDiffuse.rgb += dveSSScolor * dveSSSintensity;
-  finalDiffuse.rgb += vec3(0.02, 0.06, 0.1) * dveSSSedge * 0.4;
-
-  // --- Refraction depth approximation ---
-  float dveViewDot = max(dot(viewDirectionW, vec3(0.0, 1.0, 0.0)), 0.0);
-  float dveRefrDepth = (1.0 - dveViewDot) * dveSSSdepth * 0.15;
-  finalDiffuse.rgb *= 1.0 - dveRefrDepth;
-
-  // --- Caustics ---
-  vec2 dveCaustUV = vPositionW.xz * 0.15 + vec2(dve_time * 0.04, dve_time * 0.03);
-  float dveCaust = dveNoise3(vec3(dveCaustUV * 5.0, dve_time * 0.5));
-  dveCaust = pow(dveCaust, 2.8) * 1.6;
-  float dveCaustMask = dveSSSthickness * dveViewDot;
-  finalDiffuse.rgb += vec3(0.06, 0.1, 0.12) * dveCaust * dveCaustMask;
-}
-#endif
-`
-        : "";
 
       return {
         CUSTOM_FRAGMENT_DEFINITIONS: /*glsl*/ `
@@ -947,7 +886,6 @@ ${enablePOM ? `
 }
 #endif` : ""}
 
-#ifndef  DVE_dve_liquid
 vec4 voxelBaseColor = texture(dve_voxel, vec3(dveBaseUV + dvePOMDelta, dveTextureLayer));
 if (dveOverlayTextureIndex.x > 0.) {
   vec4 oRGB = texture(dve_voxel, vec3(dveBaseUV + dvePOMDelta, dveOverlayTextureIndex.x));
@@ -986,45 +924,6 @@ vec3 dveSnowColor = vec3(0.92, 0.94, 0.98);
 voxelBaseColor.rgb = mix(voxelBaseColor.rgb, dveSnowColor, dveSnowMask * 0.85);
 surfaceAlbedo = toLinearSpace(vec3(voxelBaseColor.r, voxelBaseColor.g, voxelBaseColor.b));
 alpha *= voxelBaseColor.a;
-#endif
-
-#ifdef  DVE_dve_liquid
-vec4 dveLiquidSample = texture(dve_voxel, vec3(dveBaseUV, dveTextureLayer));
-if (dveOverlayTextureIndex.x > 0.) {
-  vec4 oRGB = texture(dve_voxel, vec3(dveBaseUV, dveOverlayTextureIndex.x));
-  if (oRGB.a > 0.5) dveLiquidSample = oRGB;
-}
-// Dual-normal scrolling for wave detail
-float dveLiquidTime = dve_time * 0.42;
-vec2 dveWaterUV1 = vPositionW.xz * 0.08 + vec2(dveLiquidTime * 0.045, dveLiquidTime * 0.03);
-vec2 dveWaterUV2 = vPositionW.xz * 0.12 + vec2(-dveLiquidTime * 0.035, dveLiquidTime * 0.05);
-float dveWaveN1 = dveNoise3(vec3(dveWaterUV1 * 8.0, dveLiquidTime * 0.5)) * 2.0 - 1.0;
-float dveWaveN2 = dveNoise3(vec3(dveWaterUV2 * 6.0, dveLiquidTime * 0.38 + 5.0)) * 2.0 - 1.0;
-float dveDualWave = (dveWaveN1 + dveWaveN2) * 0.5;
-// Simple world-Y absorption tinting
-float dveWaterDepthFactor = clamp((64.0 - vPositionW.y) * 0.02, 0.0, 1.0);
-vec3 dveShallowColor = vec3(0.22, 0.52, 0.72);
-vec3 dveDeepColor = vec3(0.06, 0.18, 0.34);
-vec3 dveAbsorptionColor = mix(dveShallowColor, dveDeepColor, dveWaterDepthFactor);
-vec3 dveLiquidColor = mix(dveLiquidSample.rgb * vec3(0.3, 0.6, 0.82), dveAbsorptionColor, 0.6);
-float dveShimmer = dveDualWave * 0.028 + 0.016;
-dveLiquidColor += vec3(dveShimmer * 0.2, dveShimmer * 0.3, dveShimmer * 0.4);
-
-// Keep liquid alpha stable. The previous shore fade compared a normalized depth
-// texture sample against view-space Z, which produced fast-moving false holes.
-float dveCrestLight = max(dveDualWave, 0.0);
-dveLiquidColor = mix(
-  dveLiquidColor,
-  vec3(0.82, 0.9, 0.98),
-  dveCrestLight * 0.14
-);
-
-vec4 voxelBaseColor = vec4(dveLiquidColor, 1.0);
-surfaceAlbedo = toLinearSpace(voxelBaseColor.rgb);
-alpha = ${benchmarkPreset === "material-import" ? "1.0" : "0.82"};
-
-
-#endif
 `,
   CUSTOM_FRAGMENT_UPDATE_MICROSURFACE: /*glsl*/ `
 ${wetnessMicroSurfaceCode}
@@ -1032,7 +931,6 @@ ${heightGradientMicroSurfaceCode}
 ${importedMaterialMicroSurfaceCode}
 // R15: Snow microsurface — snow is glossy/icy on top surfaces at altitude
 #ifdef  DVE_${this.name}
-#ifndef  DVE_dve_liquid
 {
   vec3 dveSnowNW = normalize(vNormalW);
   float dveSnowTop = smoothstep(0.45, 0.8, dveSnowNW.y);
@@ -1043,12 +941,10 @@ ${importedMaterialMicroSurfaceCode}
   microSurface = mix(microSurface, 0.88, dveSnowM * 0.7);
 }
 #endif
-#endif
 `,
   CUSTOM_FRAGMENT_BEFORE_LIGHTS: /*glsl*/ `
 ${importedMaterialBeforeLightsCode}
 #ifdef DVE_${this.name}
-#ifndef DVE_dve_liquid
 // SE-01: Screen-space edge normal softening via dFdx/dFdy reconstruction.
 // At flat face interiors the derivative normal matches the geometry normal → edgeFactor ≈ 0 → no change.
 // At edge pixels where the hardware 2×2 derivative quad spans two adjacent face orientations,
@@ -1073,17 +969,6 @@ ${importedMaterialBeforeLightsCode}
   // Specular occlusion removed to avoid GLSL compile error; edge normal softening still active above.
 }
 #endif
-#endif
-#ifdef DVE_dve_liquid
-{
-  float dveLiquidTimeBL = dve_time * 0.42;
-  vec2 dveBL_uv1 = vPositionW.xz * 0.08 + vec2(dveLiquidTimeBL * 0.045, dveLiquidTimeBL * 0.03);
-  vec2 dveBL_uv2 = vPositionW.xz * 0.12 + vec2(-dveLiquidTimeBL * 0.035, dveLiquidTimeBL * 0.05);
-  float dveBL_n1 = dveNoise3(vec3(dveBL_uv1 * 8.0, dveLiquidTimeBL * 0.5)) * 2.0 - 1.0;
-  float dveBL_n2 = dveNoise3(vec3(dveBL_uv2 * 6.0, dveLiquidTimeBL * 0.38 + 5.0)) * 2.0 - 1.0;
-  normalW = normalize(normalW + vec3(dveBL_n1 * 0.075, 0.0, dveBL_n2 * 0.075));
-}
-#endif
 `,
         /* "!finalIrradiance\\*\\=surfaceAlbedo.rgb;":
 `finalIrradiance*=surfaceAlbedo.rgb;\nfinalIrradiance = vec3(VOXEL[2].rgb ) ;`, */
@@ -1092,12 +977,10 @@ ${importedMaterialBeforeLightsCode}
 finalDiffuse.rgb += .01;
       ${voxelLightFinalCode}
 ${wetnessFinalCode}
-${liquidSSSCode}
 #endif
 `,
         CUSTOM_FRAGMENT_MAIN_END: /*glsl*/ `
 #ifdef  DVE_${this.name}
-
 if (glFragColor.a < 0.05) {
   discard;
 }
