@@ -63,7 +63,7 @@ export class DVEWaterMaterialPlugin extends MaterialPluginBase {
   }
 
   getAttributes(attributes: string[]) {
-    attributes.push("textureIndex", "uv", "worldContext", "metadata", "phNormalized");
+    attributes.push("textureIndex", "uv", "worldContext", "metadata", "phNormalized", "subdivAO");
   }
 
   getUniforms() {
@@ -144,12 +144,14 @@ varying vec4 dveOverlayTextureIndex;
 varying vec3 dveWorldContext;
 varying vec4 dveWaterFlowData;
 varying float dveShoreDistanceNormalized;
+varying float dveStableWaterSurfaceY;
 `;
     const attributes = /* glsl */ `
 attribute vec3 textureIndex;
 attribute vec3 worldContext;
 attribute vec4 metadata;
 attribute float phNormalized;
+attribute float subdivAO;
 `;
     const functions = /* glsl */ `
 const uint dveTextureIndexMask = uint(0xffff);
@@ -214,7 +216,12 @@ vec3 dveGetWaterViewDirection(vec3 eyePosition, vec3 positionW) {
 }
 
 float dveGetWaterViewDot(vec3 waterNormal, vec3 waterViewDir) {
-  return clamp(dot(waterNormal, waterViewDir), 0.0, 1.0);
+  return clamp(abs(dot(waterNormal, waterViewDir)), 0.0, 1.0);
+}
+
+float dveGetUnderwaterFactor(vec3 eyePosition, float stableSurfaceY) {
+  if (stableSurfaceY < 0.0) return 0.0;
+  return smoothstep(0.12, 1.75, max(stableSurfaceY - eyePosition.y, 0.0));
 }
 
 float dveGetWaterFacing(vec3 waterNormal) {
@@ -361,7 +368,7 @@ float dveGetLocalShimmerPattern(vec2 positionXZ, vec2 flowDirection, float time)
   vec2 lateral = dveGetPerpendicular(flowDirection);
   float primary = sin(dot(positionXZ, flowDirection * 8.0 + lateral * 3.0) + time * 0.9);
   float secondary = cos(dot(positionXZ, lateral * 10.0 - flowDirection * 2.0) - time * 0.65);
-  return primary * 0.6 + secondary * 0.4;
+  return (primary * 0.6 + secondary * 0.4) * 0.5 + 0.5;
 }
 `;
 
@@ -387,6 +394,7 @@ dveOverlayTextureIndex.w = dveGetTextureIndex(int(uint(textureIndex.z) & dveText
 dveWorldContext = worldContext;
 dveWaterFlowData = metadata;
 dveShoreDistanceNormalized = phNormalized;
+dveStableWaterSurfaceY = subdivAO;
 #endif
 `,
       };
@@ -414,6 +422,11 @@ if (dveOverlayTextureIndex.x > 0.) {
 vec3 dveWaterNormal = dveGetWaterNormal(vNormalW);
 vec3 dveWaterViewDir = dveGetWaterViewDirection(vEyePosition.xyz, vPositionW);
 float dveWaterViewDot = dveGetWaterViewDot(dveWaterNormal, dveWaterViewDir);
+float dveUnderwaterFactor = dveGetUnderwaterFactor(vEyePosition.xyz, dveStableWaterSurfaceY);
+vec3 dveUnderwaterNormal = normalize(mix(dveWaterNormal, vec3(0.0, -1.0, 0.0), dveUnderwaterFactor * 0.96));
+dveWaterNormal = dveUnderwaterNormal;
+dveWaterViewDot = dveGetWaterViewDot(dveWaterNormal, dveWaterViewDir);
+dveWaterViewDot = max(dveWaterViewDot, dveUnderwaterFactor * 0.18);
 float dveWaterFacing = dveGetWaterFacing(dveWaterNormal);
 vec3 dveContext = dveClampWorldContextValues(dveWorldContext);
 float dveFillFactor = dveContext.x;
@@ -428,9 +441,10 @@ vec3 dveWaterClassWeights = dveGetWaterClassWeights(clamp(dveWaterFlowData.w, 0.
 float dveWaveAttenuation = dveGetWaveResponse(dveShoreFactor, dveBoundaryFactor, dveShoreDistanceFactor, dveWaterClassWeights);
 float dveBankWaveDamping = dveGetBankWaveDamping(dveShorelineBand, dveShoreDistanceFactor);
 float dveFresnel = dveGetWaterFresnelResponse(dveWaterViewDot);
+float dveUnderwaterFresnel = mix(dveFresnel, dveFresnel * 0.12, dveUnderwaterFactor);
 float dveMacroVariation = dveGetLargeScaleWaterVariation(vPositionW.xz);
 vec2 dvePatternWarp = dveGetWaterPatternWarp(vPositionW.xz) * mix(0.2, 0.55, dveWaveAttenuation);
-vec2 dveStaticWaterUV = fract(
+vec2 dveStaticWaterUV = (
   vPositionW.xz * 0.035 +
   dvePatternWarp * 0.12 +
   dveGetFoamMotion(dve_time, dveWaveAttenuation) +
@@ -450,7 +464,7 @@ float dveShallowClarity = 1.0 - smoothstep(
   DVE_SHALLOW_CLARITY_END,
   dveThicknessFactor
 );
-float dveRefractionDarkening = (1.0 - dveWaterViewDot) * (0.14 + dveThicknessFactor * 0.42);
+float dveRefractionDarkening = (1.0 - dveWaterViewDot) * (0.14 + dveThicknessFactor * 0.42) * mix(1.0, 0.82, dveUnderwaterFactor);
 float dveFoamMask = texture(dve_water_foam, dveStaticWaterUV * mix(1.4, 2.2, dveWaveAttenuation)).r;
 float dveSoftFillFactor = dveGetSoftWaterContextValue(dveFillFactor, dveMacroVariation, dveFoamMask, 0.16);
 float dveSoftBoundaryFactor = dveGetSoftWaterContextValue(dveBoundaryFactor, dveMacroVariation, dveFoamMask, 0.22);
@@ -477,10 +491,9 @@ vec3 dveTransmissionBase = dveTransmissionColor;
 dveTransmissionColor = dveTransmissionBase * dveClassTint;
 vec3 dveShallowBreakupTint = mix(vec3(0.8, 0.95, 1.01), vec3(1.06, 1.1, 1.15), dveFoamMask);
 vec3 dveShallowBreakupColor = dveTransmissionColor * dveShallowBreakupTint;
-vec3 dveReflectiveLift = mix(dveReflectionColor, vec3(0.96, 0.98, 1.0), dveFresnel * 0.76 + dveSoftFillFactor * 0.03 + dveWaterClassWeights.z * 0.06);
-vec3 dveLiquidColor = mix(dveTransmissionColor, dveReflectiveLift, 0.11 + dveFresnel * 0.5 + dveWaterClassWeights.z * 0.08 - dveWaterClassWeights.x * 0.06);
+vec3 dveReflectiveLift = mix(dveReflectionColor, vec3(0.96, 0.98, 1.0), dveUnderwaterFresnel * 0.76 + dveSoftFillFactor * 0.03 + dveWaterClassWeights.z * 0.06);
+vec3 dveLiquidColor = mix(dveTransmissionColor, dveReflectiveLift, 0.11 + dveUnderwaterFresnel * 0.42 + dveWaterClassWeights.z * 0.08 - dveWaterClassWeights.x * 0.06 - dveUnderwaterFactor * 0.09);
 dveLiquidColor = mix(dveLiquidColor, dveShallowBreakupColor, dveShallowBreakup * 0.22);
-dveLiquidColor = mix(dveLiquidColor, dveLiquidSample.rgb * vec3(0.1, 0.26, 0.38), 0.06);
 dveLiquidColor = mix(dveLiquidColor, vec3(0.95, 0.98, 1.0), dveCoastalFoam * 0.32);
 dveLiquidColor = mix(dveLiquidColor, dveLiquidColor * vec3(0.985, 0.995, 1.01), dveMacroVariation * 0.08);
 dveLiquidColor = mix(dveLiquidColor, dveLiquidColor * vec3(0.978, 0.989, 1.0), (1.0 - dveSoftFillFactor) * 0.03);
@@ -488,7 +501,7 @@ dveLiquidColor = mix(dveLiquidColor, dveLiquidColor * vec3(1.015, 1.02, 1.03), m
 dveLiquidColor *= 1.0 - dveRefractionDarkening;
 dveLiquidColor = mix(dveLiquidColor, dveLiquidColor * vec3(0.972, 0.989, 1.02), dveSoftBoundaryFactor * 0.045);
 dveLiquidColor = mix(dveLiquidColor, dveLiquidColor * vec3(1.07, 1.1, 1.16), dveShallowBreakup * (0.18 + dveBankWaveDamping * 0.08));
-dveLiquidColor *= mix(vec3(0.9, 0.94, 0.98), vec3(1.0), dveWaterFacing * 0.6 + dveFresnel * 0.2);
+dveLiquidColor *= mix(vec3(0.9, 0.94, 0.98), vec3(1.0), dveWaterFacing * 0.6 + dveUnderwaterFresnel * 0.2);
 surfaceAlbedo = toLinearSpace(dveLiquidColor);
 alpha = 1.0;
 #endif
@@ -498,6 +511,11 @@ alpha = 1.0;
 vec3 dveWaterNormal = dveGetWaterNormal(vNormalW);
 vec3 dveWaterViewDir = dveGetWaterViewDirection(vEyePosition.xyz, vPositionW);
 float dveWaterViewDot = dveGetWaterViewDot(dveWaterNormal, dveWaterViewDir);
+float dveUnderwaterFactor = dveGetUnderwaterFactor(vEyePosition.xyz, dveStableWaterSurfaceY);
+vec3 dveUnderwaterNormal = normalize(mix(dveWaterNormal, vec3(0.0, -1.0, 0.0), dveUnderwaterFactor * 0.96));
+dveWaterNormal = dveUnderwaterNormal;
+dveWaterViewDot = dveGetWaterViewDot(dveWaterNormal, dveWaterViewDir);
+dveWaterViewDot = max(dveWaterViewDot, dveUnderwaterFactor * 0.18);
 vec3 dveContext = dveClampWorldContextValues(dveWorldContext);
 float dveFillFactor = dveContext.x;
 float dveShoreFactor = dveContext.y;
@@ -508,9 +526,10 @@ vec3 dveWaterClassWeights = dveGetWaterClassWeights(clamp(dveWaterFlowData.w, 0.
 vec3 dveClassSurfacePreset = dveGetClassSurfacePreset(dveWaterClassWeights);
 float dveWaveAttenuation = dveGetWaveResponse(dveShoreFactor, dveBoundaryFactor, dveShoreDistanceFactor, dveWaterClassWeights);
 float dveFresnel = dveGetWaterFresnelResponse(dveWaterViewDot);
+float dveUnderwaterFresnel = mix(dveFresnel, dveFresnel * 0.1, dveUnderwaterFactor);
 float dveMacroVariation = dveGetLargeScaleWaterVariation(vPositionW.xz);
 vec2 dveGlossWarp = dveGetWaterPatternWarp(vPositionW.xz) * mix(0.12, 0.38, dveWaveAttenuation);
-float dveContextMask = texture(dve_water_foam, fract(vPositionW.xz * 0.028 + dveGlossWarp * 0.08)).r;
+float dveContextMask = texture(dve_water_foam, vPositionW.xz * 0.028 + dveGlossWarp * 0.08).r;
 float dveSoftFillFactor = dveGetSoftWaterContextValue(dveFillFactor, dveMacroVariation, dveContextMask, 0.14);
 float dveSoftBoundaryFactor = dveGetSoftWaterContextValue(dveBoundaryFactor, dveMacroVariation, dveContextMask, 0.18);
 float dveSoftShorelineBand = clamp(mix(dveShorelineBand, dveShorelineBand * (0.82 + dveMacroVariation * 0.16) + dveContextMask * 0.04, 0.58), 0.0, 1.0);
@@ -518,16 +537,19 @@ float dveMotionGloss = sin(dve_time * 0.65 + vPositionW.x * 0.035 + vPositionW.z
 float dveClassGlossBias = dveWaterClassWeights.y * 0.05 - dveWaterClassWeights.x * 0.04 + dveWaterClassWeights.z * 0.03;
 float dveLocalShimmer = dveGetLocalShimmerPattern(vPositionW.xz, dveGetFlowDirection(dveWaterFlowData), dve_time);
 float dveLocalShimmerStrength = dveGetClassLocalShimmerScale(dveWaterClassWeights) * mix(0.38, 1.0, dveGetFlowStrength(dveWaterFlowData)) * mix(0.42, 1.0, dveShoreDistanceFactor) * mix(0.65, 1.0, dveBoundaryFactor);
-microSurface = mix(0.88, 0.996, 0.33 + dveFresnel * 0.7 + dveSoftFillFactor * 0.04 - (1.0 - dveSoftBoundaryFactor) * 0.025 + dveMotionGloss * dveWaveAttenuation * 0.065 + dveClassGlossBias + dveClassSurfacePreset.z + dveLocalShimmer * dveLocalShimmerStrength);
+microSurface = mix(0.88, 0.996, 0.33 + dveUnderwaterFresnel * 0.52 + dveSoftFillFactor * 0.04 - (1.0 - dveSoftBoundaryFactor) * 0.025 + dveMotionGloss * dveWaveAttenuation * 0.065 * (1.0 - dveUnderwaterFactor * 0.96) + dveClassGlossBias * (1.0 - dveUnderwaterFactor * 0.45) + dveClassSurfacePreset.z * (1.0 - dveUnderwaterFactor * 0.9) + dveLocalShimmer * dveLocalShimmerStrength * (1.0 - dveUnderwaterFactor * 0.97));
+microSurface = mix(microSurface, 0.9, dveUnderwaterFactor * 0.82);
 surfaceReflectivityColor = max(
   surfaceReflectivityColor,
-  mix(vec3(0.035, 0.05, 0.07), vec3(0.16, 0.2, 0.25), dveFresnel * 0.8 + (1.0 - dveSoftShorelineBand) * 0.1 + dveSoftFillFactor * 0.03 + dveClassSurfacePreset.z * 0.58 + dveWaterClassWeights.z * 0.06 + max(dveLocalShimmer, 0.0) * dveLocalShimmerStrength * 0.92)
+  mix(vec3(0.035, 0.05, 0.07), vec3(0.16, 0.2, 0.25), dveUnderwaterFresnel * 0.56 + (1.0 - dveSoftShorelineBand) * 0.1 + dveSoftFillFactor * 0.03 + dveClassSurfacePreset.z * 0.58 * (1.0 - dveUnderwaterFactor * 0.9) + dveWaterClassWeights.z * 0.03 + max(dveLocalShimmer, 0.0) * dveLocalShimmerStrength * 0.92 * (1.0 - dveUnderwaterFactor * 0.97))
 );
+surfaceReflectivityColor = mix(surfaceReflectivityColor, vec3(0.04, 0.055, 0.07), dveUnderwaterFactor * 0.86);
 #endif
 `,
         CUSTOM_FRAGMENT_BEFORE_LIGHTS: /* glsl */ `
 #ifdef DVE_${this.name}
 {
+  float dveUnderwaterFactor = dveGetUnderwaterFactor(vEyePosition.xyz, dveStableWaterSurfaceY);
   vec3 dveContext = dveClampWorldContextValues(dveWorldContext);
   float dveShoreDistanceFactor = dveGetShoreDistanceNormalized(dveShoreDistanceNormalized);
   vec2 dveFlowDirection = dveGetFlowDirection(dveWaterFlowData);
@@ -536,14 +558,14 @@ surfaceReflectivityColor = max(
   vec3 dveClassSurfacePreset = dveGetClassSurfacePreset(dveWaterClassWeights);
   float dveWaveAttenuation = dveGetWaveResponse(dveContext.y, dveContext.z, dveShoreDistanceFactor, dveWaterClassWeights);
   vec2 dvePatternWarp = dveGetWaterPatternWarp(vPositionW.xz) * mix(0.22, 0.7, dveWaveAttenuation);
-  vec2 dveMacroUV = fract(
+  vec2 dveMacroUV = (
     vPositionW.xz * 0.012 +
     vec2(0.17, 0.31) +
     dvePatternWarp * 0.05 +
     dveGetMacroMotion(dve_time, dveWaveAttenuation) +
     dveGetDirectionalMotion(dveFlowDirection, dveFlowStrength, dveWaterClassWeights, dve_time, 0.006, 0.28, dveWaveAttenuation)
   );
-  vec2 dveMicroUV = fract(
+  vec2 dveMicroUV = (
     vPositionW.xz * 0.085 +
     vec2(0.53, 0.11) +
     dvePatternWarp * 0.2 +
@@ -551,11 +573,13 @@ surfaceReflectivityColor = max(
     dveGetDirectionalMotion(dveFlowDirection, dveFlowStrength, dveWaterClassWeights, dve_time, 0.018, 0.12, dveWaveAttenuation)
   );
   vec3 dveMacroSample = texture(dve_water_normal, dveMacroUV).xyz * 2.0 - 1.0;
-  vec3 dveMicroSample = texture(dve_water_normal, dveMicroUV.yx).xyz * 2.0 - 1.0;
+  vec3 dveMicroSample = texture(dve_water_normal, dveMicroUV).xyz * 2.0 - 1.0;
   vec3 dveMacroNormal = normalize(vec3(dveMacroSample.x * dveClassSurfacePreset.x, 1.0, dveMacroSample.y * dveClassSurfacePreset.x));
   vec3 dveMicroNormal = normalize(vec3(dveMicroSample.x * dveClassSurfacePreset.y, 1.0, dveMicroSample.y * dveClassSurfacePreset.y));
   vec3 dveWaterDetailNormal = normalize(mix(dveMacroNormal, dveMicroNormal, 0.38 + dveWaveAttenuation * 0.12));
-  normalW = normalize(mix(normalW, dveWaterDetailNormal, 0.24 + dveWaveAttenuation * 0.24));
+  float dveUnderwaterDetailMix = (0.24 + dveWaveAttenuation * 0.24) * (1.0 - dveUnderwaterFactor * 0.985);
+  vec3 dveUnderwaterBaseNormal = normalize(mix(normalW, vec3(0.0, -1.0, 0.0), dveUnderwaterFactor * 0.96));
+  normalW = normalize(mix(dveUnderwaterBaseNormal, dveWaterDetailNormal, dveUnderwaterDetailMix));
 }
 #endif
 `,
@@ -563,11 +587,11 @@ surfaceReflectivityColor = max(
 #ifdef DVE_${this.name}
 vec3 dveWaterNormal = dveGetWaterNormal(vNormalW);
 vec3 dveWaterViewDir = dveGetWaterViewDirection(vEyePosition.xyz, vPositionW);
+float dveUnderwaterFactor = dveGetUnderwaterFactor(vEyePosition.xyz, dveStableWaterSurfaceY);
+dveWaterNormal = normalize(mix(dveWaterNormal, vec3(0.0, -1.0, 0.0), dveUnderwaterFactor * 0.96));
 float dveWaterViewDot = dveGetWaterViewDot(dveWaterNormal, dveWaterViewDir);
 float dveFresnel = dveGetWaterFresnelResponse(dveWaterViewDot);
-finalDiffuse.rgb += 0.01;
-      finalDiffuse.rgb *= 1.22;
-finalDiffuse.rgb = mix(finalDiffuse.rgb, finalDiffuse.rgb * vec3(1.03, 1.05, 1.08), dveFresnel * 0.18);
+finalDiffuse.rgb = mix(finalDiffuse.rgb, finalDiffuse.rgb * vec3(1.03, 1.05, 1.08), dveFresnel * 0.18 * (1.0 - dveUnderwaterFactor * 0.9));
 #endif
 `,
       };

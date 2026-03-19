@@ -158,12 +158,12 @@ export class DVEBRPBRMaterial implements MaterialInterface {
       material.transparencyMode = Material.MATERIAL_OPAQUE;
       material.needAlphaBlending = () => false;
       material.needDepthPrePass = false;
-      material.forceDepthWrite = true;
+      material.forceDepthWrite = false;
       material.backFaceCulling = false;
       material.twoSidedLighting = true;
-      material.forceNormalForward = true;
+      material.forceNormalForward = false;
       material.separateCullingPass = false;
-      material.useRadianceOverAlpha = true;
+      material.useRadianceOverAlpha = false;
       material.forceIrradianceInFragment = true;
 
       if (this.scene.environmentTexture) {
