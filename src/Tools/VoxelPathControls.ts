@@ -16,7 +16,7 @@ import { Mesh } from "@babylonjs/core";
 import { VoxelShapeTemplate } from "@divinevoxel/vlox/Templates/Shapes/VoxelShapeTemplate";
 import { BoxVoxelShapeSelection } from "@divinevoxel/vlox/Templates/Shapes/Selections/BoxVoxelShapeSelection";
 import { VoxelTemplateSelection } from "@divinevoxel/vlox/Templates/Selection/VoxelTemplateSelection";
-import { PathToolModes } from "@divinevoxel/vlox/Builder/Tools/Path/PahtTool";
+import { PathToolModes } from "@divinevoxel/vlox/Builder/Tools/Path/PathTool";
 const min = new Vector3();
 const max = new Vector3();
 const boundingBox = new BoundingBox(min, max);
@@ -278,8 +278,8 @@ export class VoxelPathControls {
 
   private rebuildControls() {
     if (!this.path) return;
-    for (const contorl of this._pointControls) {
-      contorl.dispose();
+    for (const control of this._pointControls) {
+      control.dispose();
     }
     this._pointControls = [];
     const lastSegment = this.path.lastSegment();
@@ -337,7 +337,7 @@ export class VoxelPathControls {
     this._activeControl = null;
   }
 
-  removedHovered() {
+  removeHovered() {
     if (!this.path) return;
     if (this._hoveredIndex < 0) return false;
     const hovered = this._pointControls[this._hoveredIndex];

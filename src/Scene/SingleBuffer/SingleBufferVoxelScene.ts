@@ -24,8 +24,8 @@ import { classifyTerrainMaterial } from "../../Matereials/PBR/MaterialFamilyProf
 const min = Vector3.Zero();
 const max = new Vector3(16, 16, 16);
 const boundingBox = new BoundingBox(min, max);
-const SECTOR_FRUSTUM_PADDING = 1;
-const MESH_BOUND_PADDING = 1;
+const SECTOR_FRUSTUM_PADDING = 2;
+const MESH_BOUND_PADDING = 2;
 const LIQUID_SECTOR_FRUSTUM_PADDING = 8;
 const LIQUID_MESH_BOUND_PADDING = 6;
 

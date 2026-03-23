@@ -1,7 +1,6 @@
 import type { Scene } from "@babylonjs/core/scene";
 import type { Engine } from "@babylonjs/core/Engines/engine";
 import { Geometry } from "@babylonjs/core/Meshes/geometry";
-import { Buffer, VertexBuffer } from "@babylonjs/core/Meshes/buffer";
 import { Vector3 } from "@babylonjs/core/Maths/";
 import { Mesh } from "@babylonjs/core/Meshes/mesh.js";
 import { BoundingInfo } from "@babylonjs/core/Culling/boundingInfo.js";
@@ -52,13 +51,18 @@ export class DVEBRSectionMeshesMultiBuffer extends DVESectionMeshes {
   }
 
   returnMesh(mesh: Mesh) {
+    DVEBRVoxelMesh.releaseBuffer(mesh);
     mesh.dispose();
   }
 
   updateVertexData(section: SectionMesh, data: CompactedSectionVoxelMesh) {
     data.getLocation(location);
 
+    // Clear at the start to avoid stale state from a previous failed call.
+    found.clear();
+
     const totalMeshes = data.getTotalMeshes();
+    try {
     for (let i = 0; i < totalMeshes; i++) {
       data.getMeshData(i, meshData);
       const subMeshMaterial = meshData.materialId;
@@ -108,14 +112,6 @@ export class DVEBRSectionMeshesMultiBuffer extends DVESectionMeshes {
       mesh.unfreezeWorldMatrix();
       mesh.position.set(location[1], location[2], location[3]);
       mesh.computeWorldMatrix();
-      if (mesh.metadata.buffer && mesh.metadata.buffer instanceof Buffer) {
-        const buffer = mesh.metadata.buffer as Buffer;
-        for (const bufferKind of mesh.getVerticesDataKinds()) {
-          mesh.geometry!.removeVerticesData(bufferKind);
-        }
-        mesh.geometry!.releaseForMesh(mesh);
-        buffer.dispose();
-      }
 
       mesh.metadata.buffer = DVEBRVoxelMesh.UpdateVertexDataBuffers(
         mesh,
@@ -161,7 +157,9 @@ export class DVEBRSectionMeshesMultiBuffer extends DVESectionMeshes {
         section.meshes.delete(key);
       }
     }
-    found.clear();
+    } finally {
+      found.clear();
+    }
 
     return section;
   }

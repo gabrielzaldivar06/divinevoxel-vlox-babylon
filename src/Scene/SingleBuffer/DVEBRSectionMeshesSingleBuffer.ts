@@ -42,43 +42,49 @@ export class DVEBRSectionMeshesSingleBuffer extends DVESectionMeshes {
   updateVertexData(section: SectionMesh, data: CompactedSectionVoxelMesh) {
     data.getLocation(location);
 
-    const totalMeshes = data.getTotalMeshes();
-    for (let i = 0; i < totalMeshes; i++) {
-      data.getMeshData(i, meshData);
-      const subMeshMaterial = meshData.materialId;
-      found.add(subMeshMaterial);
-      let mesh: SubBufferMesh;
+    // Clear at the start to avoid stale state from a previous failed call.
+    found.clear();
 
-      let needNew = true;
-      if (section.meshes.has(subMeshMaterial)) {
-        needNew = false;
-        mesh = this.voxelScene.updateMesh(
-          section.meshes.get(subMeshMaterial)!,
-          meshData
-        )!;
-        if (!mesh) {
-          needNew = true;
+    const totalMeshes = data.getTotalMeshes();
+    try {
+      for (let i = 0; i < totalMeshes; i++) {
+        data.getMeshData(i, meshData);
+        const subMeshMaterial = meshData.materialId;
+        found.add(subMeshMaterial);
+        let mesh: SubBufferMesh;
+
+        let needNew = true;
+        if (section.meshes.has(subMeshMaterial)) {
+          needNew = false;
+          mesh = this.voxelScene.updateMesh(
+            section.meshes.get(subMeshMaterial)!,
+            meshData
+          )!;
+          if (!mesh) {
+            needNew = true;
+          }
+        }
+
+        if (needNew) {
+          mesh = this.voxelScene.addMesh(
+            meshData,
+            location[1],
+            location[2],
+            location[3]
+          )!;
+        }
+        section.meshes.set(subMeshMaterial, mesh!);
+      }
+
+      for (const [key, mesh] of section.meshes as Map<string, SubBufferMesh>) {
+        if (!found.has(key)) {
+          this.returnMesh(mesh);
+          section.meshes.delete(key);
         }
       }
-
-      if (needNew) {
-        mesh = this.voxelScene.addMesh(
-          meshData,
-          location[1],
-          location[2],
-          location[3]
-        )!;
-      }
-      section.meshes.set(subMeshMaterial, mesh!);
+    } finally {
+      found.clear();
     }
-
-    for (const [key, mesh] of section.meshes as Map<string, SubBufferMesh>) {
-      if (!found.has(key)) {
-        this.returnMesh(mesh);
-        section.meshes.delete(key);
-      }
-    }
-    found.clear();
 
     return section;
   }

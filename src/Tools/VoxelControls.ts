@@ -60,8 +60,8 @@ class PositionAxes {
   get hover() {
     return this._states[this.axesIndex * 4] == 1;
   }
-  set hover(hovver: boolean) {
-    this._states[this.axesIndex * 4] = hovver ? 1 : 0;
+  set hover(hover: boolean) {
+    this._states[this.axesIndex * 4] = hover ? 1 : 0;
     this._dirty = true;
   }
 
@@ -344,7 +344,7 @@ export class VoxelControls extends TypedEventTarget<VoxelControlsEvents> {
   }
 
   updateColors(x: Color3, y: Color3, z: Color3) {
-    if (!this.colors) this.colors = {} as any;
+    if (!this.colors) this.colors = [] as Color3[];
     this.colors[0] = x;
     this.colors[1] = y;
     this.colors[2] = z;

@@ -193,6 +193,7 @@ export class VoxelPathMesh {
       if (this.segments[i].segment == segment) {
         this.segments[i].dispose();
         this.segments.splice(i, 1);
+        break;
       }
     }
   }
