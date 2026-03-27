@@ -9,7 +9,7 @@ import { HemisphericLight } from "@babylonjs/core/Lights/hemisphericLight";
 import { ShadowGenerator } from "@babylonjs/core/Lights/Shadows/shadowGenerator";
 import { CascadedShadowGenerator } from "@babylonjs/core/Lights/Shadows/cascadedShadowGenerator";
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
-import { SSRRenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPipeline/Pipelines/ssrRenderingPipeline";
+import type { SSRRenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPipeline/Pipelines/ssrRenderingPipeline";
 import { SSAO2RenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPipeline/Pipelines/ssao2RenderingPipeline";
 import { ImageProcessingConfiguration } from "@babylonjs/core/Materials/imageProcessingConfiguration";
 import { ColorCurves } from "@babylonjs/core/Materials/colorCurves";
@@ -285,7 +285,7 @@ function applyTerrainPhase1SkyProfile(renderer: Awaited<ReturnType<typeof Create
 
 function applyTerrainPhase1RendererProfile(
   pipeline: DefaultRenderingPipeline,
-  ssr: SSRRenderingPipeline,
+  ssr: SSRRenderingPipeline | null,
   sunLight: DirectionalLight
 ) {
   const terrain = EngineSettings.settings.terrain;
@@ -313,8 +313,10 @@ function applyTerrainPhase1RendererProfile(
     pipeline.imageProcessing.contrast = 1.16;
     pipeline.imageProcessing.exposure = 0.9;
     pipeline.bloomThreshold = 0.62;
-    ssr.strength = 0.64;       // material-import not in RENDERER_PRESET_CONFIGS — keep here
-    ssr.roughnessFactor = 0.24;
+    if (ssr) {
+      ssr.strength = 0.64;       // material-import not in RENDERER_PRESET_CONFIGS — keep here
+      ssr.roughnessFactor = 0.24;
+    }
     sunLight.intensity = 6.8;
   }
 
@@ -322,16 +324,20 @@ function applyTerrainPhase1RendererProfile(
     pipeline.imageProcessing.contrast = 1.12;
     pipeline.imageProcessing.exposure = 1.04;
     pipeline.bloomThreshold = 0.5;
-    ssr.strength = 0.72;       // feature-flag path — not in table, keep here
-    ssr.roughnessFactor = 0.18;
+    if (ssr) {
+      ssr.strength = 0.72;       // feature-flag path — not in table, keep here
+      ssr.roughnessFactor = 0.18;
+    }
     sunLight.intensity = 8.2;
   }
 
   if (terrain.materialWetness) {
     pipeline.imageProcessing.exposure = 1.02;
     pipeline.bloomThreshold = 0.56;
-    ssr.strength = 0.78;       // feature-flag path — not in table, keep here
-    ssr.roughnessFactor = 0.14;
+    if (ssr) {
+      ssr.strength = 0.78;       // feature-flag path — not in table, keep here
+      ssr.roughnessFactor = 0.14;
+    }
     sunLight.intensity = 8.0;
   }
 
@@ -706,10 +712,13 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
   pipeline.bloomKernel = 96;
   pipeline.bloomWeight = 0.72;
   pipeline.bloomScale  = 0.9;
-  // R20: Enable sharpening to compensate FXAA blur
-  pipeline.sharpenEnabled = true;
-  pipeline.sharpen.edgeAmount = 0.28;
-  pipeline.sharpen.colorAmount = 1.0;
+  // Global stability pass:
+  // The previous sharpen stage was amplifying sub-pixel normal/reflection aliasing
+  // into long diagonal moire bands over both water and terrain at distance.
+  // Keep the pipeline soft/stable first; we can reintroduce selective sharpening later.
+  pipeline.sharpenEnabled = false;
+  pipeline.sharpen.edgeAmount = 0.0;
+  pipeline.sharpen.colorAmount = 0.0;
   // T6: DoF opt-in — ground-plane blur softens the distant cubic grid pattern.
   // Enabled only for presets that declare depthOfField.enabled in RENDERER_PRESET_CONFIGS.
   pipeline.depthOfFieldEnabled = presetCfg.depthOfField?.enabled ?? false;
@@ -744,37 +753,22 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
   pipeline.imageProcessing.vignetteCentreX = 0.0;
   pipeline.imageProcessing.vignetteCentreY = 0.08; // very slightly off-centre toward top
   pipeline.imageProcessing.vignetteBlendMode = 0; // 0 = VIGNETTEMODE_MULTIPLY
-  // F02: Animated film grain — breaks color banding, adds high-frequency cinematic texture.
-  pipeline.grainEnabled = true;
-  pipeline.grain.intensity = presetCfg.grainIntensity;
-  pipeline.grain.animated = true;
+  // Film grain adds another screen-space high-frequency layer that makes moire/banding
+  // diagnosis much harder and can read like diagonal crawl over glossy surfaces.
+  pipeline.grainEnabled = false;
+  pipeline.grain.intensity = 0;
+  pipeline.grain.animated = false;
 
   /*   const glow = new GlowLayer("", scene);
   glow.intensity = 1;
  */
   LevelParticles.init(scene);
   applyTerrainPhase1Atmosphere(scene, isPBRPremium || isPBRPremiumV2);
-  const ssr = new SSRRenderingPipeline("ssr", initData.scene, [
-    activeCamera,
-  ]);
-
-  // ssr.reflectionSpecularFalloffExponent = 2;
-
-  ssr.environmentTexture = hdrTexture as any;
-  ssr.environmentTextureIsProbe = false;
-  // Fix 2+4: SSR values from lookup table. Safe fallback guarantees step=3,
-  // maxSteps=48, blurDownsample=2 — preventing the documented ~1 FPS regression
-  // seen with step=2/maxSteps=64/blurDownsample=1 on unrecognised presets.
-  ssr.samples           = presetCfg.ssr.samples;
-  ssr.strength          = presetCfg.ssr.strength;
-  ssr.roughnessFactor   = presetCfg.ssr.roughnessFactor;
-  ssr.reflectivityThreshold = 0.12;
-  ssr.selfCollisionNumSkip  = 2;
-  ssr.step              = presetCfg.ssr.step;
-  ssr.maxSteps          = presetCfg.ssr.maxSteps;
-  ssr.maxDistance       = presetCfg.ssr.maxDistance;
-  ssr.blurDownsample    = presetCfg.ssr.blurDownsample;
-  ssr.thickness         = presetCfg.ssr.thickness;
+  // Temporary stability switch:
+  // The remaining diagonal/fractal-like bands only show up in PBR mode and span
+  // both water and solid terrain, which strongly points at the shared SSR path.
+  // Disable SSR until the terrain/water reflectance budget is retuned safely.
+  let ssr: SSRRenderingPipeline | null = null;
 
   // R20: SSAO2 — contact shadows for voxel geometry
   const ssao = new SSAO2RenderingPipeline("ssao", initData.scene, {
@@ -904,13 +898,20 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
         // R13: Cascaded Shadow Generator — 2 cascades (near + far) for quality gradient + PCF softening.
         // Performance notes: numCascades=2 saves ~20% draw calls vs 3; autoCalcDepthBounds=false avoids
         // per-frame GPU readback; stabilizeCascades=true reduces cascade-boundary shimmer on movement.
-        const shadowMapSize = 512;
+        const shadowMapSize = 2048;
         const shadows = new CascadedShadowGenerator(shadowMapSize, sunLight);
-        shadows.numCascades = 2;
-        shadows.lambda = 0.9;          // slight spread — near cascade covers crisp region, far covers mid-range
+        shadows.numCascades = 3;
+        shadows.lambda = 0.72;         // less aggressive far-cascade stretch reduces large diagonal banding
         shadows.stabilizeCascades = true;
         shadows.usePercentageCloserFiltering = true;
         shadows.filteringQuality = ShadowGenerator.QUALITY_MEDIUM;
+        shadows.cascadeBlendPercentage = 0.18;
+        shadows.depthClamp = true;
+        // Explicit acne control for broad grazing-angle terrain/water surfaces.
+        // Without these offsets, the PBR path can show diagonal self-shadow bands
+        // that read like fractal lines when the camera pulls back.
+        shadows.bias = 0.0015;
+        shadows.normalBias = 0.06;
         shadows.setDarkness(0.1);
 
         // R13: Register terrain chunks as shadow casters and receivers.
@@ -962,7 +963,6 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
         const dve_t = dve_rAmt * dve_rAmt * (3 - 2 * dve_rAmt); // smoothstep
         scene.fogDensity = dve_baseFogDensity * (1 + dve_t * 0.22);
         sunLight.intensity = dve_baseSunIntensity * (1 - dve_t * 0.18);
-        ssr.strength = Math.min(0.82 + dve_t * 0.10, 1.0);
       });
 
       applyTerrainPhase1RendererProfile(pipeline, ssr, sunLight);

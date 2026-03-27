@@ -1098,8 +1098,17 @@ ${importedMaterialBeforeLightsCode}
     float dve_flatness = max(abs(dot(normalize(vNormalW), vec3(0.0, 1.0, 0.0))),
                              max(abs(dot(normalize(vNormalW), vec3(1.0, 0.0, 0.0))),
                                  abs(dot(normalize(vNormalW), vec3(0.0, 0.0, 1.0)))));
-    float dve_flatGate = smoothstep(0.92, 0.80, dve_flatness);
-    dve_edgeFactor = smoothstep(0.04, 0.55, 1.0 - abs(dot(normalize(normalW), dve_derivN))) * dve_flatGate;
+    // Previous code used smoothstep with reversed edges (0.92, 0.80), which is
+    // undefined in GLSL and can print unstable diagonal bands on some drivers.
+    float dve_flatGate = 1.0 - smoothstep(0.80, 0.92, dve_flatness);
+    // This corner-softening trick only helps at close range; at distance it turns
+    // tiny derivative differences into long visible bands across flat terrain.
+    float dve_edgeDistance = length(vPositionW - vEyePosition.xyz);
+    float dve_edgeDistanceGate = 1.0 - smoothstep(18.0, 42.0, dve_edgeDistance);
+    dve_edgeFactor =
+      smoothstep(0.04, 0.55, 1.0 - abs(dot(normalize(normalW), dve_derivN))) *
+      dve_flatGate *
+      dve_edgeDistanceGate;
     normalW = normalize(mix(normalW, dve_derivN, dve_edgeFactor * 0.72));
   }
   // T8 NOTE: surfaceReflectivityColor is not available at CUSTOM_FRAGMENT_BEFORE_LIGHTS

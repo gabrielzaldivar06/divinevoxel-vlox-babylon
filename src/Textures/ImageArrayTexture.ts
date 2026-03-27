@@ -221,17 +221,17 @@ export class ImageArrayTexture extends Texture {
         anisotropicEnabled.MAX_TEXTURE_MAX_ANISOTROPY_EXT
       ) as number;
       const textureSize = EngineSettings.settings.rendererSettings.textureSize[0];
-      const useReducedAnisotropy =
-        textureSize > 16 && EngineSettings.settings.terrain.transitionMeshes;
+      // Ground/water surfaces are viewed at long grazing angles most of the time.
+      // Forcing anisotropy down to 1-2 there produces exactly the kind of diagonal
+      // moire bands the user is seeing when moving away from the camera.
+      // Keep a real anisotropic floor even on transition-mesh paths.
       const desired = Math.min(
         sharpTextureSampling
-          ? 1
-          : textureSize > 32 && EngineSettings.settings.terrain.transitionMeshes
-          ? 1
-          : useReducedAnisotropy
-            ? 2
-            : 8,
-        maxAniso,
+          ? 2
+          : textureSize > 32
+            ? 8
+            : 4,
+        maxAniso
       );
 
       gl.texParameterf(
