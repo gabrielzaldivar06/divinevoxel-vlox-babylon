@@ -236,7 +236,18 @@ ${props.inMainAfter || ""}
   //mix color
   rgb *= vColors;
 
-  rgb.rgb *=  getLight();
+  vec3 liquidNormal = normalize(vNormal);
+  vec3 liquidViewDir = normalize(cameraPosition - worldPOS);
+  float liquidFacing = clamp(liquidNormal.y * 0.5 + 0.5, 0.0, 1.0);
+  float liquidFresnel = pow(1.0 - clamp(abs(dot(liquidNormal, liquidViewDir)), 0.0, 1.0), 2.2);
+  vec3 liquidTint = mix(vec3(0.12, 0.18, 0.24), vec3(0.34, 0.62, 1.0), liquidFacing);
+  vec3 liquidLight = max(getLight(), vec3(0.32, 0.36, 0.42));
+  float liquidLuma = dot(rgb.rgb, vec3(0.299, 0.587, 0.114));
+  vec3 liquidBaseColor = mix(liquidTint * 0.7, liquidTint, clamp(liquidLuma * 1.15, 0.0, 1.0));
+  rgb.rgb = liquidBaseColor * liquidLight;
+  rgb.rgb += liquidTint * (0.16 + liquidFresnel * 0.28);
+  rgb.a = max(rgb.a, 0.68);
+
   vec3 fog = getFogColor();
   vec3 sky = getSkyColor(fog);
   vec4 skyBlendColor = blendSkyColor(sky,rgb);

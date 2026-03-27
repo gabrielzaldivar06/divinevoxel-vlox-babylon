@@ -39,6 +39,9 @@ function sectorKey(dimId: number, x: number, y: number, z: number): string {
 }
 
 export class LODSectorTracker {
+  private static readonly IDLE_CAMERA_EPSILON_SQ = 0.01;
+  private static readonly IDLE_REFRESH_INTERVAL = 15;
+
   /** Current LOD state per sector. */
   private _states = new Map<string, SectorLODState>();
 
@@ -48,6 +51,26 @@ export class LODSectorTracker {
   /** Callback to trigger a sector re-mesh at a particular LOD level. */
   onRemeshNeeded: ((request: RemeshRequest) => void) | null = null;
 
+  private _lastCamX: number | null = null;
+  private _lastCamY: number | null = null;
+  private _lastCamZ: number | null = null;
+  private _idleRefreshCountdown = LODSectorTracker.IDLE_REFRESH_INTERVAL;
+
+  private _dispatchRemeshQueue() {
+    let dispatched = 0;
+    while (
+      this._remeshQueue.length > 0 &&
+      dispatched < LOD_MAX_REMESH_PER_FRAME
+    ) {
+      const request = this._remeshQueue.shift()!;
+      if (this.onRemeshNeeded) {
+        this.onRemeshNeeded(request);
+      }
+      dispatched++;
+    }
+    return dispatched;
+  }
+
   /**
    * Call once per frame. Iterates all active sectors through MeshRegister,
    * computes LOD bands, and processes band transitions.
@@ -55,6 +78,24 @@ export class LODSectorTracker {
    * @returns Number of re-mesh requests dispatched this frame.
    */
   update(camX: number, camY: number, camZ: number): number {
+    if (this._lastCamX !== null) {
+      const dx = camX - this._lastCamX;
+      const dy = camY - this._lastCamY!;
+      const dz = camZ - this._lastCamZ!;
+      const deltaSq = dx * dx + dy * dy + dz * dz;
+      if (
+        deltaSq <= LODSectorTracker.IDLE_CAMERA_EPSILON_SQ &&
+        this._idleRefreshCountdown > 0
+      ) {
+        this._idleRefreshCountdown--;
+        return this._dispatchRemeshQueue();
+      }
+    }
+    this._lastCamX = camX;
+    this._lastCamY = camY;
+    this._lastCamZ = camZ;
+    this._idleRefreshCountdown = LODSectorTracker.IDLE_REFRESH_INTERVAL;
+
     const halfBoundsX = WorldSpaces.sector.bounds.x * 0.5;
     const halfBoundsY = WorldSpaces.sector.bounds.y * 0.5;
     const halfBoundsZ = WorldSpaces.sector.bounds.z * 0.5;
@@ -148,19 +189,7 @@ export class LODSectorTracker {
     }
 
     // Dispatch rate-limited re-meshes
-    let dispatched = 0;
-    while (
-      this._remeshQueue.length > 0 &&
-      dispatched < LOD_MAX_REMESH_PER_FRAME
-    ) {
-      const request = this._remeshQueue.shift()!;
-      if (this.onRemeshNeeded) {
-        this.onRemeshNeeded(request);
-      }
-      dispatched++;
-    }
-
-    return dispatched;
+    return this._dispatchRemeshQueue();
   }
 
   /**
@@ -190,6 +219,10 @@ export class LODSectorTracker {
     this._states.clear();
     this._remeshQueue.length = 0;
     this.onRemeshNeeded = null;
+    this._lastCamX = null;
+    this._lastCamY = null;
+    this._lastCamZ = null;
+    this._idleRefreshCountdown = LODSectorTracker.IDLE_REFRESH_INTERVAL;
   }
 }
 

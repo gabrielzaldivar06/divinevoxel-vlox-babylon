@@ -12,6 +12,7 @@
  * through DynamicSplatPool with rate limiting.
  */
 
+import type { Observer } from "@babylonjs/core/Misc/observable";
 import { Scene } from "@babylonjs/core/scene";
 import { DVEGaussianSplatRenderer } from "./DVEGaussianSplatRenderer";
 import {
@@ -70,6 +71,7 @@ export interface SplatMeshUpdate {
 }
 
 export class SplatManager {
+  private _scene: Scene;
   private _renderer: DVEGaussianSplatRenderer;
   private _physicsOverrides = new Map<string, SplatPhysics>();
   /** Track which section keys are active so we can clean up on sector remove */
@@ -81,14 +83,16 @@ export class SplatManager {
   /** Fase 5: Dynamic fracture splat pool with physics. */
   private _dynamicPool: DynamicSplatPool;
   private _lastTime = 0;
+  private _beforeRenderObserver: Observer<Scene> | null = null;
 
   constructor(scene: Scene) {
+    this._scene = scene;
     this._renderer = new DVEGaussianSplatRenderer(scene);
     this._dynamicPool = new DynamicSplatPool(500);
     this._lastTime = performance.now() * 0.001;
 
     // Per-frame update
-    scene.registerBeforeRender(() => {
+    this._beforeRenderObserver = scene.onBeforeRenderObservable.add(() => {
       if (this._disposed) return;
 
       // Dynamic pool physics update
@@ -252,6 +256,10 @@ export class SplatManager {
 
   dispose() {
     this._disposed = true;
+    if (this._beforeRenderObserver) {
+      this._scene.onBeforeRenderObservable.remove(this._beforeRenderObserver);
+      this._beforeRenderObserver = null;
+    }
     this._renderer.dispose();
     this._dynamicPool.dispose();
     this._activeSections.clear();

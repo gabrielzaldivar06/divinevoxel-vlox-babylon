@@ -9,6 +9,7 @@ import { classifyTerrainMaterial } from "./MaterialFamilyProfiles";
 import { isUnstablePBRSurfaceContextPreset } from "./ActiveTerrainPBRFlags";
 import { EngineSettings } from "@divinevoxel/vlox/Settings/EngineSettings";
 import { getDepthTextureBinding } from "./DepthTextureBinding";
+import { getSceneWaterHybridBridge } from "../../Water/DVEWaterHybridBridge.js";
 
 export class DVEPBRMaterialPlugin extends MaterialPluginBase {
   uniformBuffer: UniformBuffer;
@@ -76,7 +77,12 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
     if (this.hasImportedMaterialMapsEnabled()) {
       samplers.push("dve_voxel_normal", "dve_voxel_material");
     }
-    samplers.push("dve_depthTexture");
+    samplers.push(
+      "dve_depthTexture",
+      "dve_water_hybrid_base",
+      "dve_water_hybrid_dynamic",
+      "dve_water_hybrid_flow"
+    );
   }
 
   getAttributes(attributes: string[]) {
@@ -85,7 +91,13 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
 
   getUniforms() {
     return {
-      ubo: [{ name: "dve_voxel_animation_size" }, { name: "dve_time" }, { name: "dve_cameraNearFar", size: 2 }, { name: "dve_screenSize", size: 2 }],
+      ubo: [
+        { name: "dve_voxel_animation_size" },
+        { name: "dve_time" },
+        { name: "dve_cameraNearFar", size: 2 },
+        { name: "dve_screenSize", size: 2 },
+        { name: "dve_water_hybrid_clip", size: 4 },
+      ],
     };
   }
 
@@ -195,6 +207,20 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
     effect.setTexture("dve_depthTexture", depthBinding.depthTexture);
     effect.setFloat2("dve_cameraNearFar", depthBinding.near, depthBinding.far);
     effect.setFloat2("dve_screenSize", depthBinding.screenWidth, depthBinding.screenHeight);
+    if (scene) {
+      const waterHybridBridge = getSceneWaterHybridBridge(scene);
+      const clip = waterHybridBridge.getClipState();
+      effect.setTexture("dve_water_hybrid_base", waterHybridBridge.getBaseTexture());
+      effect.setTexture("dve_water_hybrid_dynamic", waterHybridBridge.getDynamicTexture());
+      effect.setTexture("dve_water_hybrid_flow", waterHybridBridge.getFlowTexture());
+      effect.setFloat4(
+        "dve_water_hybrid_clip",
+        clip.originX,
+        clip.originZ,
+        clip.invWidth,
+        clip.invHeight
+      );
+    }
   }
 
   //@ts-ignore
@@ -210,6 +236,17 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
     const isSoil = materialClass.isSoil;
     const isCultivated = materialClass.isCultivated;
     const isExotic = materialClass.isExotic;
+    const materialWetnessPorosity = isFlora
+      ? 0.72
+      : isSoil || isCultivated
+        ? 0.58
+        : isWood
+          ? 0.34
+          : isRock
+            ? 0.12
+            : isExotic
+              ? 0.26
+              : 0.2;
     const disableUnstablePBRSurfaceContext = isUnstablePBRSurfaceContextPreset(benchmarkPreset);
     const enableVisualV2 = terrain.visualV2 && !disableUnstablePBRSurfaceContext;
     const enableMacroVariation = terrain.macroVariation && !isTransparent && !isGlow;
@@ -232,6 +269,10 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
       !isTransparent &&
       !isGlow &&
       !disableUnstablePBRSurfaceContext;
+    const enableWorldContext =
+      (enableSurfaceMetadata || enableWetness) &&
+      !isTransparent &&
+      !isGlow;
     const enableSurfaceHeightGradient =
       terrain.surfaceHeightGradient &&
       !isTransparent &&
@@ -279,6 +320,10 @@ uniform highp int dve_voxel_animation_size;
 uniform sampler2D dve_depthTexture;
 uniform vec2 dve_cameraNearFar;
 uniform vec2 dve_screenSize;
+uniform sampler2D dve_water_hybrid_base;
+uniform sampler2D dve_water_hybrid_dynamic;
+uniform sampler2D dve_water_hybrid_flow;
+uniform vec4 dve_water_hybrid_clip;
   ${enableImportedMaterialMaps ? "uniform sampler2DArray dve_voxel_normal;\nuniform sampler2DArray dve_voxel_material;" : ""}
 `;
     const varying = /* glsl */ `
@@ -291,14 +336,14 @@ varying vec3 dveLight2;
 varying vec3 dveLight3;
 varying vec3 dveLight4;
   ${enableSurfaceMetadata ? "varying vec4 dveMetadata;" : ""}
-  ${enableSurfaceMetadata ? "varying vec3 dveWorldContext;" : ""}
+  ${enableWorldContext ? "varying vec3 dveWorldContext;" : ""}
 `;
 
     const attributes = /* glsl */ `
 attribute vec3 textureIndex;
 attribute vec4 voxelData;
   ${enableSurfaceMetadata ? "attribute vec4 metadata;" : ""}
-  ${enableSurfaceMetadata ? "attribute vec3 worldContext;" : ""}
+  ${enableWorldContext ? "attribute vec3 worldContext;" : ""}
 `;
     const coreFunctions = /* glsl */ `
 const uint dveLightMask = uint(0xf);
@@ -342,7 +387,7 @@ vec3 dveGetVoxelLight() {
 ${coreFunctions}
 
 float dveHash13(vec3 p) {
-  p = fract(p * 0.1031);
+  p = fract(p * vec3(0.1031, 0.1030, 0.0973));
   p += dot(p, p.yzx + 33.33);
   return fract((p.x + p.y) * p.z);
 }
@@ -350,7 +395,8 @@ float dveHash13(vec3 p) {
 float dveNoise3(vec3 p) {
   vec3 i = floor(p);
   vec3 f = fract(p);
-  f = f * f * (3.0 - 2.0 * f);
+  // Quintic Hermite (C² continuous) — reduces grid-boundary visibility vs cubic smoothstep.
+  f = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
 
   float n000 = dveHash13(i + vec3(0.0, 0.0, 0.0));
   float n100 = dveHash13(i + vec3(1.0, 0.0, 0.0));
@@ -379,6 +425,11 @@ float dveFbm3(vec3 p) {
     amplitude *= 0.5;
   }
   return value;
+}
+
+vec3 dveRotXZ(vec3 p, float a) {
+  float c = cos(a); float s = sin(a);
+  return vec3(p.x*c - p.z*s, p.y, p.x*s + p.z*c);
 }
 
 vec3 dveBlendWeights(vec3 normalDir) {
@@ -436,6 +487,54 @@ float dveCenterMask(vec2 faceUV) {
 
 float dveNearFieldMask(float distanceValue, float startDistance, float endDistance) {
   return 1.0 - smoothstep(startDistance, endDistance, distanceValue);
+}
+
+vec2 dveGetWaterHybridUV(vec3 worldPos) {
+  return fract((worldPos.xz - dve_water_hybrid_clip.xy) * dve_water_hybrid_clip.zw);
+}
+
+vec4 dveGetTerrainHydrologyFields(
+  vec3 worldPos,
+  vec3 normalDir,
+  float baseHydrology,
+  float materialPorosity
+) {
+  vec2 hybridUV = dveGetWaterHybridUV(worldPos);
+  vec2 texel = dve_water_hybrid_clip.zw;
+  vec4 hybridBase = texture(dve_water_hybrid_base, hybridUV);
+  vec4 hybridDynamic = texture(dve_water_hybrid_dynamic, hybridUV);
+  vec4 hybridFlow = texture(dve_water_hybrid_flow, hybridUV);
+  float neighborFill = 0.0;
+  neighborFill = max(neighborFill, texture(dve_water_hybrid_base, fract(hybridUV + vec2(texel.x, 0.0))).a);
+  neighborFill = max(neighborFill, texture(dve_water_hybrid_base, fract(hybridUV - vec2(texel.x, 0.0))).a);
+  neighborFill = max(neighborFill, texture(dve_water_hybrid_base, fract(hybridUV + vec2(0.0, texel.y))).a);
+  neighborFill = max(neighborFill, texture(dve_water_hybrid_base, fract(hybridUV - vec2(0.0, texel.y))).a);
+
+  float explicitWetness = clamp(
+    max(baseHydrology * 0.38, hybridBase.a * 0.86 + neighborFill * 0.34 + hybridFlow.a * 0.16),
+    0.0,
+    1.0
+  );
+  float freshWetness = clamp(
+    max(hybridFlow.a * 0.84 + hybridDynamic.b * 0.34, hybridDynamic.r * 0.72 + hybridDynamic.g * 0.18),
+    0.0,
+    1.0
+  );
+  float contactPersistence = clamp(
+    (1.0 - abs(normalDir.y)) * 0.72 + neighborFill * 0.38 + hybridFlow.a * 0.28 + hybridDynamic.r * 0.22,
+    0.0,
+    1.0
+  );
+  float dryingPersistence = clamp(
+    explicitWetness * (0.26 + materialPorosity * 0.36) +
+      hybridBase.b * (0.10 + materialPorosity * 0.12) +
+      contactPersistence * 0.18 -
+      freshWetness * 0.14,
+    0.0,
+    1.0
+  );
+
+  return vec4(explicitWetness, freshWetness, dryingPersistence, contactPersistence);
 }
 `;
     if (shaderType === "vertex") {
@@ -502,7 +601,7 @@ vec3 dveDecodeLightValue(uint value) {
   dveLight4 = dveDecodeLightValue(uint(voxelData.w));
   dveIUV = dveQuadUVArray[(uint(voxelData.z) >> dveVertexIndex) & dveVertexMask];
   ${enableSurfaceMetadata ? "dveMetadata = metadata;" : ""}
-  ${enableSurfaceMetadata ? "dveWorldContext = worldContext;" : ""}
+  ${enableWorldContext ? "dveWorldContext = worldContext;" : ""}
 
 #endif
         `,
@@ -524,12 +623,23 @@ float dveSlope = 1.0 - abs(dveNormalW.y);
       float dveSurfaceTop = smoothstep(0.45, 0.8, dveNormalW.y);
       float dveBakedHeight = 0.0;
   ${enableSurfaceMetadata ? "vec4 dveMetadataClamped = clamp(dveMetadata, 0.0, 1.0); float dveMetadataWeight = smoothstep(0.04, 0.28, dot(dveMetadataClamped, vec4(0.25))); dveSurfaceExposure = mix(dveSurfaceExposure, dveMetadataClamped.x, dveMetadataWeight * 0.72); dveSurfaceSlope = mix(dveSurfaceSlope, dveMetadataClamped.y, dveMetadataWeight * 0.72); dveSurfaceCavity = mix(dveSurfaceCavity, dveMetadataClamped.z, dveMetadataWeight * 0.72); dveSurfaceTop = mix(dveSurfaceTop, smoothstep(0.4, 0.85, dveMetadataClamped.x), dveMetadataWeight * 0.72); dveBakedHeight = dveMetadataClamped.w; dveTopExposure = mix(dveTopExposure, max(dveTopExposure, dveSurfaceExposure), dveMetadataWeight * 0.55);" : ""}
-      float dveSunExposure = ${enableSurfaceMetadata ? "clamp(dveWorldContext.x, 0.0, 1.0)" : "1.0"};
-      float dveEnclosure = ${enableSurfaceMetadata ? "clamp(dveWorldContext.y, 0.0, 1.0)" : "0.0"};
-      float dveEdgeBoundary = ${enableSurfaceMetadata ? "clamp(dveWorldContext.z, 0.0, 1.0)" : "1.0"};
+      float dveSunExposure = ${enableWorldContext ? "clamp(dveWorldContext.x, 0.0, 1.0)" : "1.0"};
+      float dveEnclosure = ${enableWorldContext ? "clamp(dveWorldContext.y, 0.0, 1.0)" : "0.0"};
+      float dveEdgeBoundary = ${enableSurfaceMetadata ? "clamp((1.0 - dveEdgeWear * 0.72) * (0.76 + dveSurfaceExposure * 0.16 + dveSurfaceTop * 0.08) + dveSurfaceCavity * 0.08, 0.0, 1.0)" : "1.0"};
       float dveHeightNorm = ${enableSurfaceMetadata ? "dveBakedHeight" : enableSurfaceHeightGradient ? "clamp((vPositionW.y - 16.0) / 112.0, 0.0, 1.0)" : "0.0"};
       float dveBaseCavity = clamp(max(dveSurfaceCavity * 0.82, dveEdgeMask(fract(dveBaseUV * 0.85 + vec2(vPositionW.y * 0.03))) * 0.18), 0.0, 1.0);
-      float dveWetnessBase = clamp(dveComputeWetness(dveNormalW, vPositionW) * 0.56 + dveSurfaceCavity * 0.14 + (1.0 - dveSurfaceExposure) * 0.06 + (1.0 - dveHeightNorm) * 0.14 - dveHeightNorm * 0.08 + (1.0 - dveSunExposure) * 0.1 + dveEnclosure * 0.08, 0.0, 1.0);
+      float dveMaterialPorosity = ${materialWetnessPorosity.toFixed(2)};
+      float dveLegacyHydrologyWetness = ${enableWorldContext ? "clamp(dveWorldContext.z, 0.0, 1.0)" : "0.0"};
+      vec4 dveHydrologyFields = dveGetTerrainHydrologyFields(vPositionW, dveNormalW, dveLegacyHydrologyWetness, dveMaterialPorosity);
+      float dveHydrologyWetness = dveHydrologyFields.x;
+      float dveHydrologyFresh = dveHydrologyFields.y;
+      float dveHydrologyDrying = dveHydrologyFields.z;
+      float dveHydrologyContact = dveHydrologyFields.w;
+      float dveWetnessBase = clamp(dveComputeWetness(dveNormalW, vPositionW) * 0.56 + dveSurfaceCavity * 0.14 + (1.0 - dveSurfaceExposure) * 0.06 + (1.0 - dveHeightNorm) * 0.14 - dveHeightNorm * 0.08 + (1.0 - dveSunExposure) * 0.1 + dveEnclosure * 0.08 + dveHydrologyWetness * (0.24 + dveMaterialPorosity * 0.24) + dveHydrologyContact * (0.12 + dveMaterialPorosity * 0.08), 0.0, 1.0);
+      float dveWetnessRetention = clamp(0.26 + dveMaterialPorosity * 0.58 + dveBaseCavity * 0.12 + dveEnclosure * 0.08 - dveSunExposure * 0.1 + dveHydrologyDrying * (0.18 + dveMaterialPorosity * 0.14) + dveHydrologyContact * 0.08, 0.0, 1.0);
+      float dveFreshWetness = max(max(smoothstep(0.24, 0.78, dveWetnessBase), smoothstep(0.08, 0.52, dveHydrologyWetness) * (0.72 + dveMaterialPorosity * 0.18)), smoothstep(0.08, 0.58, dveHydrologyFresh) * (0.68 + dveMaterialPorosity * 0.22));
+      float dveDryingWetness = clamp(dveWetnessBase * (0.42 + dveWetnessRetention * 0.42) * (1.0 - dveFreshWetness * 0.55) + dveHydrologyWetness * (0.12 + dveWetnessRetention * 0.22) * (1.0 - dveFreshWetness * 0.45) + dveHydrologyDrying * (0.18 + dveWetnessRetention * 0.14), 0.0, 1.0);
+      float dveWetFilm = clamp(dveFreshWetness * (0.58 + dveMaterialPorosity * 0.18 + dveEnclosure * 0.08) + dveDryingWetness + dveHydrologyWetness * (0.08 + dveMaterialPorosity * 0.16) + dveHydrologyContact * (0.10 + dveMaterialPorosity * 0.10), 0.0, 1.0);
     `;
       const visualV2Code = enableVisualV2
         ? /* glsl */ `
@@ -550,13 +660,15 @@ voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.75, 0.7
         : "";
       const macroVariationCode = enableMacroVariation
         ? /* glsl */ `
-float dveMacro = clamp(dveFbm3(vPositionW * 0.035) * 1.1, 0.0, 1.0);
-float dveMacroPatch = dveFbm3(vPositionW * 0.012 + vec3(-9.7, 5.2, 11.1));
+float dveMacro = clamp(dveFbm3(dveRotXZ(vPositionW, 0.41) * 0.035) * 1.1, 0.0, 1.0);
+float dveMacroPatch = dveFbm3(dveRotXZ(vPositionW, 0.83) * 0.012 + vec3(-9.7, 5.2, 11.1));
 float dveMacroTintMask = clamp(dveMacro * 0.6 + dveMacroPatch * 0.32 + dveSurfaceExposure * 0.08 - dveBaseCavity * 0.06, 0.0, 1.0);
 vec3 dveMacroTint = mix(vec3(0.80, 0.75, 0.70), vec3(1.14, 1.08, 1.00), dveMacroTintMask);
 voxelBaseColor.rgb *= dveMacroTint;
 // Per-block brightness variation: breaks uniform same-type blocks.
-vec3 dveBlockSeed = vec3(floor(vPositionW.x), floor(vPositionW.z), dveTextureLayer * 0.03125 + 17.3);
+// Use floor(vPositionW) instead of floor(dveBaseUV) to avoid per-triangle
+// interpolation mismatch that creates diagonal seams at quad boundaries.
+vec3 dveBlockSeed = floor(vPositionW) + vec3(dveTextureLayer * 0.03125 + 17.3);
 float dveBlockVar = (dveHash13(dveBlockSeed) * 2.0 - 1.0) * 0.08;    // ±8% brightness
 float dveBlockHue = (dveHash13(dveBlockSeed + vec3(5.1, 3.7, 2.9)) - 0.5) * 0.04;  // ±4% hue twist
 voxelBaseColor.rgb *= (1.0 + dveBlockVar);
@@ -586,13 +698,18 @@ voxelBaseColor = mix(voxelBaseColor, dveTriplanarColor, dveTriplanarMix);
 voxelBaseColor.rgb = mix(
   voxelBaseColor.rgb,
   voxelBaseColor.rgb * vec3(0.72, 0.76, 0.82),
-  dveWetnessBase * 0.28
+  dveWetFilm * mix(0.16, 0.34, dveMaterialPorosity)
+);
+voxelBaseColor.rgb = mix(
+  voxelBaseColor.rgb,
+  voxelBaseColor.rgb * vec3(0.84, 0.86, 0.9),
+  dveDryingWetness * mix(0.08, 0.18, dveWetnessRetention)
 );
 `
         : "";
       const microVariationCode = enableMicroVariation
         ? /* glsl */ `
-float dveMicro = dveFbm3(vPositionW * 0.42 + dveNormalW * 1.8);
+float dveMicro = dveFbm3(dveRotXZ(vPositionW, 0.19) * 0.42 + dveNormalW * 1.8);
 // Edge seam: weight by slope so flat terrain shows minimal grid; only steep/curved
 // surfaces get the full block-boundary darkening (reduces "mattress" effect).
 float dveSlopeEdgeGate = smoothstep(0.15, 0.55, max(dveSlope, dveSurfaceSlope));
@@ -624,20 +741,20 @@ voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.87, 0.8
         : "";
       const surfaceOverlaysCode = enableSurfaceOverlays
         ? /* glsl */ `
-float dveOverlayNoise = dveFbm3(vPositionW * 0.11 + vec3(4.3, -1.7, 8.1));
+float dveOverlayNoise = dveFbm3(dveRotXZ(vPositionW, 0.62) * 0.11 + vec3(4.3, -1.7, 8.1));
 float dveOverlayDistance = mix(0.62, 1.0, dveCloseBoost);
 float dveOverlayExposure = clamp(dveSurfaceExposure * 0.84 + dveTopExposure * 0.16, 0.0, 1.0);
 float dveSideFaceMask = clamp(1.0 - dveSurfaceTop, 0.0, 1.0);
-float dveSideEdgeMask = dveEdgeMask(fract(dveBaseUV * 0.72 + vec2(0.0, vPositionW.y * 0.04))) * dveSideFaceMask;
+float dveSideEdgeMask = dveEdgeMask(fract(dveBaseUV * 0.72)) * dveSideFaceMask;
 float dveShelterMask = clamp(dveBaseCavity * 0.46 + dveCenterBlend * 0.1 + (1.0 - dveOverlayExposure) * 0.16 + (1.0 - dveSurfaceSlope) * 0.06 + dveEnclosure * 0.14, 0.0, 1.0);
 float dveLowlandBias = 1.0 - smoothstep(0.15, 0.45, dveHeightNorm);
 float dveHighlandBias = smoothstep(0.55, 0.85, dveHeightNorm);
 float dveMidlandBias = clamp(1.0 - abs(dveHeightNorm - 0.42) * 2.4, 0.0, 1.0);
-float dveHorizontalSeed = dveHash13(floor(vPositionW * vec3(0.85, 0.05, 0.85)) + vec3(dveTextureLayer * 0.03125, 100.0, dveSurfaceTop));
+float dveHorizontalSeed = dveHash13(vec3(floor(dveBaseUV.x * 4.0) + dveTextureLayer * 0.03125, 100.0, floor(dveBaseUV.y * 4.0) + dveSurfaceTop));
 vec3 dveNormalAbs = abs(dveNormalW);
 float dveAxisSwitch = step(dveNormalAbs.x, dveNormalAbs.z);
 vec3 dveAxisSeed = mix(vec3(dveNormalW.x * 10.0, 5.0, 0.1), vec3(0.1, 5.0, dveNormalW.z * 10.0), dveAxisSwitch);
-float dveDirectionalSeed = dveHash13(floor(vPositionW * 0.85 + dveAxisSeed) + vec3(dveTextureLayer * 0.03125, dveSurfaceSlope, 0.0));
+float dveDirectionalSeed = dveHash13(vec3(floor(dveBaseUV.x * 4.0) + dveTextureLayer * 0.03125 + dveAxisSeed.x * 0.01, dveSurfaceSlope, floor(dveBaseUV.y * 4.0) + dveAxisSeed.z * 0.01));
 float dveConnectedPatch = mix(
   smoothstep(0.34, 0.82, dveHorizontalSeed + dveShelterMask * 0.18),
   smoothstep(0.28, 0.76, dveDirectionalSeed + dveShelterMask * 0.14 - dveSideEdgeMask * 0.12),
@@ -654,13 +771,14 @@ float dveConnectedEdgeBlend = clamp(dveGrassRimMask * 0.72 + dveSideFaceMask * 0
 float dveFloraConnectedMask = clamp(dveSideFaceMask * (0.42 + (1.0 - dveOverlayExposure) * 0.24) + dveConnectedPatch * 0.18 + dveSideEdgeMask * 0.12, 0.0, 1.0) * mix(0.74, 1.0, dveCloseBoost) * (0.94 + dveEdgeProximity * 0.1);
 float dveSoilConnectedMask = clamp(dveConnectedPatch * 0.34 + dveSideFaceMask * 0.28 + dveShelterMask * 0.18 + (1.0 - dveSurfaceSlope) * 0.08, 0.0, 1.0) * mix(0.72, 1.0, dveCloseBoost) * (0.94 + dveEdgeProximity * 0.08);
 float dveEdgeDirBias = mix(0.94 + (fract(dveBaseUV.x) - 0.5) * 0.12, 0.94 + (fract(dveBaseUV.y) - 0.5) * 0.12, dveAxisSwitch);
-float dveDepositionMask = clamp(dveSurfaceTop * (1.0 - dveSurfaceSlope) * 0.62 + dveBaseCavity * 0.08 + dveOverlayNoise * 0.14 + dveCenterBlend * 0.06, 0.0, 1.0) * dveOverlayDistance;
+float dveHydrologyDeposition = clamp(dveHydrologyWetness * (0.44 + dveLowlandBias * 0.18 + dveShelterMask * 0.12) + dveFreshWetness * 0.08 - dveSurfaceSlope * 0.12, 0.0, 1.0);
+float dveDepositionMask = clamp(dveSurfaceTop * (1.0 - dveSurfaceSlope) * 0.56 + dveBaseCavity * 0.08 + dveOverlayNoise * 0.12 + dveCenterBlend * 0.06 + dveHydrologyDeposition * 0.34, 0.0, 1.0) * dveOverlayDistance;
 float dveMossMask = clamp(dveWetnessBase * 0.42 + dveBaseCavity * 0.24 + (1.0 - dveSurfaceSlope) * 0.06 + dveCenterBlend * 0.04 - dveOverlayExposure * 0.08 + dveMidlandBias * 0.1 + dveEnclosure * 0.1 + (1.0 - dveSunExposure) * 0.08, 0.0, 1.0) * mix(0.72, 1.0, dveCloseBoost);
-float dveDustMask = clamp(dveOverlayExposure * 0.24 + dveBaseCavity * 0.1 + (1.0 - dveWetnessBase) * 0.2 + dveOverlayNoise * 0.08 + dveHighlandBias * 0.12 + dveSunExposure * 0.1 - dveEnclosure * 0.14, 0.0, 1.0) * mix(0.68, 1.0, dveCloseBoost);
-float dveSandDriftMask = clamp(dveDepositionMask * (0.48 + dveOverlayExposure * 0.22 + (1.0 - dveWetnessBase) * 0.26) + dveSideEdgeMask * 0.08 + dveShelterMask * 0.12 + dveLowlandBias * 0.16 - dveMossMask * 0.22 - dveEnclosure * 0.12, 0.0, 1.0) * mix(0.72, 1.0, dveCloseBoost);
-float dveSandPocketMask = clamp(dveDepositionMask * (0.34 + dveShelterMask * 0.28) + dveBaseCavity * 0.16 + (1.0 - dveWetnessBase) * 0.12 + dveLowlandBias * 0.12 - dveSurfaceSlope * 0.06, 0.0, 1.0) * mix(0.7, 1.0, dveCloseBoost);
+float dveDustMask = clamp(dveOverlayExposure * 0.24 + dveBaseCavity * 0.1 + (1.0 - dveWetFilm) * 0.2 + dveOverlayNoise * 0.08 + dveHighlandBias * 0.12 + dveSunExposure * 0.1 - dveEnclosure * 0.14, 0.0, 1.0) * mix(0.68, 1.0, dveCloseBoost);
+float dveSandDriftMask = clamp(dveDepositionMask * (0.48 + dveOverlayExposure * 0.22 + (1.0 - dveWetFilm) * 0.26) + dveSideEdgeMask * 0.08 + dveShelterMask * 0.12 + dveLowlandBias * 0.16 - dveMossMask * 0.22 - dveEnclosure * 0.12, 0.0, 1.0) * mix(0.72, 1.0, dveCloseBoost);
+float dveSandPocketMask = clamp(dveDepositionMask * (0.34 + dveShelterMask * 0.28) + dveBaseCavity * 0.16 + (1.0 - dveWetFilm) * 0.12 + dveLowlandBias * 0.12 - dveSurfaceSlope * 0.06, 0.0, 1.0) * mix(0.7, 1.0, dveCloseBoost);
 float dveMossDominanceZone = clamp(dveMossMask * (1.4 - dveSurfaceTop * 0.35) - dveSandDriftMask * 0.18 - dveOverlayExposure * 0.12, 0.0, 1.0);
-float dveDryInteraction = (1.0 - dveWetnessBase) * clamp(dveOverlayExposure * 0.6 + dveTopExposure * 0.4, 0.0, 1.0);
+float dveDryInteraction = (1.0 - dveWetFilm) * clamp(dveOverlayExposure * 0.6 + dveTopExposure * 0.4, 0.0, 1.0);
 float dveGrainSettlingMask = clamp(dveDepositionMask * (0.34 + dveShelterMask * 0.32 + dveBaseCavity * 0.18) + dveOverlayNoise * 0.08 - dveSurfaceSlope * 0.12, 0.0, 1.0) * mix(0.7, 1.0, dveCloseBoost);
 float dveRockMossMask = clamp(dveMossMask * (0.72 + dveBaseCavity * 0.18) + dveSideFaceMask * (0.08 + (1.0 - dveOverlayExposure) * 0.08) + dveShelterMask * 0.12 - dveDustMask * 0.18, 0.0, 1.0) * mix(0.74, 1.0, dveCloseBoost);
 float dveRockMossCreepMask = clamp(dveRockMossMask * (0.42 + dveSideFaceMask * 0.42) + dveSideEdgeMask * 0.08 + dveOverlayNoise * 0.05 - dveSandDriftMask * 0.16, 0.0, 1.0);
@@ -668,17 +786,17 @@ float dveMossVerticalCreepMask = clamp(dveRockMossMask * (1.2 - abs(dveNormalW.y
 
 ${
   isRock
-    ? "voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.7, 0.9, 0.68), dveRockMossMask * (1.0 - dveDryInteraction * 0.28) * 0.22); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.62, 0.8, 0.62), dveMossVerticalCreepMask * 0.14); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(1.08, 1.04, 0.94), dveSandDriftMask * (1.0 + dveDryInteraction * 0.18) * 0.14); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(1.12, 1.08, 0.96), dveGrainSettlingMask * 0.12);"
+    ? "voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.7, 0.9, 0.68), dveRockMossMask * (1.0 - dveDryInteraction * 0.28) * 0.22); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.62, 0.8, 0.62), dveMossVerticalCreepMask * 0.14); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(1.08, 1.04, 0.94), dveSandDriftMask * (1.0 + dveDryInteraction * 0.18) * 0.14); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(1.12, 1.08, 0.96), dveGrainSettlingMask * 0.12); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(1.1, 1.06, 0.92), dveHydrologyDeposition * 0.14);"
     : ""
 }
 ${
   isSoil || isCultivated
-    ? "voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(1.08, 1.01, 0.92), dveSandDriftMask * 0.16); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(1.12, 1.04, 0.96), dveSandPocketMask * 0.08); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.78, 0.9, 0.7), dveGrassSideMask * 0.12); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.82, 0.99, 0.75), dveGrassRimMask * 0.18); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.76, 0.9, 0.72) * dveEdgeDirBias, dveConnectedEdgeBlend * dveSoilConnectedMask * 0.1); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.92, 0.88, 0.8), (1.0 - dveConnectedPatch) * dveSoilConnectedMask * 0.08); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.71, 0.87, 0.64), dveMossMask * 0.14); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.68, 0.91, 0.62), dveMossDominanceZone * 0.08);"
+    ? "voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(1.08, 1.01, 0.92), dveSandDriftMask * 0.16); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(1.12, 1.04, 0.96), dveSandPocketMask * 0.08); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(1.14, 1.06, 0.9), dveHydrologyDeposition * 0.18); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.78, 0.9, 0.7), dveGrassSideMask * 0.12); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.82, 0.99, 0.75), dveGrassRimMask * 0.18); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.76, 0.9, 0.72) * dveEdgeDirBias, dveConnectedEdgeBlend * dveSoilConnectedMask * 0.1); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.92, 0.88, 0.8), (1.0 - dveConnectedPatch) * dveSoilConnectedMask * 0.08); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.71, 0.87, 0.64), dveMossMask * 0.14); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.68, 0.91, 0.62), dveMossDominanceZone * 0.08);"
     : ""
 }
 ${
   isFlora
-    ? "voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.74, 0.9, 0.7), dveGrassSideMask * 0.18); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.82, 0.99, 0.75), dveGrassRimMask * 0.18); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.82, 0.9, 0.72) * dveEdgeDirBias, dveFloraConnectedMask * 0.14); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.9, 1.02, 0.82), dveConnectedEdgeBlend * dveFloraConnectedMask * 0.08); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(1.04, 1.08, 0.96), dveSandDriftMask * 0.07);"
+    ? "voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.74, 0.9, 0.7), dveGrassSideMask * 0.18); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.82, 0.99, 0.75), dveGrassRimMask * 0.18); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.82, 0.9, 0.72) * dveEdgeDirBias, dveFloraConnectedMask * 0.14); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.9, 1.02, 0.82), dveConnectedEdgeBlend * dveFloraConnectedMask * 0.08); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(1.04, 1.08, 0.96), dveSandDriftMask * 0.07); voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(1.08, 1.05, 0.92), dveHydrologyDeposition * 0.08);"
     : ""
 }
 ${
@@ -704,8 +822,8 @@ ${
       const premiumAlbedoCode = enablePBRPremium
         ? /* glsl */ `
 float dvePremiumSlope = 1.0 - abs(dveNormalW.y);
-float dvePremiumMacro = dveFbm3(vPositionW * 0.082 + vec3(4.1, -1.2, 2.7));
-float dvePremiumBands = dveFbm3(vec3(vPositionW.x * 0.06, vPositionW.y * 0.18, vPositionW.z * 0.06));
+float dvePremiumMacro = dveFbm3(dveRotXZ(vPositionW, 1.05) * 0.082 + vec3(4.1, -1.2, 2.7));
+vec3 _bndP = dveRotXZ(vPositionW, 0.41); float dvePremiumBands = dveFbm3(vec3(_bndP.x * 0.06, vPositionW.y * 0.18, _bndP.z * 0.06));
 float dvePremiumEdge = dveEdgeMask(fract(vPositionW.xz * 0.22 + vPositionW.y * 0.04));
 voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(0.82, 0.8, 0.78), dvePremiumSlope * (0.08 + dvePremiumMacro * 0.06));
 voxelBaseColor.rgb = mix(voxelBaseColor.rgb, voxelBaseColor.rgb * vec3(1.08, 1.05, 1.02), dvePremiumBands * (0.04 + dvePremiumEdge * 0.05));
@@ -724,7 +842,7 @@ ${
         : "";
       const heightGradientAlbedoCode = enableSurfaceHeightGradient
         ? /* glsl */ `
-float dveHGBreakup = dveFbm3(vPositionW * 0.04 + vec3(7.3, -2.1, 5.5));
+float dveHGBreakup = dveFbm3(dveRotXZ(vPositionW, 0.83) * 0.04 + vec3(7.3, -2.1, 5.5));
 float dveHGMask = clamp(dveHeightNorm + dveHGBreakup * 0.18 - 0.08, 0.0, 1.0);
 vec3 dveWarmTint = vec3(1.06, 1.02, 0.94);
 vec3 dveCoolTint = vec3(0.94, 0.97, 1.05);
@@ -765,12 +883,18 @@ voxelBaseColor.rgb = mix(
         ? /* glsl */ `
 #ifdef  DVE_${this.name}
 vec3 dveNormalW = normalize(vNormalW);
-float dveWetnessMask = dveComputeWetness(dveNormalW, vPositionW);
-microSurface = mix(microSurface, 0.96, dveWetnessMask * 0.7);
+float dveHydrologyWetness = ${enableWorldContext ? "clamp(dveWorldContext.z, 0.0, 1.0)" : "0.0"};
+vec4 dveHydrologyFields = dveGetTerrainHydrologyFields(vPositionW, dveNormalW, dveHydrologyWetness, ${materialWetnessPorosity.toFixed(2)});
+float dveWetnessBase = clamp(dveComputeWetness(dveNormalW, vPositionW) + dveHydrologyFields.x * (0.22 + ${materialWetnessPorosity.toFixed(2)} * 0.24) + dveHydrologyFields.w * (0.10 + ${materialWetnessPorosity.toFixed(2)} * 0.08), 0.0, 1.0);
+float dveWetnessRetention = clamp(0.26 + ${materialWetnessPorosity.toFixed(2)} * 0.58 + dveHydrologyFields.z * 0.18 + dveHydrologyFields.w * 0.08, 0.0, 1.0);
+float dveFreshWetness = max(max(smoothstep(0.24, 0.78, dveWetnessBase), smoothstep(0.08, 0.52, dveHydrologyFields.x) * (0.72 + ${materialWetnessPorosity.toFixed(2)} * 0.18)), smoothstep(0.08, 0.58, dveHydrologyFields.y) * (0.68 + ${materialWetnessPorosity.toFixed(2)} * 0.22));
+float dveDryingWetness = clamp(dveWetnessBase * (0.42 + dveWetnessRetention * 0.42) * (1.0 - dveFreshWetness * 0.55) + dveHydrologyFields.x * (0.12 + dveWetnessRetention * 0.22) * (1.0 - dveFreshWetness * 0.45) + dveHydrologyFields.z * (0.18 + dveWetnessRetention * 0.14), 0.0, 1.0);
+float dveWetnessMask = clamp(dveFreshWetness * (0.58 + ${materialWetnessPorosity.toFixed(2)} * 0.18) + dveDryingWetness + dveHydrologyFields.x * (0.08 + ${materialWetnessPorosity.toFixed(2)} * 0.16) + dveHydrologyFields.w * (0.08 + ${materialWetnessPorosity.toFixed(2)} * 0.12), 0.0, 1.0);
+microSurface = mix(microSurface, mix(0.9, 0.98, dveFreshWetness), dveWetnessMask * mix(0.42, 0.82, ${materialWetnessPorosity.toFixed(2)}));
 surfaceReflectivityColor = mix(
   surfaceReflectivityColor,
   max(surfaceReflectivityColor, vec3(0.08, 0.08, 0.08)),
-  dveWetnessMask * 0.25
+  dveWetnessMask * mix(0.12, 0.32, ${materialWetnessPorosity.toFixed(2)})
 );
 #endif
 `
@@ -828,8 +952,15 @@ surfaceReflectivityColor *= mix(vec3(1.0), vec3(0.96), dveAmbientOcclusion * 0.0
       const wetnessFinalCode = enableWetness
         ? /* glsl */ `
 vec3 dveNormalW = normalize(vNormalW);
-float dveWetnessMask = dveComputeWetness(dveNormalW, vPositionW);
-finalDiffuse.rgb = mix(finalDiffuse.rgb, finalDiffuse.rgb * vec3(0.92, 0.94, 0.97), dveWetnessMask * 0.18);
+float dveHydrologyWetness = ${enableWorldContext ? "clamp(dveWorldContext.z, 0.0, 1.0)" : "0.0"};
+vec4 dveHydrologyFields = dveGetTerrainHydrologyFields(vPositionW, dveNormalW, dveHydrologyWetness, ${materialWetnessPorosity.toFixed(2)});
+float dveWetnessBase = clamp(dveComputeWetness(dveNormalW, vPositionW) + dveHydrologyFields.x * (0.22 + ${materialWetnessPorosity.toFixed(2)} * 0.24) + dveHydrologyFields.w * (0.10 + ${materialWetnessPorosity.toFixed(2)} * 0.08), 0.0, 1.0);
+float dveWetnessRetention = clamp(0.26 + ${materialWetnessPorosity.toFixed(2)} * 0.58 + dveHydrologyFields.z * 0.18 + dveHydrologyFields.w * 0.08, 0.0, 1.0);
+float dveFreshWetness = max(max(smoothstep(0.24, 0.78, dveWetnessBase), smoothstep(0.08, 0.52, dveHydrologyFields.x) * (0.72 + ${materialWetnessPorosity.toFixed(2)} * 0.18)), smoothstep(0.08, 0.58, dveHydrologyFields.y) * (0.68 + ${materialWetnessPorosity.toFixed(2)} * 0.22));
+float dveDryingWetness = clamp(dveWetnessBase * (0.42 + dveWetnessRetention * 0.42) * (1.0 - dveFreshWetness * 0.55) + dveHydrologyFields.x * (0.12 + dveWetnessRetention * 0.22) * (1.0 - dveFreshWetness * 0.45) + dveHydrologyFields.z * (0.18 + dveWetnessRetention * 0.14), 0.0, 1.0);
+float dveWetnessMask = clamp(dveFreshWetness * (0.58 + ${materialWetnessPorosity.toFixed(2)} * 0.18) + dveDryingWetness + dveHydrologyFields.x * (0.08 + ${materialWetnessPorosity.toFixed(2)} * 0.16) + dveHydrologyFields.w * (0.08 + ${materialWetnessPorosity.toFixed(2)} * 0.12), 0.0, 1.0);
+finalDiffuse.rgb = mix(finalDiffuse.rgb, finalDiffuse.rgb * vec3(0.9, 0.93, 0.98), dveWetnessMask * mix(0.08, 0.22, ${materialWetnessPorosity.toFixed(2)}));
+finalDiffuse.rgb = mix(finalDiffuse.rgb, finalDiffuse.rgb * vec3(0.95, 0.96, 0.98), dveDryingWetness * 0.08);
 `
         : "";
       const voxelLightFinalCode = /* glsl */ `
@@ -918,7 +1049,7 @@ ${importedMaterialAlbedoCode}
 ${unstableSurfaceContextLiftCode}
 // R15: Snow/ice accumulation on exposed top surfaces at altitude
 float dveSnowEligibility = dveSurfaceTop * smoothstep(0.55, 0.75, dveHeightNorm);
-float dveSnowNoise = dveFbm3(vPositionW * 0.15 + vec3(3.1, 0.0, 7.7));
+float dveSnowNoise = dveFbm3(dveRotXZ(vPositionW, 0.19) * 0.15 + vec3(3.1, 0.0, 7.7));
 float dveSnowMask = smoothstep(0.3, 0.7, dveSnowEligibility + dveSnowNoise * 0.2);
 vec3 dveSnowColor = vec3(0.92, 0.94, 0.98);
 voxelBaseColor.rgb = mix(voxelBaseColor.rgb, dveSnowColor, dveSnowMask * 0.85);
@@ -936,7 +1067,7 @@ ${importedMaterialMicroSurfaceCode}
   float dveSnowTop = smoothstep(0.45, 0.8, dveSnowNW.y);
   float dveSnowHN = clamp((vPositionW.y - 16.0) / 112.0, 0.0, 1.0);
   float dveSnowE = dveSnowTop * smoothstep(0.55, 0.75, dveSnowHN);
-  float dveSnowN2 = dveFbm3(vPositionW * 0.15 + vec3(3.1, 0.0, 7.7));
+  float dveSnowN2 = dveFbm3(dveRotXZ(vPositionW, 0.62) * 0.15 + vec3(3.1, 0.0, 7.7));
   float dveSnowM = smoothstep(0.3, 0.7, dveSnowE + dveSnowN2 * 0.2);
   microSurface = mix(microSurface, 0.88, dveSnowM * 0.7);
 }
@@ -961,7 +1092,14 @@ ${importedMaterialBeforeLightsCode}
   if (dot(dve_cross, dve_cross) > 1e-6) {
     vec3 dve_derivN = normalize(dve_cross);
     dve_derivN *= (dot(dve_derivN, normalW) >= 0.0) ? 1.0 : -1.0;
-    dve_edgeFactor = smoothstep(0.04, 0.55, 1.0 - abs(dot(normalize(normalW), dve_derivN)));
+    // Gate: suppress on near-flat faces to avoid per-triangle shading diamond pattern.
+    // On flat surfaces dFdx/dFdy differ between the two triangles of a quad,
+    // causing normalW to shift differently on each half → visible diagonal.
+    float dve_flatness = max(abs(dot(normalize(vNormalW), vec3(0.0, 1.0, 0.0))),
+                             max(abs(dot(normalize(vNormalW), vec3(1.0, 0.0, 0.0))),
+                                 abs(dot(normalize(vNormalW), vec3(0.0, 0.0, 1.0)))));
+    float dve_flatGate = smoothstep(0.92, 0.80, dve_flatness);
+    dve_edgeFactor = smoothstep(0.04, 0.55, 1.0 - abs(dot(normalize(normalW), dve_derivN))) * dve_flatGate;
     normalW = normalize(mix(normalW, dve_derivN, dve_edgeFactor * 0.72));
   }
   // T8 NOTE: surfaceReflectivityColor is not available at CUSTOM_FRAGMENT_BEFORE_LIGHTS

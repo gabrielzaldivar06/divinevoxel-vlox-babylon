@@ -1,4 +1,5 @@
 import { DVERenderer } from "@divinevoxel/vlox/Renderer/DVERenderer";
+import type { Observer } from "@babylonjs/core/Misc/observable";
 import { Scene } from "@babylonjs/core/scene";
 import { DVEBRMeshCuller } from "./DVEBRMeshCuller";
 import { DVEBRFOManager } from "./DVEBRFOManger";
@@ -11,6 +12,7 @@ import { SingleBufferVoxelScene } from "../Scene/SingleBuffer/SingleBufferVoxelS
 import { SceneOptions } from "../Scene/SceneOptions";
 import { DVEBRSectionMeshesMultiBuffer } from "../Scene/MultiBuffer/DVEBRSectionMeshesMultiBuffer";
 import { SplatManager } from "../Splats/SplatManager";
+import { getSceneWaterHybridBridge } from "../Water/DVEWaterHybridBridge.js";
 import { LODSectorTracker } from "../LOD/LODSectorTracker";
 import { MeshManager } from "@divinevoxel/vlox/Renderer/MeshManager";
 import { VoxelTagsRegister } from "@divinevoxel/vlox/Voxels/Data/VoxelTagsRegister";
@@ -55,6 +57,8 @@ export class DVEBabylonRenderer extends DVERenderer {
   sceneOptions: SceneOptions;
   splatManager: SplatManager | null = null;
   lodTracker: LODSectorTracker | null = null;
+  private _beforeRenderObservers: Observer<Scene>[] = [];
+  private _disposed = false;
 
   constructor(data: DVEBabylonRendererInitData) {
     super();
@@ -83,26 +87,48 @@ export class DVEBabylonRenderer extends DVERenderer {
       this.scene,
       EngineSettings.settings.rendererSettings.bufferMode
     );
+    this.scene.onDisposeObservable.addOnce(() => this.dispose());
     if (!DVEBabylonRenderer.instance) DVEBabylonRenderer.instance = this;
 
     return DVEBabylonRenderer.instance;
   }
 
   async init(dver: DivineVoxelEngineRender) {
+    const waterHybridBridge = getSceneWaterHybridBridge(this.scene);
+    this._beforeRenderObservers.push(this.scene.onBeforeRenderObservable.add(() => {
+      const camera = this.scene.activeCamera;
+      if (camera) {
+        const pos = camera.globalPosition;
+        waterHybridBridge.centerClipOn(pos.x, pos.z);
+      }
+      waterHybridBridge.advance(this.engine.getDeltaTime() / 1000);
+    }));
+
     if (this.sectorMeshes instanceof DVEBRSectionMeshesSingleBuffer) {
       const sectorMeshes = this.sectorMeshes as DVEBRSectionMeshesSingleBuffer;
       sectorMeshes.voxelScene.init(this.scene);
 
-      this.scene.registerBeforeRender(() => {
+      this._beforeRenderObservers.push(this.scene.onBeforeRenderObservable.add(() => {
         sectorMeshes.voxelScene.beforRender();
-      });
+      }));
     }
 
     // Initialize SplatManager when dissolutionSplats is enabled
     if (EngineSettings.settings.terrain.dissolutionSplats) {
       this.splatManager = new SplatManager(this.scene);
 
-      MeshManager.onSectionUpdated = (sectorKey, meshes) => {
+      MeshManager.onSectionUpdated = (sectorKey, meshes, waterUpdate) => {
+        if (waterUpdate) {
+          waterHybridBridge.updateFromSectionGPUData(
+            waterUpdate.gpuData,
+            waterUpdate.boundsX,
+            waterUpdate.boundsZ,
+            waterUpdate.paddedBoundsX,
+            waterUpdate.paddedBoundsZ,
+            waterUpdate.originX,
+            waterUpdate.originZ,
+          );
+        }
         this.splatManager!.processSectionMeshes(sectorKey, meshes);
       };
 
@@ -142,16 +168,50 @@ export class DVEBabylonRenderer extends DVERenderer {
       };
     }
 
+    if (!EngineSettings.settings.terrain.dissolutionSplats) {
+      MeshManager.onSectionUpdated = (_sectorKey, _meshes, waterUpdate) => {
+        if (!waterUpdate) return;
+        waterHybridBridge.updateFromSectionGPUData(
+          waterUpdate.gpuData,
+          waterUpdate.boundsX,
+          waterUpdate.boundsZ,
+          waterUpdate.paddedBoundsX,
+          waterUpdate.paddedBoundsZ,
+          waterUpdate.originX,
+          waterUpdate.originZ,
+        );
+      };
+    }
+
     // Initialize LODSectorTracker when lodMorph is enabled
     if (EngineSettings.settings.terrain.lodMorph) {
       this.lodTracker = new LODSectorTracker();
 
-      this.scene.registerBeforeRender(() => {
+      this._beforeRenderObservers.push(this.scene.onBeforeRenderObservable.add(() => {
         const camera = this.scene.activeCamera;
         if (!camera || !this.lodTracker) return;
         const pos = camera.globalPosition;
         this.lodTracker.update(pos.x, pos.y, pos.z);
-      });
+      }));
+    }
+  }
+
+  dispose() {
+    if (this._disposed) return;
+    this._disposed = true;
+    for (const observer of this._beforeRenderObservers) {
+      this.scene.onBeforeRenderObservable.remove(observer);
+    }
+    this._beforeRenderObservers.length = 0;
+    this.splatManager?.dispose();
+    this.splatManager = null;
+    this.lodTracker?.dispose();
+    this.lodTracker = null;
+    if (MeshManager.onSectionUpdated) MeshManager.onSectionUpdated = null;
+    if (MeshManager.onSectorRemoved) MeshManager.onSectorRemoved = null;
+    if (MeshManager.onVoxelErased) MeshManager.onVoxelErased = null;
+    if (DVEBabylonRenderer.instance === this) {
+      DVEBabylonRenderer.instance = null as any;
     }
   }
 }

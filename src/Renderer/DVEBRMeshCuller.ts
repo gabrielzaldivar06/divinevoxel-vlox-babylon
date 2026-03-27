@@ -9,8 +9,8 @@ import { classifyTerrainMaterial } from "../Matereials/PBR/MaterialFamilyProfile
 const min = new Vector3();
 const max = new Vector3(16, 16, 16);
 const boundingBox = new BoundingBox(min, max);
-const addMeshes: Mesh[] = [];
-const removedMeshes: Mesh[] = [];
+const addMeshes = new Set<Mesh>();
+const removedMeshes = new Set<Mesh>();
 
 /** Draw-call budget enforcement — tracks consecutive over-budget frames. */
 let _budgetWarningCooldown = 0;
@@ -138,7 +138,7 @@ function disableSectorMeshes(sector: any) {
     for (const [, mesh] of section.meshes as Map<string, Mesh>) {
       if (mesh.isEnabled()) {
         mesh.setEnabled(false);
-        removedMeshes.push(mesh);
+        removedMeshes.add(mesh);
       }
     }
   }
@@ -229,7 +229,7 @@ function CullSectors(scene: Scene) {
           if (exceedsTransitionGeometryDistance(mesh, camera.globalPosition)) {
             if (mesh.isEnabled()) {
               mesh.setEnabled(false);
-              removedMeshes.push(mesh);
+              removedMeshes.add(mesh);
             }
             continue;
           }
@@ -241,12 +241,12 @@ function CullSectors(scene: Scene) {
             if (!mesh.isEnabled()) {
               mesh.computeWorldMatrix(true);
               mesh.setEnabled(true);
-              addMeshes.push(mesh);
+              addMeshes.add(mesh);
             }
           } else {
             if (mesh.isEnabled()) {
               mesh.setEnabled(false);
-              removedMeshes.push(mesh);
+              removedMeshes.add(mesh);
             }
           }
         }
@@ -255,7 +255,7 @@ function CullSectors(scene: Scene) {
   }
 
   for (let i = scene.meshes.length - 1; i > -1; i--) {
-    if (removedMeshes.includes(scene.meshes[i] as Mesh)) {
+    if (removedMeshes.has(scene.meshes[i] as Mesh)) {
       scene.meshes.splice(i, 1);
     }
   }
@@ -264,8 +264,8 @@ function CullSectors(scene: Scene) {
       scene.meshes.push(mesh);
     }
   }
-  addMeshes.length = 0;
-  removedMeshes.length = 0;
+  addMeshes.clear();
+  removedMeshes.clear();
 
   // Draw-call budget enforcement
   const budget = EngineSettings.settings.terrain.maxSceneMeshes;

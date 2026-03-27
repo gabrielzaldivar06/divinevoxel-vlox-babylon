@@ -13,6 +13,14 @@ type MeshBufferEntry = { buffer: Buffer; floatCount: number };
 export class DVEBRVoxelMesh {
   /** Map of mesh → its underlying GPU buffer (for fast in-place updates). */
   private static _meshBuffers = new WeakMap<Mesh, MeshBufferEntry>();
+  private static readonly _maxPoolEntriesPerSize = 2;
+  /**
+   * Global cap on total pooled GPU buffers across all sizes.
+   * Prevents unbounded accumulation when mesh sizes change continuously
+   * (e.g., growing liquid bodies that never reuse an exact old size).
+   */
+  private static readonly _maxTotalPooledBuffers = 24;
+  private static _totalPooledBuffers = 0;
 
   /**
    * Buffer pool keyed by vertex float count.
@@ -21,15 +29,76 @@ export class DVEBRVoxelMesh {
    */
   private static _bufferPool = new Map<number, Buffer[]>();
 
+  private static _storeBufferInPool(entry: MeshBufferEntry) {
+    // Clear CPU mirror so hydrology churn does not retain large Float32Arrays.
+    (entry.buffer as any)._data = null;
+
+    // Enforce global cap first: continuously-growing meshes produce unique sizes
+    // on every rebuild and would otherwise accumulate unboundedly in the pool.
+    if (this._totalPooledBuffers >= this._maxTotalPooledBuffers) {
+      entry.buffer.dispose();
+      return;
+    }
+
+    let pool = this._bufferPool.get(entry.floatCount);
+    if (!pool) {
+      pool = [];
+      this._bufferPool.set(entry.floatCount, pool);
+    }
+
+    if (pool.length >= this._maxPoolEntriesPerSize) {
+      entry.buffer.dispose();
+      return;
+    }
+
+    pool.push(entry.buffer);
+    this._totalPooledBuffers++;
+  }
+
   private static _acquireBuffer(engine: Engine, vertices: Float32Array): Buffer {
     const floatCount = vertices.length;
     const pool = this._bufferPool.get(floatCount);
     const pooled = pool?.pop();
     if (pooled) {
+      this._totalPooledBuffers--;
       pooled.update(vertices);
       return pooled;
     }
     return new Buffer(engine, vertices, true);
+  }
+
+  private static _setGeometryVertexBuffer(
+    geometry: any,
+    vertexBuffer: VertexBuffer,
+    totalVertices?: number
+  ) {
+    const kind = vertexBuffer.getKind();
+    const existing = geometry._vertexBuffers?.[kind];
+    if (existing) {
+      existing.dispose();
+    }
+
+    // Do NOT call _buffer._increaseReferences() here.
+    // Babylon's reference counter starts at 1 (set by createDynamicVertexBuffer).
+    // Calling _increaseReferences() 13 times (once per attribute kind) raises it to
+    // 13, so a single buffer.dispose() only decrements to 12 — the GPU buffer is
+    // never freed.  Keeping references = 1 means pool eviction via buffer.dispose()
+    // reaches 0 and calls gl.deleteBuffer() correctly.
+    geometry._vertexBuffers[kind] = vertexBuffer;
+
+    if (kind === VertexBuffer.PositionKind) {
+      geometry._totalVertices = totalVertices ?? vertexBuffer._maxVerticesCount;
+      geometry._resetPointsArrayCache?.();
+
+      const meshes: Mesh[] = geometry._meshes || [];
+      for (const mesh of meshes) {
+        mesh._createGlobalSubMesh(mesh.isUnIndexed);
+        mesh.computeWorldMatrix(true);
+        mesh.synchronizeInstances();
+      }
+    }
+
+    geometry._notifyUpdate?.(kind);
   }
 
   /**
@@ -39,12 +108,7 @@ export class DVEBRVoxelMesh {
   static releaseBuffer(mesh: Mesh) {
     const entry = this._meshBuffers.get(mesh);
     if (!entry) return;
-    let pool = this._bufferPool.get(entry.floatCount);
-    if (!pool) {
-      pool = [];
-      this._bufferPool.set(entry.floatCount, pool);
-    }
-    pool.push(entry.buffer);
+    this._storeBufferInPool(entry);
     this._meshBuffers.delete(mesh);
   }
 
@@ -68,6 +132,7 @@ export class DVEBRVoxelMesh {
     indices: Uint16Array<any> | Uint32Array<any>
   ) {
     const floatCount = vertices.length;
+    const totalVertices = floatCount / VoxelMeshVertexStructCursor.VertexFloatSize;
     const existing = this._meshBuffers.get(mesh);
 
     // Fast path: same buffer size — just push new data to GPU, no VertexBuffer re-registration.
@@ -80,16 +145,15 @@ export class DVEBRVoxelMesh {
 
     // Return old buffer to pool before replacing it
     if (existing) {
-      let pool = this._bufferPool.get(existing.floatCount);
-      if (!pool) { pool = []; this._bufferPool.set(existing.floatCount, pool); }
-      pool.push(existing.buffer);
+      this._storeBufferInPool(existing);
     }
 
     // Slow path: acquire (or create) a buffer and re-register all VertexBuffers.
     const buffer = this._acquireBuffer(engine, vertices);
     this._meshBuffers.set(mesh, { buffer, floatCount });
     const geo = mesh.geometry ? mesh.geometry : mesh;
-    geo.setVerticesBuffer(
+    this._setGeometryVertexBuffer(
+      geo,
       new VertexBuffer(
         engine,
         buffer,
@@ -100,9 +164,11 @@ export class DVEBRVoxelMesh {
         undefined,
         VoxelMeshVertexStructCursor.PositionOffset,
         3
-      )
+      ),
+      totalVertices
     );
-    geo.setVerticesBuffer(
+    this._setGeometryVertexBuffer(
+      geo,
       new VertexBuffer(
         engine,
         buffer,
@@ -115,7 +181,8 @@ export class DVEBRVoxelMesh {
         3
       )
     );
-    geo.setVerticesBuffer(
+    this._setGeometryVertexBuffer(
+      geo,
       new VertexBuffer(
         engine,
         buffer,
@@ -130,7 +197,8 @@ export class DVEBRVoxelMesh {
         3
       )
     );
-    geo.setVerticesBuffer(
+    this._setGeometryVertexBuffer(
+      geo,
       new VertexBuffer(
         engine,
         buffer,
@@ -143,7 +211,8 @@ export class DVEBRVoxelMesh {
         2
       )
     );
-    geo.setVerticesBuffer(
+    this._setGeometryVertexBuffer(
+      geo,
       new VertexBuffer(
         engine,
         buffer,
@@ -156,7 +225,8 @@ export class DVEBRVoxelMesh {
         3
       )
     );
-    geo.setVerticesBuffer(
+    this._setGeometryVertexBuffer(
+      geo,
       new VertexBuffer(
         engine,
         buffer,
@@ -169,7 +239,8 @@ export class DVEBRVoxelMesh {
         4
       )
     );
-    geo.setVerticesBuffer(
+    this._setGeometryVertexBuffer(
+      geo,
       new VertexBuffer(
         engine,
         buffer,
@@ -183,28 +254,32 @@ export class DVEBRVoxelMesh {
       )
     );
     // Dissolution / subdivision data — packed into padding slots and tail floats
-    geo.setVerticesBuffer(
+    this._setGeometryVertexBuffer(
+      geo,
       new VertexBuffer(
         engine, buffer, "dissolutionProximity", false, undefined,
         VoxelMeshVertexStructCursor.VertexFloatSize, undefined,
         VoxelMeshVertexStructCursor.DissolutionProximityOffset, 1
       )
     );
-    geo.setVerticesBuffer(
+    this._setGeometryVertexBuffer(
+      geo,
       new VertexBuffer(
         engine, buffer, "pullStrength", false, undefined,
         VoxelMeshVertexStructCursor.VertexFloatSize, undefined,
         VoxelMeshVertexStructCursor.PullStrengthOffset, 1
       )
     );
-    geo.setVerticesBuffer(
+    this._setGeometryVertexBuffer(
+      geo,
       new VertexBuffer(
         engine, buffer, "subdivLevel", false, undefined,
         VoxelMeshVertexStructCursor.VertexFloatSize, undefined,
         VoxelMeshVertexStructCursor.SubdivLevelOffset, 1
       )
     );
-    geo.setVerticesBuffer(
+    this._setGeometryVertexBuffer(
+      geo,
       new VertexBuffer(
         engine, buffer, "pullDirectionBias", false, undefined,
         VoxelMeshVertexStructCursor.VertexFloatSize, undefined,
@@ -212,18 +287,46 @@ export class DVEBRVoxelMesh {
       )
     );
     // R06: Vertex-baked AO — tail float 0
-    geo.setVerticesBuffer(
+    this._setGeometryVertexBuffer(
+      geo,
       new VertexBuffer(
         engine, buffer, "subdivAO", false, undefined,
         VoxelMeshVertexStructCursor.VertexFloatSize, undefined,
         VoxelMeshVertexStructCursor.SubdivAOOffset, 1
       )
     );
-    geo.setVerticesBuffer(
+    this._setGeometryVertexBuffer(
+      geo,
       new VertexBuffer(
         engine, buffer, "phNormalized", false, undefined,
         VoxelMeshVertexStructCursor.VertexFloatSize, undefined,
         VoxelMeshVertexStructCursor.PhNormalizedOffset, 1
+      )
+    );
+    // Phase 3 / Phase 4 — water surface derivative fields at slots 28-30.
+    // Non-water meshes leave these floats as zero (safe: shader guards on dveStableWaterSurfaceY).
+    this._setGeometryVertexBuffer(
+      geo,
+      new VertexBuffer(
+        engine, buffer, "waterGradientX", false, undefined,
+        VoxelMeshVertexStructCursor.VertexFloatSize, undefined,
+        VoxelMeshVertexStructCursor.WaterGradientXOffset, 1
+      )
+    );
+    this._setGeometryVertexBuffer(
+      geo,
+      new VertexBuffer(
+        engine, buffer, "waterGradientZ", false, undefined,
+        VoxelMeshVertexStructCursor.VertexFloatSize, undefined,
+        VoxelMeshVertexStructCursor.WaterGradientZOffset, 1
+      )
+    );
+    this._setGeometryVertexBuffer(
+      geo,
+      new VertexBuffer(
+        engine, buffer, "waterCurvature", false, undefined,
+        VoxelMeshVertexStructCursor.VertexFloatSize, undefined,
+        VoxelMeshVertexStructCursor.WaterCurvatureOffset, 1
       )
     );
     geo.setIndices(indices);

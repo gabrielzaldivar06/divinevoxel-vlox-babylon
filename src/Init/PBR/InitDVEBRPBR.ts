@@ -35,6 +35,7 @@ import {
   applyActiveTerrainMaterialProfiles,
   classifyTerrainMaterial,
 } from "../../Matereials/PBR/MaterialFamilyProfiles";
+import { getSceneWaterHybridBridge } from "../../Water/DVEWaterHybridBridge.js";
 export type DVEBRPBRData = DVEBRDefaultMaterialBaseData & {
   getProgress?: (progress: WorkItemProgress) => void;
 };
@@ -106,7 +107,8 @@ const RENDERER_PRESET_CONFIGS: Readonly<Record<string, RendererPresetCfg>> = {
 };
 
 const WATER_NORMAL_ASSET_PATH = "assets/water/water-001-normal.jpg";
-const WATER_FOAM_ASSET_PATH = "assets/water/water-droplets-001-mask.jpg";
+const WATER_FOAM_BODY_ASSET_PATH = "assets/water/foam-body-001.jpg";
+const WATER_FOAM_BREAKER_ASSET_PATH = "assets/water/foam-breaker-003.jpg";
 const WATER_HDRI_ASSET_PATH = "assets/skybox-blouberg-sunrise-2.hdr";
 
 function createLinearWaterTexture(scene: Scene, path: string) {
@@ -822,15 +824,23 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
     substances: initData.substances,
     afterCreate: async (_renderer, materials) => {
       const waterNormalTexture = createLinearWaterTexture(scene, WATER_NORMAL_ASSET_PATH);
-      const waterFoamTexture = createLinearWaterTexture(scene, WATER_FOAM_ASSET_PATH);
+      const waterFoamBodyTexture = createLinearWaterTexture(scene, WATER_FOAM_BODY_ASSET_PATH);
+      const waterFoamBreakerTexture = createLinearWaterTexture(scene, WATER_FOAM_BREAKER_ASSET_PATH);
+      const waterHybridBridge = getSceneWaterHybridBridge(scene);
       scene.onDisposeObservable.addOnce(() => {
         waterNormalTexture.dispose();
-        waterFoamTexture.dispose();
+        waterFoamBodyTexture.dispose();
+        waterFoamBreakerTexture.dispose();
+        waterHybridBridge.dispose();
       });
       for (const material of materials) {
+        material.setTexture("dve_water_hybrid_base", waterHybridBridge.getBaseTexture());
+        material.setTexture("dve_water_hybrid_dynamic", waterHybridBridge.getDynamicTexture());
+        material.setTexture("dve_water_hybrid_flow", waterHybridBridge.getFlowTexture());
         if (!classifyTerrainMaterial(material.id).isLiquid) continue;
         material.setTexture("dve_water_normal", waterNormalTexture);
-        material.setTexture("dve_water_foam", waterFoamTexture);
+        material.setTexture("dve_water_foam_body", waterFoamBodyTexture);
+        material.setTexture("dve_water_foam_breaker", waterFoamBreakerTexture);
       }
 
       scene.ambientColor.set(1, 1, 1);
