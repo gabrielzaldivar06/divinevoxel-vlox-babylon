@@ -159,6 +159,20 @@ export class DVEBabylonRenderer extends DVERenderer {
       const activeShallowKeys = new Set(activeSections.keys());
       for (const [key, grid] of activeSections) {
         const gpuData = packShallowWaterSection(grid);
+        this.shallowSectionRenderer?.updateSection(key, {
+          originX: gpuData.originX,
+          originZ: gpuData.originZ,
+          boundsX: gpuData.sizeX,
+          boundsZ: gpuData.sizeZ,
+          gpuData,
+        });
+        updateEditorShallowSurfaceSection(
+          gpuData.originX,
+          gpuData.originZ,
+          gpuData.sizeX,
+          gpuData.sizeZ,
+          gpuData,
+        );
         this.shallowWaterRenderer?.updateSection(key, gpuData);
         waterHybridBridge.injectShallowSection(
           gpuData.originX,
@@ -190,9 +204,8 @@ export class DVEBabylonRenderer extends DVERenderer {
         waterUpdate.originZ,
         waterUpdate.boundsX,
         waterUpdate.boundsZ,
-        waterUpdate.gpuData,
+        null,
       );
-      this.shallowSectionRenderer?.updateSection(sectorKey, waterUpdate);
       markEditorShallowSurfaceConnectedByLargeBody(
         waterUpdate.originX,
         waterUpdate.originZ,
