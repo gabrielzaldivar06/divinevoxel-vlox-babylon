@@ -254,10 +254,15 @@ function CullSectors(scene: Scene) {
     }
   }
 
-  for (let i = scene.meshes.length - 1; i > -1; i--) {
-    if (removedMeshes.has(scene.meshes[i] as Mesh)) {
-      scene.meshes.splice(i, 1);
+  // O(n) compaction: write surviving meshes in-place, then trim.
+  if (removedMeshes.size > 0) {
+    let write = 0;
+    for (let read = 0; read < scene.meshes.length; read++) {
+      if (!removedMeshes.has(scene.meshes[read] as Mesh)) {
+        scene.meshes[write++] = scene.meshes[read];
+      }
     }
+    scene.meshes.length = write;
   }
   for (const mesh of addMeshes) {
     if (!scene.meshes.includes(mesh)) {

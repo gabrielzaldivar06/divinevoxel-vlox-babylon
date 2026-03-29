@@ -100,11 +100,11 @@ export class DVEBRSectionMeshesMultiBuffer extends DVESectionMeshes {
         newMesh.doNotSyncBoundingInfo = true;
         newMesh.setEnabled(false);
         newMesh.freezeWorldMatrix();
-        for (let i = this.scene.meshes.length - 1; i > -1; i--) {
-          if (this.scene.meshes[i] == newMesh) {
-            this.scene.meshes.splice(i, 1);
-            break;
-          }
+        // Remove from scene.meshes — the culler manages scene membership.
+        // Use indexOf for O(1) break instead of backwards scan.
+        const idx = this.scene.meshes.indexOf(newMesh);
+        if (idx !== -1) {
+          this.scene.meshes.splice(idx, 1);
         }
         mesh = newMesh;
       }

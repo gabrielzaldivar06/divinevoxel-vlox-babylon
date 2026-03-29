@@ -73,9 +73,9 @@ const RENDERER_PRESET_CONFIGS: Readonly<Record<string, RendererPresetCfg>> = {
   },
   "pbr-premium-v2": {
     environmentIntensity: 0.68, grainIntensity: 16, bilateralStrength: 0.65,
-    depthOfField: { enabled: true },
+    depthOfField: { enabled: false },
     ssr:  { samples: 4, strength: 0.8, roughnessFactor: 0.1, step: 3, maxSteps: 50, maxDistance: 128, blurDownsample: 2, thickness: 0.98 },
-    ssao: { totalStrength: 0.9, samples: 16, radius: 2.2 },
+    ssao: { totalStrength: 0.9, samples: 8, radius: 2.2 },
   },
   "optimum-inspired": {
     environmentIntensity: 0.62, grainIntensity: 12, bilateralStrength: 0,
@@ -675,6 +675,14 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
   if (initData.getProgress) initData.getProgress(progress);
   progress.startTask("Init PBR Renderer");
   const scene = initData.scene;
+
+  // R4: Scene-level CPU optimizations — disable unused subsystems.
+  scene.skipPointerMovePicking = true;
+  scene.lensFlaresEnabled = false;
+  scene.spritesEnabled = false;
+  scene.probesEnabled = false;
+  scene.proceduralTexturesEnabled = false;
+
   const terrain = EngineSettings.settings.terrain;
   const isPBRPremium = terrain.benchmarkPreset === "pbr-premium";
   const isPBRPremiumV2 = terrain.benchmarkPreset === "pbr-premium-v2";
@@ -709,9 +717,9 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
   pipeline.bloomEnabled = true;
   pipeline.bloomThreshold = 0.52;
   // Bloom shape: wider kernel for softer atmospheric glow (cinematic haze)
-  pipeline.bloomKernel = 96;
+  pipeline.bloomKernel = 64;
   pipeline.bloomWeight = 0.72;
-  pipeline.bloomScale  = 0.9;
+  pipeline.bloomScale  = 0.5;
   // Global stability pass:
   // The previous sharpen stage was amplifying sub-pixel normal/reflection aliasing
   // into long diagonal moire bands over both water and terrain at distance.
@@ -772,8 +780,8 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
 
   // R20: SSAO2 — contact shadows for voxel geometry
   const ssao = new SSAO2RenderingPipeline("ssao", initData.scene, {
-    ssaoRatio: 0.5,
-    blurRatio: 0.5,
+    ssaoRatio: 0.25,
+    blurRatio: 0.25,
   }, [activeCamera]);
   ssao.radius = presetCfg.ssao.radius;  // T5: per-preset radius; premium=2.2–2.5 for chamfer visual effect
   ssao.totalStrength = presetCfg.ssao.totalStrength;
@@ -887,8 +895,13 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
       // the water to appear uniformly flat with no solar sparkle.
       sunLight.specular.set(1, 0.95, 0.88);
 
-      // R14: Enable Scene Depth Renderer for soft liquid intersection and wet shores
-      scene.enableDepthRenderer(scene.activeCamera || undefined, false, true);
+      // R14: Enable Scene Depth Renderer for soft liquid intersection and wet shores.
+      // Skip for pbr-premium-v2: the extra full-scene depth pass costs ~474 draw calls
+      // (≈30% of total). The water plugin falls back to a 1×1 white texture — soft
+      // intersection at shore edges is lost but the perf gain is substantial.
+      if (!isPBRPremiumV2) {
+        scene.enableDepthRenderer(scene.activeCamera || undefined, false, true);
+      }
 
       if (isMaterialImport) {
         // Imported material arrays still destabilize the shadow compile path here.
@@ -898,9 +911,9 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
         // R13: Cascaded Shadow Generator — 2 cascades (near + far) for quality gradient + PCF softening.
         // Performance notes: numCascades=2 saves ~20% draw calls vs 3; autoCalcDepthBounds=false avoids
         // per-frame GPU readback; stabilizeCascades=true reduces cascade-boundary shimmer on movement.
-        const shadowMapSize = 2048;
+        const shadowMapSize = 1024;
         const shadows = new CascadedShadowGenerator(shadowMapSize, sunLight);
-        shadows.numCascades = 3;
+        shadows.numCascades = 2;
         shadows.lambda = 0.72;         // less aggressive far-cascade stretch reduces large diagonal banding
         shadows.stabilizeCascades = true;
         shadows.usePercentageCloserFiltering = true;
@@ -920,7 +933,13 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
         // without cleanup, each reload accumulates N duplicate observers → N shadow draw calls per chunk.
         const onMeshAdded = scene.onNewMeshAddedObservable.add((mesh) => {
           if (mesh.name === "") {
-            shadows.addShadowCaster(mesh);
+            // Only add non-liquid meshes as shadow casters — liquid meshes
+            // don't cast meaningful shadows and double GPU shadow-pass cost.
+            const baseMat = mesh.metadata?.baseMaterialId || "";
+            const isLiquid = classifyTerrainMaterial(baseMat).isLiquid;
+            if (!isLiquid) {
+              shadows.addShadowCaster(mesh);
+            }
             mesh.receiveShadows = true;
           }
         });
@@ -969,6 +988,36 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
       applyTerrainPhase1MaterialProfile(materials);
       scheduleTerrainPhase1MaterialProfileRefresh(scene, materials);
       scheduleTerrainPhase1PostRenderWarmup(scene, materials);
+
+      // R15: After warmup frames, freeze materials and world matrices to skip
+      // R15 – Freeze static world matrices and disable shadow re-rendering after
+      // the scene settles. Material freeze is NOT safe because water/dissolution
+      // plugins need per-frame uniform updates (time, camera, flow textures).
+      if (isPBRPremiumV2) {
+        let freezeFrame = 0;
+        const freezeObs = scene.onBeforeRenderObservable.add(() => {
+          freezeFrame++;
+          if (freezeFrame < 60) return;  // wait for scene to settle
+          scene.onBeforeRenderObservable.remove(freezeObs);
+
+          // Freeze world matrices on static meshes (all voxel terrain/liquid)
+          for (const mesh of scene.meshes) {
+            if (!mesh.skeleton) {
+              mesh.freezeWorldMatrix();
+            }
+          }
+
+          // Disable shadow rendering — terrain is static
+          for (const light of scene.lights) {
+            if (light.getShadowGenerator?.()) {
+              light.shadowEnabled = false;
+            }
+          }
+
+          // Block material dirty checks — materials are stable after warmup
+          scene.blockMaterialDirtyMechanism = true;
+        });
+      }
       LevelParticles.startNatureAmbient(
         isPBRPremium || isPBRPremiumV2 || isUniversalisInspired || isDefinitivo ? "premium" : "lush"
       );

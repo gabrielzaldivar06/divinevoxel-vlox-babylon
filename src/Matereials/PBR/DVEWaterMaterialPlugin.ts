@@ -108,6 +108,10 @@ export class DVEWaterMaterialPlugin extends MaterialPluginBase {
       ? Math.max(0, Math.min(1, opacity))
       : 0;
     switch (mode) {
+      case "emitters":
+        return [9, clampedOpacity > 0 ? clampedOpacity : 1, 0, 0] as const;
+      case "originmask":
+        return [8, clampedOpacity > 0 ? clampedOpacity : 1, 0, 0] as const;
       case "ownership":
         return [1, clampedOpacity, 0, 0] as const;
       case "composition":
@@ -302,6 +306,36 @@ vec2 dveGetWaterPatternWarp(vec2 positionXZ) {
   float warpX = dveValueNoise(mat2(0.9171, -0.3986, 0.3986, 0.9171) * positionXZ * 0.018 + vec2(31.7, -19.3)) * 2.0 - 1.0;
   float warpY = dveValueNoise(mat2(0.6822, -0.7312, 0.7312, 0.6822) * positionXZ * 0.016 + vec2(-8.4, 27.6)) * 2.0 - 1.0;
   return vec2(warpX, warpY) * 0.5;
+}
+
+// ── Sprint 11: Grid-dissolution orbital warp ──────────────────────
+// Gerstner-inspired world-space displacement that breaks integer-grid
+// vertex regularity on open water. Uses rotated noise octaves to avoid
+// creating new visible patterns. Amplitude scales with shore distance
+// (open water = full displacement, near shore = zero).
+vec3 dveGetGridDissolutionWarp(vec2 worldXZ, float shoreDistNorm, float time) {
+  // Skip near shore to preserve coastline fidelity
+  float openWaterMask = smoothstep(0.15, 0.55, shoreDistNorm);
+  if (openWaterMask < 0.001) return vec3(0.0);
+  
+  // Three rotated octaves at non-harmonic frequencies to avoid periodicity
+  vec2 p1 = mat2(0.8660, -0.5, 0.5, 0.8660) * worldXZ * 0.073 + vec2(time * 0.021, -time * 0.013);
+  vec2 p2 = mat2(0.7071, 0.7071, -0.7071, 0.7071) * worldXZ * 0.041 + vec2(-time * 0.017, time * 0.009);
+  vec2 p3 = mat2(0.9397, -0.342, 0.342, 0.9397) * worldXZ * 0.107 + vec2(time * 0.011, time * 0.023);
+  
+  float n1 = dveValueNoise(p1) - 0.5;
+  float n2 = dveValueNoise(p2) - 0.5;
+  float n3 = dveValueNoise(p3) - 0.5;
+  
+  // Lateral XZ displacement — larger amplitude breaks grid regularity
+  float lateralAmp = openWaterMask * 0.45;
+  float dx = (n1 * 0.55 + n2 * 0.30 + n3 * 0.15) * lateralAmp;
+  float dz = (n2 * 0.50 + n3 * 0.35 + n1 * 0.15) * lateralAmp;
+  
+  // Vertical component — gentle swell that correlates with lateral motion
+  float dy = (n1 * 0.4 + n2 * 0.35 + n3 * 0.25) * openWaterMask * 0.08;
+  
+  return vec3(dx, dy, dz);
 }
 
 float dveGetSoftWaterContextValue(float value, float macroVariation, float detailSample, float strength) {
@@ -580,16 +614,36 @@ float dveGetFlowStrength(vec4 flowData) {
 }
 
 float dveGetPackedWaterClassValue(vec4 flowData) {
-  float packed = clamp(flowData.w, 0.0, 1.0);
+  float packed = fract(max(flowData.w, 0.0));
   if (packed < 0.33) return 0.16;
   if (packed < 0.67) return 0.5;
   return 0.84;
 }
 
 float dveGetWaterTurbidity(vec4 flowData) {
-  float packed = clamp(flowData.w, 0.0, 1.0);
+  float packed = fract(max(flowData.w, 0.0));
   float classCenter = dveGetPackedWaterClassValue(flowData);
   return clamp((packed - (classCenter - 0.09)) / 0.18, 0.0, 1.0);
+}
+
+float dveGetEmitterDebugId(vec4 flowData) {
+  float packed = floor(max(flowData.w, 0.0) + 0.001);
+  return mod(packed, 10.0);
+}
+
+float dveGetOriginDebugId(vec4 flowData) {
+  float packed = floor(max(flowData.w, 0.0) + 0.001);
+  return floor(packed / 10.0);
+}
+
+vec3 dveGetEmitterDebugColor(float emitterId) {
+  if (emitterId < 0.5) return vec3(0.1, 0.1, 0.1);
+  if (emitterId < 1.5) return vec3(0.08, 0.78, 0.94);
+  if (emitterId < 2.5) return vec3(0.98, 0.84, 0.18);
+  if (emitterId < 3.5) return vec3(0.22, 0.9, 0.32);
+  if (emitterId < 4.5) return vec3(0.9, 0.18, 0.86);
+  if (emitterId < 5.5) return vec3(0.95, 0.26, 0.22);
+  return vec3(1.0, 1.0, 1.0);
 }
 
 vec3 dveGetWaterClassWeights(float classValue) {
@@ -756,12 +810,16 @@ vec4 dveGetVertexWaveDisplacement(
   float pn1 = (dveValueNoise(domain * 0.034 + vec2(-t * 0.013, t * 0.011) + vec2(23.4, -11.7)) * 2.0 - 1.0) * 4.8;
   float pn2 = (dveValueNoise(domain * 0.112 + vec2(t * 0.041, t * 0.029) + vec2(-8.7, 17.3)) * 2.0 - 1.0) * 1.2;
   float phaseBreak = pn0 + pn1 + pn2;
-  float phaseA = dot(domain, dir0) * 0.2472 + t * 0.62 + phaseBreak * 0.22;
-  float phaseB = dot(domain, dir1) * 0.3183 - t * 0.41 + phaseBreak * 0.17;
-  float phaseC = dot(domain, dir2) * 0.8507 + t * 1.18 + phaseBreak * 0.11;
-  float phaseD = dot(domain, dir3) * 1.2732 - t * 0.96 + phaseBreak * 0.08;
-  float phaseE = dot(domain, dir4) * 2.2361 + t * 2.38 + phaseBreak * 0.06;
-  float phaseF = dot(domain, dir5) * 2.7183 - t * 1.97 + phaseBreak * 0.04;
+  // Ocean-realistic frequency hierarchy:
+  // A,B = dominant swell (very long wavelength ~50-80m, slow)
+  // C,D = secondary swell (medium ~20-30m)
+  // E,F = wind chop (short ~5-8m, fast)
+  float phaseA = dot(domain, dir0) * 0.09  + t * 0.35 + phaseBreak * 0.22;
+  float phaseB = dot(domain, dir1) * 0.12  - t * 0.25 + phaseBreak * 0.17;
+  float phaseC = dot(domain, dir2) * 0.32  + t * 0.72 + phaseBreak * 0.11;
+  float phaseD = dot(domain, dir3) * 0.48  - t * 0.58 + phaseBreak * 0.08;
+  float phaseE = dot(domain, dir4) * 1.45  + t * 1.85 + phaseBreak * 0.06;
+  float phaseF = dot(domain, dir5) * 1.80  - t * 1.42 + phaseBreak * 0.04;
 
   // ─── AMPLITUDE ENVELOPE: WORLD-POSITION ONLY ─────────────────────────────
   // ROOT CAUSE FIX (part 2): Even with phases fixed (part 1), any per-cell
@@ -775,15 +833,28 @@ vec4 dveGetVertexWaveDisplacement(
     0.35, 1.3
   );
 
-  float steepness  = mix(0.12, 0.42,  clamp(waveEnergy * 0.7,  0.0, 1.0));
-  float largeAmp   = mix(0.018, 0.16,  clamp(waveEnergy * 0.82, 0.0, 1.0));
-  float mediumAmp  = mix(0.008, 0.085, clamp(waveEnergy * 0.82, 0.0, 1.0));
-  float chopAmp    = mix(0.004, 0.05,  clamp(waveEnergy * 0.9,  0.0, 1.0));
+  // ─── Wave grouping: ocean swell comes in sets of 3-5 waves ─────────────
+  // Low-frequency envelope creates natural amplitude modulation.
+  float groupPhase = dot(domain, vec2(0.5, 0.866)) * 0.015 + t * 0.06;
+  float groupEnvelope = 0.55 + 0.45 * sin(groupPhase);
+  float groupPhase2 = dot(domain, vec2(-0.766, 0.643)) * 0.022 - t * 0.04;
+  float groupEnvelope2 = 0.6 + 0.4 * sin(groupPhase2);
+
+  float steepness  = mix(0.18, 0.55,  clamp(waveEnergy * 0.7,  0.0, 1.0));
+  float largeAmp   = mix(0.04, 0.28,   clamp(waveEnergy * 0.82, 0.0, 1.0)) * groupEnvelope;
+  float mediumAmp  = mix(0.015, 0.12,  clamp(waveEnergy * 0.82, 0.0, 1.0)) * groupEnvelope2;
+  float chopAmp    = mix(0.004, 0.045, clamp(waveEnergy * 0.9,  0.0, 1.0));
   // detailAmp1/2 (phaseG/H) removed from vertex — negligible amplitude, saved 2 sin/cos
 
   // ─── WAVE HEIGHTS ─────────────────────────────────────────────────────────
+  // Ocean-realistic shaping: sharper crests, flatter troughs.
+  // Trochoidal approximation: sin + steepness * sin * |sin| pushes peaks up
+  // and flattens valleys, mimicking real Gerstner profile.
   float swellWave  = sin(phaseA) * 0.65 + sin(phaseB) * 0.35;
-  float swellShaped = swellWave + steepness * swellWave * abs(swellWave);
+  // Enhanced trochoidal shaping: cubic term gives sharper crests
+  float swellShaped = swellWave
+    + steepness * swellWave * abs(swellWave)
+    + steepness * 0.3 * swellWave * swellWave * swellWave;
 
   float medWave   = sin(phaseC) * 0.58 + sin(phaseD) * 0.42;
   float medShaped = medWave + steepness * 0.8 * medWave * abs(medWave);
@@ -816,17 +887,15 @@ vec4 dveGetVertexWaveDisplacement(
   );
 
   // ─── GERSTNER LATERAL (XZ): trig-only, no noise in vertex ─────────────────
-  // Lateral noise removed (save 2 × dveValueNoise). Phase-based cos/sin is
-  // sufficient; noise micro-breakup belongs in the fragment shader.
-  // ×0.5 lateral scale: original 0.04–0.19 m range was too large for
-  // subdiv=1 geometry, causing visible triangular silhouettes. Scale down
-  // to ~0.02–0.095 m; high-energy zones with subdiv=2 still look dynamic.
+  // Wider swell → stronger lateral displacement for realistic orbital motion.
+  // The lateral-to-vertical ratio is the defining Gerstner characteristic:
+  // water particles trace elliptical orbits, not just bob up and down.
   vec2 gerstnerLateral = (
-    dir0 * (-cos(phaseA) * largeAmp * steepness * 1.2) +
-    dir1 * (-cos(phaseB) * largeAmp * steepness * 0.85) +
-    dir2 * ( cos(phaseC) * mediumAmp * 0.55 + chopWaveA * chopAmp * 0.35) +
-    dir3 * ( sin(phaseB)  * largeAmp * 0.65  + cos(phaseD) * mediumAmp * 0.45)
-  ) * mix(0.4, 1.0, clamp(waveEnergy, 0.0, 1.0)) * 0.5;
+    dir0 * (-cos(phaseA) * largeAmp * steepness * 1.6) +
+    dir1 * (-cos(phaseB) * largeAmp * steepness * 1.1) +
+    dir2 * ( cos(phaseC) * mediumAmp * 0.7 + chopWaveA * chopAmp * 0.3) +
+    dir3 * ( sin(phaseB)  * largeAmp * 0.8  + cos(phaseD) * mediumAmp * 0.5)
+  ) * mix(0.4, 1.0, clamp(waveEnergy, 0.0, 1.0)) * 0.55;
 
   return vec4(gerstnerLateral.x, height, gerstnerLateral.y, crest);
 }
@@ -891,6 +960,219 @@ float dveWaterContinuousHeight(vec3 worldPos, vec2 flowDir, float flowStrength, 
 `;
 
     const fragmentOnlyFunctions = /* glsl */ `
+// ─── Analytical Gerstner normal: per-pixel wave crest highlights ──────────
+// Recomputes the wave phase derivatives in fragment for accurate specular.
+// Uses the SAME directions/frequencies as the vertex displacement so normals
+// match the geometry exactly.  Wave grouping (envelope modulation) creates
+// natural sets of 3-5 large waves followed by calmer periods.
+vec3 dveGetAnalyticalGerstnerNormal(vec3 positionW, float waveAttenuation) {
+  vec2 domainWarp = dveGetWaterPatternWarp(
+    positionW.xz * 0.47 + vec2(dve_time * 0.08, -dve_time * 0.05)
+  );
+  vec2 domain = positionW.xz + domainWarp * 2.0;
+
+  // Same directions as vertex shader
+  vec2 dir0 = vec2( 0.8660,  0.5000);
+  vec2 dir1 = vec2(-0.3420,  0.9397);
+  vec2 dir2 = vec2( 0.6428,  0.7660);
+  vec2 dir3 = vec2(-0.7071,  0.7071);
+  vec2 dir4 = vec2( 0.9848, -0.1736);
+  vec2 dir5 = vec2( 0.1392,  0.9903);
+
+  float t = dve_time;
+
+  // Simplified phase noise (cheaper in fragment — single octave)
+  float phaseBreak = (dveValueNoise(domain * 0.045 + vec2(t * 0.018, -t * 0.012)) * 2.0 - 1.0) * 5.0;
+
+  // Same frequencies as vertex
+  float phaseA = dot(domain, dir0) * 0.09  + t * 0.35 + phaseBreak * 0.22;
+  float phaseB = dot(domain, dir1) * 0.12  - t * 0.25 + phaseBreak * 0.17;
+  float phaseC = dot(domain, dir2) * 0.32  + t * 0.72 + phaseBreak * 0.11;
+  float phaseD = dot(domain, dir3) * 0.48  - t * 0.58 + phaseBreak * 0.08;
+  float phaseE = dot(domain, dir4) * 1.45  + t * 1.85 + phaseBreak * 0.06;
+  float phaseF = dot(domain, dir5) * 1.80  - t * 1.42 + phaseBreak * 0.04;
+
+  // ─── Wave grouping: real ocean waves come in sets ─────────────────────
+  // Low-frequency envelope modulates amplitude — creates "sets" of 3-5 big
+  // waves then calmer water, exactly like real ocean swell behaviour.
+  float groupPhase = dot(domain, vec2(0.5, 0.866)) * 0.015 + t * 0.06;
+  float groupEnvelope = 0.55 + 0.45 * sin(groupPhase);   // 0.1 .. 1.0
+  float groupPhase2 = dot(domain, vec2(-0.766, 0.643)) * 0.022 - t * 0.04;
+  float groupEnvelope2 = 0.6 + 0.4 * sin(groupPhase2);
+
+  float waveEnergy = clamp(
+    mix(0.5, 1.15, dveValueNoise(positionW.xz * 0.018 + vec2(37.4, 15.9))),
+    0.35, 1.3
+  );
+
+  float steepness = mix(0.18, 0.55, clamp(waveEnergy * 0.7, 0.0, 1.0));
+  float largeAmp  = mix(0.04, 0.28, clamp(waveEnergy * 0.82, 0.0, 1.0)) * groupEnvelope;
+  float mediumAmp = mix(0.015, 0.12, clamp(waveEnergy * 0.82, 0.0, 1.0)) * groupEnvelope2;
+  float chopAmp   = mix(0.004, 0.045, clamp(waveEnergy * 0.9, 0.0, 1.0));
+
+  // ─── Analytical normal: ∂height/∂x, ∂height/∂z from wave gradients ───
+  // For Gerstner wave h = A * sin(k·x + ωt), the gradient is:
+  // ∂h/∂x = A * k_x * cos(phase), ∂h/∂z = A * k_z * cos(phase)
+  // Plus trochoidal correction: steepness * 2 * |sin| * cos contrib
+  float cosA = cos(phaseA), cosB = cos(phaseB);
+  float cosC = cos(phaseC), cosD = cos(phaseD);
+  float cosE = cos(phaseE), cosF = cos(phaseF);
+  float sinA = sin(phaseA), sinB = sin(phaseB);
+
+  // Swell gradient (dominant)
+  float swellCos = cosA * 0.65 + cosB * 0.35;
+  float swellTrochoidalFactor = 1.0 + steepness * 2.0 * abs(sinA * 0.65 + sinB * 0.35);
+  vec2 gradSwell = (
+    dir0 * 0.09 * cosA * 0.65 +
+    dir1 * 0.12 * cosB * 0.35
+  ) * largeAmp * swellTrochoidalFactor;
+
+  // Medium gradient
+  float medTrochoidalFactor = 1.0 + steepness * 0.8 * 2.0 * abs(sin(phaseC) * 0.58 + sin(phaseD) * 0.42);
+  vec2 gradMed = (
+    dir2 * 0.32 * cosC * 0.58 +
+    dir3 * 0.48 * cosD * 0.42
+  ) * mediumAmp * medTrochoidalFactor;
+
+  // Chop gradient
+  vec2 gradChop = (
+    dir4 * 1.45 * cosE * 0.72 +
+    dir5 * 1.80 * cosF * 0.28
+  ) * chopAmp;
+
+  vec2 totalGrad = (gradSwell + gradMed + gradChop) * waveAttenuation;
+
+  return normalize(vec3(-totalGrad.x, 1.0, -totalGrad.y));
+}
+
+// ─── Jacobian-based whitecap detection ──────────────────────────────────────
+// The Jacobian determinant of the Gerstner displacement field measures surface
+// compression. When J < 1 the surface is being compressed (wave crests pulling
+// together) → whitecaps/foam form. When J ≈ 0 or negative, waves are
+// "folding over" — maximum foam. This is THE industry-standard technique for
+// ocean foam (Tessendorf, Assassin's Creed, Sea of Thieves, War Thunder).
+//
+// For Gerstner: J = (1 - Σ kx²·S·sin(f)) × (1 - Σ kz²·S·sin(f)) - (Σ kx·kz·S·sin(f))²
+// where S = steepness factor, kx/kz = directional wavenumber components.
+float dveGetJacobianWhitecapFactor(vec3 positionW, float waveAttenuation) {
+  vec2 domainWarp = dveGetWaterPatternWarp(
+    positionW.xz * 0.47 + vec2(dve_time * 0.08, -dve_time * 0.05)
+  );
+  vec2 domain = positionW.xz + domainWarp * 2.0;
+
+  vec2 dir0 = vec2( 0.8660,  0.5000);
+  vec2 dir1 = vec2(-0.3420,  0.9397);
+  vec2 dir2 = vec2( 0.6428,  0.7660);
+  vec2 dir3 = vec2(-0.7071,  0.7071);
+  vec2 dir4 = vec2( 0.9848, -0.1736);
+  vec2 dir5 = vec2( 0.1392,  0.9903);
+
+  float t = dve_time;
+  float phaseBreak = (dveValueNoise(domain * 0.045 + vec2(t * 0.018, -t * 0.012)) * 2.0 - 1.0) * 5.0;
+
+  float phaseA = dot(domain, dir0) * 0.09  + t * 0.35 + phaseBreak * 0.22;
+  float phaseB = dot(domain, dir1) * 0.12  - t * 0.25 + phaseBreak * 0.17;
+  float phaseC = dot(domain, dir2) * 0.32  + t * 0.72 + phaseBreak * 0.11;
+  float phaseD = dot(domain, dir3) * 0.48  - t * 0.58 + phaseBreak * 0.08;
+  float phaseE = dot(domain, dir4) * 1.45  + t * 1.85 + phaseBreak * 0.06;
+  float phaseF = dot(domain, dir5) * 1.80  - t * 1.42 + phaseBreak * 0.04;
+
+  // Wave grouping (same as vertex)
+  float groupPhase = dot(domain, vec2(0.5, 0.866)) * 0.015 + t * 0.06;
+  float groupEnvelope = 0.55 + 0.45 * sin(groupPhase);
+  float groupPhase2 = dot(domain, vec2(-0.766, 0.643)) * 0.022 - t * 0.04;
+  float groupEnvelope2 = 0.6 + 0.4 * sin(groupPhase2);
+
+  float waveEnergy = clamp(
+    mix(0.5, 1.15, dveValueNoise(positionW.xz * 0.018 + vec2(37.4, 15.9))),
+    0.35, 1.3
+  );
+
+  float steepness = mix(0.18, 0.55, clamp(waveEnergy * 0.7, 0.0, 1.0));
+  float largeAmp  = mix(0.04, 0.28, clamp(waveEnergy * 0.82, 0.0, 1.0)) * groupEnvelope;
+  float mediumAmp = mix(0.015, 0.12, clamp(waveEnergy * 0.82, 0.0, 1.0)) * groupEnvelope2;
+  float chopAmp   = mix(0.004, 0.045, clamp(waveEnergy * 0.9, 0.0, 1.0));
+
+  // Compute Jacobian partial derivatives:
+  // Jxx = 1 - Σ (kx_i² × S_i × sin(phase_i))
+  // Jzz = 1 - Σ (kz_i² × S_i × sin(phase_i))
+  // Jxz =   - Σ (kx_i × kz_i × S_i × sin(phase_i))
+  // where k_i = wavenumber vector = dir_i × spatial_freq
+
+  // Swell: wavenumber components = dir × freq
+  vec2 k0 = dir0 * 0.09, k1 = dir1 * 0.12;
+  vec2 k2 = dir2 * 0.32, k3 = dir3 * 0.48;
+  vec2 k4 = dir4 * 1.45, k5 = dir5 * 1.80;
+
+  float sinA = sin(phaseA), sinB = sin(phaseB);
+  float sinC = sin(phaseC), sinD = sin(phaseD);
+  float sinE = sin(phaseE), sinF = sin(phaseF);
+
+  // Accumulate Jacobian contributions per wave
+  // Each wave contributes: steepness_effective × sin(phase)
+  // Swell (with trochoidal enhancement ×1.3)
+  float s0 = steepness * 1.3 * largeAmp * sinA * 0.65;
+  float s1 = steepness * 1.3 * largeAmp * sinB * 0.35;
+  // Medium
+  float s2 = steepness * 1.0 * mediumAmp * sinC * 0.58;
+  float s3 = steepness * 1.0 * mediumAmp * sinD * 0.42;
+  // Chop
+  float s4 = chopAmp * sinE * 0.72;
+  float s5 = chopAmp * sinF * 0.28;
+
+  // Accumulate Jxx, Jzz, Jxz
+  float Jxx = 1.0;
+  float Jzz = 1.0;
+  float Jxz = 0.0;
+
+  // Macro helper: accumulate one wave's Jacobian contribution
+  Jxx -= k0.x * k0.x * s0 + k1.x * k1.x * s1 + k2.x * k2.x * s2 + k3.x * k3.x * s3 + k4.x * k4.x * s4 + k5.x * k5.x * s5;
+  Jzz -= k0.y * k0.y * s0 + k1.y * k1.y * s1 + k2.y * k2.y * s2 + k3.y * k3.y * s3 + k4.y * k4.y * s4 + k5.y * k5.y * s5;
+  Jxz -= k0.x * k0.y * s0 + k1.x * k1.y * s1 + k2.x * k2.y * s2 + k3.x * k3.y * s3 + k4.x * k4.y * s4 + k5.x * k5.y * s5;
+
+  float jacobian = Jxx * Jzz - Jxz * Jxz;
+
+  // Foam response: J < 1.0 means compression, J < 0 means folding
+  // Map to foam intensity: strong foam at J=0, maximum at J<0, none at J≥1
+  float whitecapRaw = 1.0 - smoothstep(-0.3, 0.8, jacobian);
+
+  // Persistence: foam doesn't vanish instantly — add a temporal decay trail
+  // using a secondary noise field that creates lingering foam patches
+  float foamPersistence = dveValueNoise(positionW.xz * 0.12 + vec2(t * 0.015, -t * 0.02));
+  float foamDecay = smoothstep(0.0, 0.55, whitecapRaw + foamPersistence * 0.15);
+
+  return clamp(foamDecay * waveAttenuation, 0.0, 1.0);
+}
+
+// ─── Procedural foam bubble pattern ─────────────────────────────────────────
+// Generates organic foam bubble structure using layered Voronoi with
+// flow-advected coordinates. Used when Jacobian triggers whitecap.
+float dveGetProceduralFoamPattern(vec2 worldXZ, float intensity, float time) {
+  // Large-scale foam cell structure
+  vec2 foamUV = worldXZ * 0.35 + vec2(time * 0.02, -time * 0.015);
+  vec4 coarseCell = dveVoronoiCellData(foamUV);
+  // Cell edge brightening (foam collects at cell boundaries)
+  float coarseFoam = smoothstep(0.08, 0.28, coarseCell.y) * (0.6 + coarseCell.z * 0.4);
+  // Ridge between cells = foam streaks
+  float coarseRidge = 1.0 - smoothstep(0.0, 0.12, coarseCell.y);
+
+  // Fine-scale bubble detail
+  vec2 fineUV = worldXZ * 1.2 + vec2(-time * 0.03, time * 0.018);
+  vec4 fineCell = dveVoronoiCellData(fineUV);
+  float fineBubbles = smoothstep(0.06, 0.22, fineCell.y) * (0.5 + fineCell.z * 0.3);
+
+  // Micro noise for breakup — prevents uniform foam sheets
+  float microBreakup = dveValueNoise(worldXZ * 2.8 + vec2(time * 0.04, -time * 0.025));
+
+  // Combine: coarse structure + fine bubbles + breakup
+  float pattern = mix(coarseRidge * 0.6 + coarseFoam * 0.4, fineBubbles, 0.35);
+  pattern *= (0.7 + microBreakup * 0.3);
+  // Intensity gates how much foam is visible
+  pattern *= smoothstep(0.05, 0.4, intensity);
+
+  return clamp(pattern, 0.0, 1.0);
+}
+
 float dveGetDistanceStableDetailFade(vec3 positionW, vec3 eyePosition, float waveAttenuation) {
   float viewDistance = length(eyePosition - positionW);
   float distanceFade = 1.0 - smoothstep(18.0, 120.0, viewDistance);
@@ -1091,6 +1373,15 @@ if (dveStableWaterSurfaceY >= 0.0) {
   positionUpdated.x += dveWaveDisplacement.x;
   positionUpdated.y += dveWaveDisplacement.y;
   positionUpdated.z += dveWaveDisplacement.z;
+
+  // ── Sprint 11: Grid dissolution — adaptive world-space vertex warp ──
+  // Adds Gerstner-inspired orbital displacement that scales with distance
+  // from shore. World-space domain ensures boundary vertices get identical
+  // displacement across sections (no seam risk).
+  vec3 dveGridWarp = dveGetGridDissolutionWarp(dveWorldPos.xz, dveShoreDistanceFactor, dve_time);
+  positionUpdated.x += dveGridWarp.x;
+  positionUpdated.y += dveGridWarp.y;
+  positionUpdated.z += dveGridWarp.z;
 
   // ─── Phase 4 + 8 — Curvature-modulated displacement with temporal coherence ─
   // Phase 4: high-curvature edge/transition zones get extra flow-aligned noise.
@@ -1681,6 +1972,14 @@ float dveCrestFoam = max(
   dveFoamClassMask.x * (0.3 + max(dveFoamMask, dveImpactFoamMask * 0.55) * 0.56 + dveHybridFlowBoost * 0.12) * (0.36 + dveWaveAttenuation * 0.64 + abs(dveVertexWaveHeight) * 2.0),
   dveWaveCrestFactor * (0.22 + dveFoamMask * 0.32 + dveImpactFoamMask * 0.18 + dveHybridFoamBoost * 0.16)
 );
+// ─── Jacobian-based procedural whitecap foam (open ocean) ───────────────
+// Tessendorf Jacobian: where waves compress, whitecaps form naturally.
+// This is purely procedural — no textures needed, works everywhere.
+float dveJacobianWhitecap = dveGetJacobianWhitecapFactor(vPositionW, dveWaveAttenuation);
+float dveProceduralFoamBubbles = dveGetProceduralFoamPattern(vPositionW.xz, dveJacobianWhitecap, dve_time);
+// Combine Jacobian whitecap with existing crest foam (additive, clamped)
+float dveWhitecapFoam = dveJacobianWhitecap * (0.5 + dveProceduralFoamBubbles * 0.5) * dveOpenWaterFactor;
+dveCrestFoam = clamp(dveCrestFoam + dveWhitecapFoam * 0.85, 0.0, 1.0);
 float dveDropFoam = dveDropFactor * (0.42 + dveFoamClassMask.z * 0.88) * (0.3 + dveImpactFoamMask * 0.84 + dveFoamMask * 0.12);
 float dveOrganicShoreline = clamp(dveSoftShorelineBand * (0.82 + dveMacroVariation * 0.14) + dveShoreFoamMask * 0.08, 0.0, 1.0);
 float dveShallowBreakup = clamp(dveShallowClarity * 0.36 + dveOrganicShoreline * 0.22 + dveMacroVariation * 0.18 + (1.0 - dveSoftFillFactor) * 0.035 + dveHybridPressure * 0.16 + dveHybridFlowMagnitude * 0.08, 0.0, 1.0);
@@ -1702,6 +2001,16 @@ vec3 dveClassTint = dveGetClassTint(dveWaterClassWeights);
 float dveClassCalmness = dveGetClassCalmness(dveWaterClassWeights);
 float dveLargeBodyHighlightCoherence = dveLargeBodySignal * clamp(dveHybridCalmness * 0.72 + dveWaterFacing * 0.18 + dveOpenWaterFactor * 0.1, 0.0, 1.0);
 vec3 dveTransmissionColor = mix(dveAbsorptionColor, vec3(0.58, 0.89, 1.0), dveOrganicShoreline * 0.1 + dveWaterFacing * 0.06 + dveShallowClarity * (0.22 - dveTurbidity * 0.1) + dveMacroVariation * 0.06 + dveSoftFillFactor * 0.015 + dveLargeBodyHighlightCoherence * 0.035);
+// WaterBall Beer-Lambert: physically accurate wavelength-dependent absorption.
+// Water absorbs red light fastest and blue slowest, making deep water appear blue.
+// dveBeerAbsorptionCoeff: per-channel absorption rate at world scale (1 unit ≈ 1 voxel).
+vec3 dveBeerAbsorptionCoeff = mix(
+  vec3(0.55, 0.18, 0.04),
+  vec3(0.38, 0.22, 0.08),
+  dveTurbidity
+);
+vec3 dveBeerTransmittance = exp(-dveBeerAbsorptionCoeff * max(dveWaterThickness * 1.2, 0.0));
+dveTransmissionColor *= mix(vec3(1.0), dveBeerTransmittance, clamp(dveThicknessFactor * 1.6, 0.0, 1.0));
 vec3 dveTransmissionBase = dveTransmissionColor;
   dveTransmissionColor = dveTransmissionBase * mix(dveClassTint, vec3(0.98, 1.0, 1.03), dveTurbidity * 0.2);
 vec3 dveShallowBreakupTint = mix(vec3(0.8, 0.95, 1.01), vec3(1.06, 1.1, 1.15), dveFoamMask);
@@ -1740,6 +2049,8 @@ dveLiquidColor = dveComposeWaterColor(
   dveUnifiedRefraction
 );
 dveLiquidColor = mix(dveLiquidColor, vec3(0.83, 0.93, 1.0), dveWaveCrestFactor * (0.1 + dveWaveAttenuation * 0.12));
+// ─── Jacobian whitecap albedo: bright blue-white foam on wave crests ────
+dveLiquidColor = mix(dveLiquidColor, vec3(0.88, 0.95, 1.0), dveWhitecapFoam * 0.55);
 dveLiquidColor = mix(dveLiquidColor, vec3(0.92, 0.97, 1.0), dveScreenGlint * (0.025 + dveUnderwaterFresnel * 0.055 + dveHybridPressure * 0.035 + dveLargeBodyHighlightCoherence * 0.028));
 dveLiquidColor = mix(dveLiquidColor, dveLiquidColor * vec3(0.985, 0.995, 1.01), dveMacroVariation * 0.08);
 dveLiquidColor = mix(dveLiquidColor, dveLiquidColor * vec3(0.978, 0.989, 1.0), (1.0 - dveSoftFillFactor) * 0.03);
@@ -1772,6 +2083,11 @@ if (dveDebugMode > 0.5) {
     dveDebugColor = vec3(dveRawLargeBody, dveRawShore, dveRawInteraction);
   } else if (dveDebugMode < 7.5) {
     dveDebugColor = vec3(dveFillFactor, dveBoundaryFactor, dveShoreFactor);
+  } else if (dveDebugMode < 8.5) {
+    float dveOriginMask = dveGetOriginDebugId(dveWaterFlowData);
+    dveDebugColor = mix(vec3(0.08, 0.12, 0.18), vec3(1.0, 0.32, 0.18), clamp(dveOriginMask, 0.0, 1.0));
+  } else if (dveDebugMode < 9.5) {
+    dveDebugColor = dveGetEmitterDebugColor(dveGetEmitterDebugId(dveWaterFlowData));
   } else {
     dveDebugColor = dveGetConflictDebugColor(
       dveRawLargeBody,
@@ -1871,6 +2187,9 @@ float dveCalmnessSuppression = clamp(dveClassCalmness + dveTurbidity * 0.1, 0.0,
 float dveLocalShimmerStrength = dveGetClassLocalShimmerScale(dveWaterClassWeights) * mix(0.34, 1.0, dveFlowStrength) * mix(0.4, 1.0, dveShoreDistanceFactor) * mix(0.65, 1.0, dveBoundaryFactor);
 float dveFilteredShimmerStrength = dveLocalShimmerStrength * (0.22 + dveDetailFade * 0.5 + dveLargeBodySignal * 0.12 + dvePatchFlowSignal * 0.1) * (1.0 - dveCalmnessSuppression) * mix(0.94, 1.2, dveScreenGlint * (0.35 + dveHybridFlowMagnitude * 0.4 + dveLargeBodySignal * 0.12 + dvePatchFlowSignal * 0.08));
 float dveFoamGlossFlatten = clamp(dveFoamClassData.y * 0.06 + dveFoamClassData.z * 0.18 + dveDropHeight * 0.12 + dveWaveCrestFactor * 0.08 + dveHybridPressure * 0.1, 0.0, 0.28);
+// Jacobian whitecap roughness: foam patches are diffuse, not specular
+float dveWhitecapRoughness = dveGetJacobianWhitecapFactor(vPositionW, dveWaveAttenuation) * (1.0 - dveContext.y) * 0.18;
+dveFoamGlossFlatten = clamp(dveFoamGlossFlatten + dveWhitecapRoughness, 0.0, 0.38);
 microSurface = mix(0.84, 0.994, 0.35 + dveUnderwaterFresnel * 0.5 + dveSoftFillFactor * 0.03 - (1.0 - dveSoftBoundaryFactor) * 0.022 + dveMotionGloss * dveWaveAttenuation * 0.052 * (1.0 - dveUnderwaterFactor * 0.96) + dveClassGlossBias * (1.0 - dveUnderwaterFactor * 0.45) + dveClassSurfacePreset.z * (1.0 - dveUnderwaterFactor * 0.9) + dveStableShimmer * dveFilteredShimmerStrength * (1.0 - dveUnderwaterFactor * 0.97) + dveWaveCrestFactor * 0.08 * (1.0 - dveUnderwaterFactor * 0.92) + dveScreenGlint * (0.018 + dveHybridPressure * 0.02) * (1.0 - dveUnderwaterFactor * 0.97));
 microSurface = mix(microSurface, min(0.996, microSurface + dveLocalFluidThickness * 0.08 + dveLocalFluidEventSignal * 0.04), dveMicroCompW.y);
 microSurface = max(0.74, microSurface - dveFoamGlossFlatten);
@@ -1895,6 +2214,8 @@ surfaceReflectivityColor = mix(surfaceReflectivityColor, vec3(0.04, 0.055, 0.07)
   vec3 dveWaterClassWeights = dveGetWaterClassWeights(dveGetPackedWaterClassValue(dveWaterFlowData));
   vec3 dveClassSurfacePreset = dveGetClassSurfacePreset(dveWaterClassWeights);
   float dveWaveAttenuation = dveGetWaveResponse(dveContext.y, dveBoundaryFactor, dveShoreDistanceFactor, dveWaterClassWeights);
+  // ─── Analytical Gerstner normal for realistic specular highlights ──────
+  vec3 dveGerstnerNormal = dveGetAnalyticalGerstnerNormal(vPositionW, dveWaveAttenuation);
   float dveDetailFade = dveGetDistanceStableDetailFade(vPositionW, vEyePosition.xyz, dveWaveAttenuation);
   float dveAperiodicSeed = dveHash12(vPositionW.xz * vec2(0.063, 0.097));
   vec2 dveBasePatternWarp = dveGetWaterPatternWarp(vPositionW.xz) * 0.46;
@@ -1955,11 +2276,19 @@ surfaceReflectivityColor = mix(surfaceReflectivityColor, vec3(0.04, 0.055, 0.07)
   vec3 dveMacroNormal = normalize(vec3(dveMacroSample.x * (0.35 + dveDropLift * 0.08 + dveHybridPressure * 0.07), 1.0, dveMacroSample.y * (0.35 + dveDropLift * 0.08 + dveHybridPressure * 0.07)));
   vec3 dveMicroNormal = normalize(vec3(dveMicroSample.x * (0.18 + dveHybridFlowMagnitude * 0.04), 1.0, dveMicroSample.y * (0.18 + dveHybridFlowMagnitude * 0.04)));
   vec3 dveWaterDetailNormal = normalize(mix(dveMacroNormal, dveMicroNormal, (0.18 + dveWaveAttenuation * 0.1) + dveDetailFade * 0.12));
+  // ─── Blend analytical Gerstner normal with texture detail ──────────────
+  // Gerstner provides the broad wave shape, texture normals add micro-detail.
+  // Use UDN (Unreal-style) blending: sum XZ gradients, renormalize.
+  vec3 dveWaterCombinedNormal = normalize(vec3(
+    dveGerstnerNormal.x + dveWaterDetailNormal.x * 0.6,
+    dveGerstnerNormal.y,
+    dveGerstnerNormal.z + dveWaterDetailNormal.z * 0.6
+  ));
   // Sprint 6 — Unified normal composition using composition weights
   float dveNormPatchW = dveGetPatchBaseWeight(dveLargeBodySignal, clamp(dveHybridBaseMask.b, 0.0, 1.0), dveOpenWaterFactor, dveLocalFluidEventSignal);
   float dveNormSSFRW = dveGetSSFREventWeight(dveLocalFluidEventSignal, dveLocalFluidThickness, dveDropLift, dveOpenWaterFactor);
   vec2 dveNormCompW = dveGetCompositionBlend(dveNormPatchW, dveNormSSFRW, dveLocalFluidEventSignal);
-  vec3 dveResolvedFluidNormal = dveComposeWaterNormal(dveWaterDetailNormal, dveLocalFluidNormal, dveNormCompW.x, dveNormCompW.y, dveLocalFluidThickness);
+  vec3 dveResolvedFluidNormal = dveComposeWaterNormal(dveWaterCombinedNormal, dveLocalFluidNormal, dveNormCompW.x, dveNormCompW.y, dveLocalFluidThickness);
   float dveUnderwaterDetailMix = (0.72 + dveWaveAttenuation * 0.24) * (1.0 - dveUnderwaterFactor * 0.985);
   vec3 dveDerivedNormal = dveGetDerivedWaterSurfaceNormal(normalW);
   vec3 dveUnderwaterBaseNormal = normalize(mix(dveDerivedNormal, vec3(0.0, -1.0, 0.0), dveUnderwaterFactor * 0.96));

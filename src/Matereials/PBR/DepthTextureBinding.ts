@@ -41,10 +41,18 @@ function getSceneCameraDepthTexture(scene: Scene, activeCamera: object) {
     sceneDepthMaps.set(scene, depthMaps);
   }
 
-  let depthTexture = depthMaps.get(activeCamera);
+  let depthTexture: BaseTexture | undefined = depthMaps.get(activeCamera);
   if (!depthTexture) {
-    const depthRenderer = scene.enableDepthRenderer(scene.activeCamera || undefined, false, true);
-    depthTexture = depthRenderer.getDepthMap();
+    // Only use an existing depth renderer — don't create one lazily.
+    // If the renderer was intentionally skipped (e.g. pbr-premium-v2),
+    // creating it here would silently add a full-scene extra pass (≈474 draw calls).
+    const existing = (scene as any)._depthRenderer?.[""];
+    if (existing) {
+      depthTexture = existing.getDepthMap() as BaseTexture;
+    }
+    if (!depthTexture) {
+      depthTexture = getFallbackDepthTexture(scene);
+    }
     depthMaps.set(activeCamera, depthTexture);
   }
 

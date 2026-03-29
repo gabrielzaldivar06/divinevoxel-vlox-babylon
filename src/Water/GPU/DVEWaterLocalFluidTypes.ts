@@ -1,5 +1,29 @@
 export type WaterLocalFluidSolver = "off" | "pbf" | "mls-mpm";
 
+export type WaterDisturbanceKind = "wake" | "impact" | "emitter" | "heavy-impact" | "actor-wade" | "object-splash";
+
+export interface WaterDisturbanceEvent {
+  kind: WaterDisturbanceKind;
+  worldX: number;
+  worldZ: number;
+  radius: number;
+  energy: number;
+  velocityX?: number;
+  velocityZ?: number;
+  directionX?: number;
+  directionZ?: number;
+  mass?: number;
+  duration?: number;
+}
+
+export interface WaterLocalFluidBudget {
+  maxEmitters: number;
+  maxImpactsPerFrame: number;
+  maxWakesPerFrame: number;
+  maxHeavyImpactsPerFrame: number;
+  maxObjectSplashesPerFrame: number;
+}
+
 export interface WaterLocalFluidSectionRecord {
   originX: number;
   originZ: number;
@@ -27,6 +51,7 @@ export interface WaterLocalFluidBackend {
   registerSection(record: WaterLocalFluidSectionRecord): void;
   clearSections(): void;
   dispose(): void;
+  applyDisturbances?(events: WaterDisturbanceEvent[]): void;
 }
 
 export function getPreferredWaterLocalFluidSolver(): WaterLocalFluidSolver {

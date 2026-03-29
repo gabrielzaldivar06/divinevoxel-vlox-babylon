@@ -66,6 +66,11 @@ export class DVEDissolutionPlugin extends MaterialPluginBase {
   private _blueNoiseTex: Texture | null = null;
   /** Fase 5: timestamp when this sector's dissolution started (-999 = static/complete). */
   private _dissolveStartTime = -999.0;
+  /** Per-frame cached sun direction to avoid O(lights) search per draw call. */
+  private static _cachedFrameId = -1;
+  private static _cachedSunX = -1;
+  private static _cachedSunY = -1;
+  private static _cachedSunZ = -0.5;
 
   constructor(
     material: PBRMaterial,
@@ -167,8 +172,7 @@ export class DVEDissolutionPlugin extends MaterialPluginBase {
       this._blueNoiseTex = getOrCreateBlueNoiseTexture(this._scene);
     }
     effect.setTexture("dve_blueNoise", this._blueNoiseTex);
-    effect.setFloat(
-      "dve_dissolutionIntensity",
+    effect.setFloat("dve_dissolutionIntensity",
       EngineSettings.settings.terrain.dissolution
         ? ((EngineSettings.settings.terrain as any).dissolutionIntensity ?? 1.0)
         : 0.0
@@ -176,18 +180,25 @@ export class DVEDissolutionPlugin extends MaterialPluginBase {
     effect.setFloat("dve_dissolveStartTime", this._dissolveStartTime);
     effect.setFloat("dve_time", performance.now() * 0.001); // F01: live clock for glow flicker + rain cycle
 
-    // R03: Bind real sun direction from scene's directional light
-    const lights = this._scene.lights;
-    let sx = -1, sy = -1, sz = -0.5;
-    for (let i = 0; i < lights.length; i++) {
-      if (lights[i] instanceof DirectionalLight) {
-        const dir = (lights[i] as DirectionalLight).direction;
-        sx = dir.x; sy = dir.y; sz = dir.z;
-        break;
+    // R03: Bind real sun direction from scene's directional light (cached per frame)
+    const frameId = this._scene.getFrameId();
+    if (DVEDissolutionPlugin._cachedFrameId !== frameId) {
+      DVEDissolutionPlugin._cachedFrameId = frameId;
+      const lights = this._scene.lights;
+      let sx = -1, sy = -1, sz = -0.5;
+      for (let i = 0; i < lights.length; i++) {
+        if (lights[i] instanceof DirectionalLight) {
+          const dir = (lights[i] as DirectionalLight).direction;
+          sx = dir.x; sy = dir.y; sz = dir.z;
+          break;
+        }
       }
+      const len = Math.sqrt(sx * sx + sy * sy + sz * sz) || 1;
+      DVEDissolutionPlugin._cachedSunX = sx / len;
+      DVEDissolutionPlugin._cachedSunY = sy / len;
+      DVEDissolutionPlugin._cachedSunZ = sz / len;
     }
-    const len = Math.sqrt(sx * sx + sy * sy + sz * sz) || 1;
-    effect.setFloat3("dve_sunDir", sx / len, sy / len, sz / len);
+    effect.setFloat3("dve_sunDir", DVEDissolutionPlugin._cachedSunX, DVEDissolutionPlugin._cachedSunY, DVEDissolutionPlugin._cachedSunZ);
     // R02: Shore zone sea-level height — game can override via (terrain as any).seaLevel
     effect.setFloat("dve_seaLevel", (EngineSettings.settings.terrain as any).seaLevel ?? 32.0);
     // R17: Weather state — 0=clear sky, 1=full rain

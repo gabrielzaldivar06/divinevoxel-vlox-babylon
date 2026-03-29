@@ -3,6 +3,7 @@ import { RawTexture } from "@babylonjs/core/Materials/Textures/rawTexture";
 import { Texture } from "@babylonjs/core/Materials/Textures/texture";
 import type { WaterSectionGPUData } from "@divinevoxel/vlox/Water/Types/WaterTypes.js";
 import { DVEWaterLocalFluidSystem } from "./GPU/DVEWaterLocalFluidSystem.js";
+import type { WaterLocalFluidBudget } from "./GPU/DVEWaterLocalFluidTypes.js";
 import { DVEWaterComputeRefiner } from "./GPU/DVEWaterComputeRefiner.js";
 
 const DEFAULT_PIXEL = new Uint8Array([128, 32, 192, 255]);
@@ -21,6 +22,9 @@ const VELOCITY_DAMPING = 0.92;
 const TARGET_PULL = 0.12;
 const FILL_RELAXATION = 0.22;
 const PRESSURE_RESPONSE = 0.18;
+// WaterBall Tait EOS: tension-free pressure (max(0,...) = fluid only pushes, never retracts)
+const TAIT_STIFFNESS = 0.38;
+const TAIT_REST_DENSITY = 0.55;
 const FOAM_DECAY = 0.94;
 const EDGE_DECAY = 0.9;
 const MASS_TRANSFER_RATE = 4.2;
@@ -123,6 +127,10 @@ export class DVEWaterHybridBridge {
   private shiftFieldScratch = new Float32Array(HYBRID_TEXTURE_SIZE * HYBRID_TEXTURE_SIZE);
   private sectionStates = new Map<string, CachedWaterSectionState>();
   private targetsDirty = false;
+  /** True once simulation has converged (max field delta below threshold). */
+  private _converged = false;
+  /** Frames since last significant field change. */
+  private _stableFrames = 0;
   baseTexture: RawTexture;
   dynamicTexture: RawTexture;
   flowTexture: RawTexture;
@@ -131,6 +139,36 @@ export class DVEWaterHybridBridge {
   height = HYBRID_TEXTURE_SIZE;
   /** Local fluid simulation backend selected by explicit solver gate. */
   private gpuSim: DVEWaterLocalFluidSystem | null = null;
+
+  get localFluidSystem(): DVEWaterLocalFluidSystem | null {
+    return this.gpuSim;
+  }
+
+  // ── Gameplay disturbance convenience API ────────────────────
+  dispatchActorWake(worldX: number, worldZ: number, vx: number, vz: number, radius?: number, energy?: number): void {
+    this.gpuSim?.dispatchActorWake(worldX, worldZ, vx, vz, radius, energy);
+  }
+
+  dispatchActorWade(worldX: number, worldZ: number, vx: number, vz: number, legRadius?: number): void {
+    this.gpuSim?.dispatchActorWade(worldX, worldZ, vx, vz, legRadius);
+  }
+
+  dispatchImpact(worldX: number, worldZ: number, energy: number, radius?: number): void {
+    this.gpuSim?.dispatchImpact(worldX, worldZ, energy, radius);
+  }
+
+  dispatchHeavyImpact(worldX: number, worldZ: number, mass: number, velocity: number, radius?: number): void {
+    this.gpuSim?.dispatchHeavyImpact(worldX, worldZ, mass, velocity, radius);
+  }
+
+  dispatchObjectSplash(worldX: number, worldZ: number, mass: number, impactVelocity: number): void {
+    this.gpuSim?.dispatchObjectSplash(worldX, worldZ, mass, impactVelocity);
+  }
+
+  setFluidBudget(partial: Partial<WaterLocalFluidBudget>): void {
+    this.gpuSim?.setBudget(partial);
+  }
+
   /** Phase-9 GPU compute refiner: replaces simulateStep + packTextures with WebGPU compute. */
   private computeRefiner: DVEWaterComputeRefiner | null = null;
   private elapsedTime = 0;
@@ -669,7 +707,10 @@ export class DVEWaterHybridBridge {
         const downFill = this.fillField[x * this.height + Math.min(this.height - 1, z + 1)];
         const neighborAverage = (leftFill + rightFill + upFill + downFill) * 0.25;
         const netMass = this.massDeltaField[index];
-        const pressure = (neighborAverage - advectedFill + netMass * 2.2) * PRESSURE_RESPONSE;
+        // WaterBall tension-free Tait EOS: max(0,...) ensures fluid only pushes when
+        // compressed beyond rest density, never pulls back when sparse → water spreads freely.
+        const taitPressure = Math.max(0, TAIT_STIFFNESS * (Math.pow(advectedFill / TAIT_REST_DENSITY, 5) - 1));
+        const pressure = (taitPressure * 0.6 + (neighborAverage - advectedFill) * 0.4 + netMass * 2.2) * PRESSURE_RESPONSE;
         const targetVelocityX = this.targetVelocityXField[index] * this.targetFlowField[index];
         const targetVelocityZ = this.targetVelocityZField[index] * this.targetFlowField[index];
         const interaction = this.targetInteractionField[index];
@@ -846,8 +887,12 @@ export class DVEWaterHybridBridge {
     if (deltaSeconds <= 0 || this.sectionStates.size === 0) {
       return;
     }
-    if (isSettledBenchmarkHydrology() && !this.targetsDirty) {
-      return;
+    // Skip simulation when settled and no new data injected
+    if (!this.targetsDirty) {
+      if (isSettledBenchmarkHydrology()) return;
+      // General convergence: if we ran at least one cycle and fields haven't
+      // changed, skip the expensive simulate+pack+upload path entirely.
+      if (this._converged) return;
     }
     this.accumulatedDelta += deltaSeconds;
     this.targetRebuildAccumulator += deltaSeconds;
@@ -876,6 +921,26 @@ export class DVEWaterHybridBridge {
     if (steps === 0) {
       return;
     }
+
+    // Convergence detection: check max field delta after simulation
+    {
+      let maxDelta = 0;
+      const n = this.fillField.length;
+      for (let i = 0; i < n; i++) {
+        const d = Math.abs(this.fillField[i] - this.targetFillField[i]);
+        if (d > maxDelta) maxDelta = d;
+      }
+      if (maxDelta < 0.001) {
+        this._stableFrames++;
+        if (this._stableFrames >= 10) {
+          this._converged = true;
+        }
+      } else {
+        this._stableFrames = 0;
+        this._converged = false;
+      }
+    }
+
     const writeDebugTexture = shouldWriteDebugTexture(this.scene);
     const computeRefiner = this.computeRefiner;
     const useGPUComputedPacking = !!(computeRefiner?.ready && computeRefiner.packedDataReady);
@@ -960,6 +1025,72 @@ export class DVEWaterHybridBridge {
     }
   }
 
+  /**
+   * Inject shallow water simulation data from the editor shallow renderer into
+   * the bridge target fields so that the hybrid water PBR shader becomes aware
+   * of shallow water presence, flow velocity, and shore proximity.  Called once
+   * per frame per active shallow section before advance().
+   */
+  injectShallowSection(
+    originX: number,
+    originZ: number,
+    sizeX: number,
+    sizeZ: number,
+    columnBuffer: Float32Array,
+    columnStride: number,
+    columnMetadata: Uint32Array,
+  ) {
+    let anyChange = false;
+    for (let xi = 0; xi < sizeX; xi++) {
+      for (let zi = 0; zi < sizeZ; zi++) {
+        const worldX = originX + xi;
+        const worldZ = originZ + zi;
+        const idx = this.getClipIndex(worldX, worldZ);
+        if (idx < 0) continue;
+        const ci = (xi * sizeZ + zi) * columnStride;
+        const meta = columnMetadata[xi * sizeZ + zi];
+        const active = (meta & 0x1) !== 0;
+        const thickness = columnBuffer[ci + 0];
+        if (!active || thickness <= 0) {
+          if (this.targetPresenceField[idx] !== 0 || this.targetFillField[idx] !== 0) {
+            this.targetPresenceField[idx] = 0;
+            this.targetFillField[idx] = 0;
+            anyChange = true;
+          }
+          continue;
+        }
+        const fill = Math.min(1, thickness);
+        const newPresence = Math.max(this.targetPresenceField[idx], fill);
+        const newFill = Math.max(this.targetFillField[idx], fill);
+        const spreadVX = columnBuffer[ci + 3];
+        const spreadVZ = columnBuffer[ci + 4];
+        const speed = Math.sqrt(spreadVX * spreadVX + spreadVZ * spreadVZ);
+        const newFlow = Math.max(this.targetFlowField[idx], Math.min(1, speed));
+        if (newPresence !== this.targetPresenceField[idx] ||
+            newFill !== this.targetFillField[idx] ||
+            newFlow !== this.targetFlowField[idx] ||
+            spreadVX !== this.targetVelocityXField[idx] ||
+            spreadVZ !== this.targetVelocityZField[idx]) {
+          anyChange = true;
+        }
+        this.targetPresenceField[idx] = newPresence;
+        this.targetFillField[idx] = newFill;
+        this.targetFlowField[idx] = newFlow;
+        this.targetVelocityXField[idx] = spreadVX;
+        this.targetVelocityZField[idx] = spreadVZ;
+        const shoreDist = columnBuffer[ci + 9];
+        if (shoreDist <= 1) {
+          this.targetShoreField[idx] = Math.max(this.targetShoreField[idx], 0.8);
+        }
+      }
+    }
+    if (anyChange) {
+      this.targetsDirty = true;
+      this._converged = false;
+      this._stableFrames = 0;
+    }
+  }
+
   updateFromSectionGPUData(
     gpuData: WaterSectionGPUData,
     width: number,
@@ -998,10 +1129,20 @@ export class DVEWaterHybridBridge {
       gpuData,
     });
     this.targetsDirty = true;
-    this.accumulatedDelta = Math.max(this.accumulatedDelta, SIMULATION_STEP);
+    this._converged = false;
+    this._stableFrames = 0;
+  }
+
+  /** Sprint 10: Optional callback injected by shallow water system to receive puddle spawn requests */
+  onPuddleSpawn: ((worldX: number, worldZ: number, terrainY: number, thickness: number) => void) | null = null;
+
+  /** Inject a puddle spawn into the shallow water layer */
+  injectPuddleSpawn(worldX: number, worldZ: number, terrainY: number, initialThickness: number): void {
+    this.onPuddleSpawn?.(worldX, worldZ, terrainY, initialThickness);
   }
 
   dispose() {
+    this.onPuddleSpawn = null;
     this.gpuSim?.dispose();
     this.gpuSim = null;
     this.computeRefiner?.dispose();

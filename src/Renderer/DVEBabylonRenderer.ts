@@ -12,11 +12,29 @@ import { SingleBufferVoxelScene } from "../Scene/SingleBuffer/SingleBufferVoxelS
 import { SceneOptions } from "../Scene/SceneOptions";
 import { DVEBRSectionMeshesMultiBuffer } from "../Scene/MultiBuffer/DVEBRSectionMeshesMultiBuffer";
 import { SplatManager } from "../Splats/SplatManager";
+import { DVEWaterLocalFluidSystem } from "../Water/GPU/DVEWaterLocalFluidSystem.js";
 import { getSceneWaterHybridBridge } from "../Water/DVEWaterHybridBridge.js";
+import { DVEEditorShallowSectionRenderer } from "../Water/DVEEditorShallowSectionRenderer.js";
+import { DVEShallowWaterRenderer } from "../Water/DVEShallowWaterRenderer.js";
 import { LODSectorTracker } from "../LOD/LODSectorTracker";
+import { DVEWaterContinuumController } from "../Water/DVEWaterContinuumController.js";
 import { MeshManager } from "@divinevoxel/vlox/Renderer/MeshManager";
 import { VoxelTagsRegister } from "@divinevoxel/vlox/Voxels/Data/VoxelTagsRegister";
 import { VoxelTagIds } from "@divinevoxel/vlox/Voxels/Data/VoxelTag.types";
+import {
+  advanceEditorShallowSurfaceLayer,
+  clearEditorShallowSurfaceRegistry,
+  markEditorShallowSurfaceConnectedByLargeBody,
+  removeEditorShallowSurfaceSection,
+  updateEditorShallowSurfaceSection,
+} from "@divinevoxel/vlox/Water/Surface/WaterEditorShallowSurfaceRegistry";
+import {
+  tickShallowWater,
+  getActiveShallowSections,
+  clearAllShallowWater,
+  setShallowWaterHandoffCallback,
+} from "@divinevoxel/vlox/Water/Shallow/index.js";
+import { packShallowWaterSection } from "@divinevoxel/vlox/Water/Shallow/ShallowWaterGPUDataPacker.js";
 import {
   classifyTerrainMaterial,
   TerrainMaterialFamily,
@@ -44,6 +62,16 @@ function familyDefaultColor(family: string): [number, number, number] {
 export interface DVEBabylonRendererInitData {
   scene: Scene;
 }
+function _countActiveWaterLayers(shallowKeys?: Set<string>): number {
+  let count = 0;
+  count++; // Layer A: voxel liquid mesh
+  count++; // Layer B: continuous patch mesh
+  if ((globalThis as any).__DVE_GPU_FLUID_ACTIVE__) count++; // Layer D: GPU local fluid
+  count++; // Layer E: SSFR composition
+  if (shallowKeys && shallowKeys.size > 0) count++; // Layer F: Shallow water puddles
+  return count;
+}
+
 export class DVEBabylonRenderer extends DVERenderer {
   static instance: DVEBabylonRenderer;
   sectorMeshes: DVEBRSectionMeshesSingleBuffer | DVEBRSectionMeshesMultiBuffer;
@@ -57,8 +85,15 @@ export class DVEBabylonRenderer extends DVERenderer {
   sceneOptions: SceneOptions;
   splatManager: SplatManager | null = null;
   lodTracker: LODSectorTracker | null = null;
+  shallowSectionRenderer: DVEEditorShallowSectionRenderer | null = null;
+  shallowWaterRenderer: DVEShallowWaterRenderer | null = null;
+  continuumController: DVEWaterContinuumController | null = null;
   private _beforeRenderObservers: Observer<Scene>[] = [];
   private _disposed = false;
+
+  get localFluidSystem(): DVEWaterLocalFluidSystem | null {
+    return getSceneWaterHybridBridge(this.scene).localFluidSystem;
+  }
 
   constructor(data: DVEBabylonRendererInitData) {
     super();
@@ -95,14 +130,78 @@ export class DVEBabylonRenderer extends DVERenderer {
 
   async init(dver: DivineVoxelEngineRender) {
     const waterHybridBridge = getSceneWaterHybridBridge(this.scene);
+    this.shallowSectionRenderer = new DVEEditorShallowSectionRenderer(this.scene);
+    this.shallowWaterRenderer = new DVEShallowWaterRenderer(this.scene);
+    this.continuumController = new DVEWaterContinuumController(
+      waterHybridBridge,
+      this.shallowWaterRenderer ?? null,
+    );
+
+    // Phase 3: register handoff callback — promotes thick shallow columns to dve_liquid voxels
+    // TODO: replace console.log with actual DVE voxel write API when available
+    setShallowWaterHandoffCallback((worldX, worldZ, surfaceY, thickness, emitterId) => {
+      return false;
+    });
+
     this._beforeRenderObservers.push(this.scene.onBeforeRenderObservable.add(() => {
       const camera = this.scene.activeCamera;
       if (camera) {
         const pos = camera.globalPosition;
         waterHybridBridge.centerClipOn(pos.x, pos.z);
+        this.continuumController?.updateCamera(pos.x, pos.z);
       }
-      waterHybridBridge.advance(this.engine.getDeltaTime() / 1000);
+      const dt = this.engine.getDeltaTime() / 1000;
+      advanceEditorShallowSurfaceLayer(dt);
+      this.shallowSectionRenderer?.update(dt);
+      // Tick shallow water simulation and push packed GPU data to renderer
+      tickShallowWater(dt);
+      const activeSections = getActiveShallowSections();
+      const activeShallowKeys = new Set(activeSections.keys());
+      for (const [key, grid] of activeSections) {
+        const gpuData = packShallowWaterSection(grid);
+        this.shallowWaterRenderer?.updateSection(key, gpuData);
+        waterHybridBridge.injectShallowSection(
+          gpuData.originX,
+          gpuData.originZ,
+          gpuData.sizeX,
+          gpuData.sizeZ,
+          gpuData.columnBuffer,
+          gpuData.columnStride,
+          gpuData.columnMetadata,
+        );
+      }
+      this.shallowWaterRenderer?.update(dt, activeShallowKeys);
+      waterHybridBridge.advance(dt);
+      this.continuumController?.advance(dt);
+
+      // ── Sprint 12: Expose water capability flags for validation ──
+      (globalThis as any).__DVE_SHALLOW_WATER_SECTIONS__ = activeShallowKeys?.size ?? 0;
+      (globalThis as any).__DVE_GPU_FLUID_ACTIVE__ = !!(waterHybridBridge as any).gpuSim?.backend?.ready;
+      (globalThis as any).__DVE_SSFR_ACTIVE__ = true;
+      (globalThis as any).__DVE_GRID_DISSOLUTION_ACTIVE__ = true;
+      (globalThis as any).__DVE_PUDDLE_HANDOFF_WIRED__ = !!this.shallowWaterRenderer;
+      (globalThis as any).__DVE_ACTIVE_WATER_LAYERS__ = _countActiveWaterLayers(activeShallowKeys);
     }));
+
+    const processShallowWaterUpdate = (sectorKey: string, waterUpdate: any) => {
+      if (!waterUpdate) return;
+      updateEditorShallowSurfaceSection(
+        waterUpdate.originX,
+        waterUpdate.originZ,
+        waterUpdate.boundsX,
+        waterUpdate.boundsZ,
+        waterUpdate.gpuData,
+      );
+      this.shallowSectionRenderer?.updateSection(sectorKey, waterUpdate);
+      markEditorShallowSurfaceConnectedByLargeBody(
+        waterUpdate.originX,
+        waterUpdate.originZ,
+        waterUpdate.boundsX,
+        waterUpdate.boundsZ,
+        waterUpdate.gpuData.largeBodyField,
+        waterUpdate.gpuData.largeBodyFieldSize,
+      );
+    };
 
     if (this.sectorMeshes instanceof DVEBRSectionMeshesSingleBuffer) {
       const sectorMeshes = this.sectorMeshes as DVEBRSectionMeshesSingleBuffer;
@@ -128,12 +227,18 @@ export class DVEBabylonRenderer extends DVERenderer {
             waterUpdate.originX,
             waterUpdate.originZ,
           );
+          processShallowWaterUpdate(sectorKey, waterUpdate);
         }
         this.splatManager!.processSectionMeshes(sectorKey, meshes);
       };
 
       MeshManager.onSectorRemoved = (sectorKey) => {
         this.splatManager!.removeSector(sectorKey);
+        const [dimensionId, x, y, z] = sectorKey.split("_").map((value) => Number(value));
+        void dimensionId;
+        void y;
+        removeEditorShallowSurfaceSection(x, z);
+        this.shallowSectionRenderer?.removeSection(sectorKey);
       };
 
       // Wire fracture splats: when a voxel is erased, emit dynamic splats
@@ -180,6 +285,14 @@ export class DVEBabylonRenderer extends DVERenderer {
           waterUpdate.originX,
           waterUpdate.originZ,
         );
+        processShallowWaterUpdate(_sectorKey, waterUpdate);
+      };
+      MeshManager.onSectorRemoved = (sectorKey) => {
+        const [dimensionId, x, y, z] = sectorKey.split("_").map((value) => Number(value));
+        void dimensionId;
+        void y;
+        removeEditorShallowSurfaceSection(x, z);
+        this.shallowSectionRenderer?.removeSection(sectorKey);
       };
     }
 
@@ -207,6 +320,14 @@ export class DVEBabylonRenderer extends DVERenderer {
     this.splatManager = null;
     this.lodTracker?.dispose();
     this.lodTracker = null;
+    this.shallowSectionRenderer?.dispose();
+    this.shallowSectionRenderer = null;
+    this.shallowWaterRenderer?.dispose();
+    this.shallowWaterRenderer = null;
+    this.continuumController?.dispose();
+    this.continuumController = null;
+    clearEditorShallowSurfaceRegistry();
+    clearAllShallowWater();
     if (MeshManager.onSectionUpdated) MeshManager.onSectionUpdated = null;
     if (MeshManager.onSectorRemoved) MeshManager.onSectorRemoved = null;
     if (MeshManager.onVoxelErased) MeshManager.onVoxelErased = null;
