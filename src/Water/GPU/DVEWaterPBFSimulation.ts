@@ -18,6 +18,8 @@ const LOOP_DELAY_MS = 16;
 const INTERACTION_IMPULSE = 0.085;
 const INTERACTION_FILL = 0.12;
 const INTERACTION_FOAM = 0.35;
+const EQUIVALENCE_SAMPLE_COUNT = 16;
+const EMPTY_FLOAT_ARRAY = new Float32Array(0);
 
 type PBFParticle = {
   x: number;
@@ -30,8 +32,37 @@ type PBFParticle = {
   kind: number;
 };
 
+function buildSampledArraySignature(array: Float32Array) {
+  const parts = [String(array.length)];
+  const sampleCount = Math.min(EQUIVALENCE_SAMPLE_COUNT, array.length);
+  for (let i = 0; i < sampleCount; i++) {
+    parts.push(String(array[i]));
+  }
+  for (let i = 0; i < sampleCount; i++) {
+    const index = array.length - 1 - i;
+    if (index < sampleCount) break;
+    parts.push(String(array[index]));
+  }
+  return parts.join("|");
+}
+
+function computeRecordSignature(record: WaterLocalFluidSectionRecord) {
+  return [
+    record.originX,
+    record.originZ,
+    record.boundsX,
+    record.boundsZ,
+    record.particleSeedStride,
+    record.particleSeedCount,
+    record.interactionFieldSize ?? 0,
+    buildSampledArraySignature(record.particleSeedBuffer),
+    buildSampledArraySignature(record.interactionField ?? EMPTY_FLOAT_ARRAY),
+  ].join("::");
+}
+
 export class DVEWaterPBFSimulation implements WaterLocalFluidBackend {
   ready = false;
+  hasFreshContributions = false;
   velocityXField = new Float32Array(FIELD_SIZE * FIELD_SIZE);
   velocityZField = new Float32Array(FIELD_SIZE * FIELD_SIZE);
   fillContribField = new Float32Array(FIELD_SIZE * FIELD_SIZE);
@@ -39,12 +70,14 @@ export class DVEWaterPBFSimulation implements WaterLocalFluidBackend {
 
   private particles: PBFParticle[] = [];
   private sectionRecords: WaterLocalFluidSectionRecord[] = [];
+  private sectionSignatures = new Map<string, string>();
   private clipOriginX = 0;
   private clipOriginZ = 0;
   private needsReseed = false;
   private loopActive = false;
 
   async init(): Promise<boolean> {
+    if (this.ready) return true;
     this.ready = true;
     this.loopActive = true;
     void this.simulationLoop();
@@ -57,32 +90,60 @@ export class DVEWaterPBFSimulation implements WaterLocalFluidBackend {
       this.clipOriginX = clipOriginX;
       this.clipOriginZ = clipOriginZ;
       this.needsReseed = true;
+      this.hasFreshContributions = false;
     }
   }
 
   registerSection(record: WaterLocalFluidSectionRecord): void {
+    const key = `${record.originX}:${record.originZ}`;
+    const signature = computeRecordSignature(record);
     const index = this.sectionRecords.findIndex(
       (other) => other.originX === record.originX && other.originZ === record.originZ,
     );
     if (index === -1) {
       this.sectionRecords.push(record);
-    } else {
-      this.sectionRecords[index] = record;
+      this.sectionSignatures.set(key, signature);
+      this.needsReseed = true;
+      this.hasFreshContributions = false;
+      return;
     }
+
+    const currentSignature = this.sectionSignatures.get(key);
+    this.sectionRecords[index] = record;
+    this.sectionSignatures.set(key, signature);
+    if (currentSignature !== signature) {
+      this.needsReseed = true;
+      this.hasFreshContributions = false;
+    }
+  }
+
+  removeSection(originX: number, originZ: number): void {
+    const index = this.sectionRecords.findIndex(
+      (other) => other.originX === originX && other.originZ === originZ,
+    );
+    if (index === -1) return;
+
+    this.sectionRecords.splice(index, 1);
+    this.sectionSignatures.delete(`${originX}:${originZ}`);
     this.needsReseed = true;
+    this.hasFreshContributions = false;
   }
 
   clearSections(): void {
     this.sectionRecords.length = 0;
+    this.sectionSignatures.clear();
     this.particles.length = 0;
     this.needsReseed = true;
+    this.hasFreshContributions = false;
     this.clearFields();
   }
 
   dispose(): void {
     this.loopActive = false;
     this.ready = false;
+    this.hasFreshContributions = false;
     this.sectionRecords.length = 0;
+    this.sectionSignatures.clear();
     this.particles.length = 0;
     this.clearFields();
   }
@@ -96,8 +157,10 @@ export class DVEWaterPBFSimulation implements WaterLocalFluidBackend {
       if (this.particles.length > 0) {
         this.simulateStep();
         this.scatterParticles();
+        this.hasFreshContributions = true;
       } else {
         this.clearFields();
+        this.hasFreshContributions = false;
       }
       await sleep(LOOP_DELAY_MS);
     }

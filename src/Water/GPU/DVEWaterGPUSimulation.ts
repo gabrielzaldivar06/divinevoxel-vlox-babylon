@@ -61,38 +61,56 @@ export interface GPUSimSectionRecord {
 const MAX_INTERACTION_SEED_PARTICLES = 4096;
 const INTERACTION_SEED_THRESHOLD = 0.18;
 const INTERACTION_SEED_VELOCITY = 0.85;
+const EQUIVALENCE_SAMPLE_COUNT = 16;
+const EMPTY_FLOAT_ARRAY = new Float32Array(0);
+
+function buildSampledArraySignature(array: Float32Array) {
+  const parts = [String(array.length)];
+  const sampleCount = Math.min(EQUIVALENCE_SAMPLE_COUNT, array.length);
+  for (let i = 0; i < sampleCount; i++) {
+    parts.push(String(array[i]));
+  }
+  for (let i = 0; i < sampleCount; i++) {
+    const index = array.length - 1 - i;
+    if (index < sampleCount) break;
+    parts.push(String(array[index]));
+  }
+  return parts.join("|");
+}
+
+function computeRecordSignature(record: WaterLocalFluidSectionRecord) {
+  return [
+    record.originX,
+    record.originZ,
+    record.boundsX,
+    record.boundsZ,
+    record.particleSeedStride,
+    record.particleSeedCount,
+    record.interactionFieldSize ?? 0,
+    buildSampledArraySignature(record.particleSeedBuffer),
+    buildSampledArraySignature(record.interactionField ?? EMPTY_FLOAT_ARRAY),
+  ].join("::");
+}
 
 export class DVEWaterGPUSimulation implements WaterLocalFluidBackend {
   private device: GPUDevice | null = null;
   private simulator: DVEWaterMLSMPMSimulator | null = null;
 
-  /** True after init() has secured a GPUDevice and built all pipelines. */
   ready = false;
-
-  /**
-   * Output scatter fields — 256×256 arrays indexed [x * FIELD_SIZE + z].
-   * These are written by the async readback loop and read by the bridge.
-   * All are in the same coordinate frame as the bridge's clip fields.
-   */
+  hasFreshContributions = false;
   velocityXField = new Float32Array(FIELD_SIZE * FIELD_SIZE);
   velocityZField = new Float32Array(FIELD_SIZE * FIELD_SIZE);
   fillContribField = new Float32Array(FIELD_SIZE * FIELD_SIZE);
   foamContribField = new Float32Array(FIELD_SIZE * FIELD_SIZE);
 
   private sectionRecords: WaterLocalFluidSectionRecord[] = [];
+  private sectionSignatures = new Map<string, string>();
   private clipOriginX = 0;
   private clipOriginZ = 0;
   private needsReseed = false;
-
   private loopActive = false;
   private loopPromise: Promise<void> | null = null;
 
-  // --- public API: lifecycle ------------------------------------------------
-
-  /**
-   * Asynchronously acquires a WebGPU device and initialises the simulator.
-   * Call once at startup; returns true on success.
-   */
   async init(): Promise<boolean> {
     if (typeof navigator === "undefined" || !("gpu" in navigator)) {
       console.warn("[DVEWaterGPUSimulation] WebGPU not available — GPU MLS-MPM disabled.");
@@ -104,7 +122,7 @@ export class DVEWaterGPUSimulation implements WaterLocalFluidBackend {
         console.warn("[DVEWaterGPUSimulation] No WebGPU adapter — GPU MLS-MPM disabled.");
         return false;
       }
-      this.device = await adapter.requestDevice() as GPUDevice;
+      this.device = (await adapter.requestDevice()) as GPUDevice;
       this.simulator = new DVEWaterMLSMPMSimulator(this.device, {
         stiffness: 3.0,
         restDensity: 4.0,
@@ -124,44 +142,62 @@ export class DVEWaterGPUSimulation implements WaterLocalFluidBackend {
     }
   }
 
-  /**
-   * Notify the simulation that the bridge's clip origin has changed.
-   * Triggers a reseed on the next loop iteration.
-   */
   onClipMoved(clipOriginX: number, clipOriginZ: number): void {
     if (clipOriginX !== this.clipOriginX || clipOriginZ !== this.clipOriginZ) {
       this.clipOriginX = clipOriginX;
       this.clipOriginZ = clipOriginZ;
       this.needsReseed = true;
+      this.hasFreshContributions = false;
     }
   }
 
-  /**
-   * Register or update a water section for seeding.
-   * Call this whenever the bridge receives a new WaterSectionGPUData.
-   */
   registerSection(record: WaterLocalFluidSectionRecord): void {
+    const key = `${record.originX}:${record.originZ}`;
+    const signature = computeRecordSignature(record);
     const idx = this.sectionRecords.findIndex(
-      (r) => r.originX === record.originX && r.originZ === record.originZ
+      (other) => other.originX === record.originX && other.originZ === record.originZ,
     );
     if (idx < 0) {
       this.sectionRecords.push(record);
-    } else {
-      this.sectionRecords[idx] = record;
+      this.sectionSignatures.set(key, signature);
+      this.needsReseed = true;
+      this.hasFreshContributions = false;
+      return;
     }
-    this.needsReseed = true;
+
+    const currentSignature = this.sectionSignatures.get(key);
+    this.sectionRecords[idx] = record;
+    this.sectionSignatures.set(key, signature);
+    if (currentSignature !== signature) {
+      this.needsReseed = true;
+      this.hasFreshContributions = false;
+    }
   }
 
-  /** Remove all section records (e.g. on world unload). */
+  removeSection(originX: number, originZ: number): void {
+    const index = this.sectionRecords.findIndex(
+      (record) => record.originX === originX && record.originZ === originZ,
+    );
+    if (index === -1) return;
+
+    this.sectionRecords.splice(index, 1);
+    this.sectionSignatures.delete(`${originX}:${originZ}`);
+    this.needsReseed = true;
+    this.hasFreshContributions = false;
+  }
+
   clearSections(): void {
     this.sectionRecords.length = 0;
+    this.sectionSignatures.clear();
     this.needsReseed = true;
+    this.hasFreshContributions = false;
     this.clearOutputFields();
   }
 
-  /** Stop the loop and free GPU resources. */
   dispose(): void {
     this.loopActive = false;
+    this.hasFreshContributions = false;
+    this.sectionSignatures.clear();
     this.clearOutputFields();
     this.simulator?.dispose();
     this.simulator = null;
@@ -388,6 +424,7 @@ export class DVEWaterGPUSimulation implements WaterLocalFluidBackend {
     while (this.loopActive) {
       if (!this.ready || !this.simulator) {
         this.clearOutputFields();
+        this.hasFreshContributions = false;
         await _sleep(50);
         continue;
       }
@@ -401,6 +438,7 @@ export class DVEWaterGPUSimulation implements WaterLocalFluidBackend {
 
       if (this.simulator.numParticles === 0) {
         this.clearOutputFields();
+        this.hasFreshContributions = false;
         await _sleep(50);
         continue;
       }
@@ -416,8 +454,10 @@ export class DVEWaterGPUSimulation implements WaterLocalFluidBackend {
       const posvelData = await this.simulator.awaitReadback();
       if (posvelData) {
         this.scatterReadback(posvelData, this.simulator.numParticles);
+        this.hasFreshContributions = true;
       } else {
         this.clearOutputFields();
+        this.hasFreshContributions = false;
       }
 
       // Yield to allow the main thread to process events between steps

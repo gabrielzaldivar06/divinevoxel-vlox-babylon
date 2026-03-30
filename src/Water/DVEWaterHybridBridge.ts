@@ -5,9 +5,19 @@ import type { WaterSectionGPUData } from "@divinevoxel/vlox/Water/Types/WaterTyp
 import { DVEWaterLocalFluidSystem } from "./GPU/DVEWaterLocalFluidSystem.js";
 import type { WaterLocalFluidBudget } from "./GPU/DVEWaterLocalFluidTypes.js";
 import { DVEWaterComputeRefiner } from "./GPU/DVEWaterComputeRefiner.js";
+import {
+  type HybridBridgeContinuousSectionInput,
+  type HybridBridgeShallowSectionInput,
+  readHybridContinuousColumn,
+  readHybridShallowColumn,
+} from "./DVEWaterHybridBridge.contracts.js";
+import {
+  refineHybridVisualFields,
+  type HybridVisualRefinerFields,
+  type HybridVisualRefinerTuning,
+} from "./DVEWaterHybridVisualRefiner.js";
 
 const DEFAULT_PIXEL = new Uint8Array([128, 32, 192, 255]);
-const UNKNOWN_SHORE_DISTANCE = 0xff;
 const bridgeCache = new WeakMap<Scene, DVEWaterHybridBridge>();
 const HYBRID_TEXTURE_SIZE = 256;
 const HYBRID_CLIP_HALF = HYBRID_TEXTURE_SIZE / 2;
@@ -34,36 +44,33 @@ const VELOCITY_LIMIT = 1.35;
 const INTERACTION_TO_FLOW = 0.22;
 const INTERACTION_TO_FOAM = 0.3;
 const INTERACTION_TO_PRESSURE = 0.2;
-const PATCH_SUMMARY_MEAN_FLOW_INDEX = 6;
-const PATCH_SUMMARY_MEAN_TURBULENCE_INDEX = 7;
-const PATCH_SUMMARY_WAVE_DIRECTION_X_INDEX = 8;
-const PATCH_SUMMARY_WAVE_DIRECTION_Z_INDEX = 9;
-const PATCH_SUMMARY_SHORE_INFLUENCE_INDEX = 10;
-const PATCH_SUMMARY_ANTI_PERIODICITY_SEED_INDEX = 11;
+
+const HYBRID_VISUAL_REFINER_TUNING: HybridVisualRefinerTuning = {
+  velocityAdvection: VELOCITY_ADVECTION,
+  velocityDamping: VELOCITY_DAMPING,
+  targetPull: TARGET_PULL,
+  fillRelaxation: FILL_RELAXATION,
+  pressureResponse: PRESSURE_RESPONSE,
+  taitStiffness: TAIT_STIFFNESS,
+  taitRestDensity: TAIT_REST_DENSITY,
+  foamDecay: FOAM_DECAY,
+  edgeDecay: EDGE_DECAY,
+  massTransferRate: MASS_TRANSFER_RATE,
+  massRetention: MASS_RETENTION,
+  momentumResponse: MOMENTUM_RESPONSE,
+  velocityLimit: VELOCITY_LIMIT,
+  interactionToFlow: INTERACTION_TO_FLOW,
+  interactionToFoam: INTERACTION_TO_FOAM,
+  interactionToPressure: INTERACTION_TO_PRESSURE,
+};
 
 function isSettledBenchmarkHydrology() {
   const benchmark = (globalThis as any).__DVE_TERRAIN_BENCHMARK__;
   return benchmark?.hydrologySettled === true;
 }
 
-interface CachedWaterSectionState {
-  key: string;
-  originX: number;
-  originZ: number;
-  boundsX: number;
-  boundsZ: number;
-  paddedBoundsX: number;
-  paddedBoundsZ: number;
-  gpuData: WaterSectionGPUData;
-}
-
 function clamp01(value: number) {
   return Math.max(0, Math.min(1, value));
-}
-
-function decodeShoreDistance(metadata: number) {
-  const shoreDistance = (metadata >>> 16) & 0xff;
-  return shoreDistance === UNKNOWN_SHORE_DISTANCE ? -1 : shoreDistance;
 }
 
 function fract(value: number) {
@@ -89,6 +96,28 @@ function createTexture(scene: Scene, data: Uint8Array, width: number, height: nu
 function shouldWriteDebugTexture(scene: Scene) {
   const mode = String(scene.metadata?.dveWaterDebugMode || "off").toLowerCase();
   return mode !== "off";
+}
+
+export interface WaterHybridBridgeFrameStats {
+  frame: number;
+  dirtyAtFrameStart: boolean;
+  targetsDirty: boolean;
+  targetsDirtyMarks: number;
+  rebuildTargetsCalls: number;
+  simulateStepCalls: number;
+  textureUpdateCalls: number;
+  textureUploadPasses: number;
+  convergedTransitions: number;
+  convergedState: boolean;
+  skippedForSettled: boolean;
+  skippedForConverged: boolean;
+  shallowInjectedSections: number;
+  shallowRetainedSections: number;
+  shallowRemovedSections: number;
+  clipRecentered: boolean;
+  activeContinuousSections: number;
+  activeShallowSections: number;
+  dirtyReasons: Record<string, number>;
 }
 
 export class DVEWaterHybridBridge {
@@ -123,9 +152,15 @@ export class DVEWaterHybridBridge {
   private particleFlowField = new Float32Array(HYBRID_TEXTURE_SIZE * HYBRID_TEXTURE_SIZE);
   private pressureField = new Float32Array(HYBRID_TEXTURE_SIZE * HYBRID_TEXTURE_SIZE);
   private pressureFieldNext = new Float32Array(HYBRID_TEXTURE_SIZE * HYBRID_TEXTURE_SIZE);
-  private massDeltaField = new Float32Array(HYBRID_TEXTURE_SIZE * HYBRID_TEXTURE_SIZE);
+  // Visual-only redistribution term used by the bridge refiner. It must never
+  // be fed back into runtime physics ownership, transport, or mass accounting.
+  private visualMassDeltaField = new Float32Array(HYBRID_TEXTURE_SIZE * HYBRID_TEXTURE_SIZE);
   private shiftFieldScratch = new Float32Array(HYBRID_TEXTURE_SIZE * HYBRID_TEXTURE_SIZE);
-  private sectionStates = new Map<string, CachedWaterSectionState>();
+  // Extracted visual inputs only. The bridge may refine and pack these for shading,
+  // but it must never become gameplay authority for water state.
+  private sectionStates = new Map<string, HybridBridgeContinuousSectionInput>();
+  private shallowSectionStates = new Map<string, HybridBridgeShallowSectionInput>();
+  private shallowSectionsSeenThisFrame = new Set<string>();
   private targetsDirty = false;
   /** True once simulation has converged (max field delta below threshold). */
   private _converged = false;
@@ -176,6 +211,8 @@ export class DVEWaterHybridBridge {
   private targetRebuildAccumulator = 0;
   private clipOriginX = -HYBRID_CLIP_HALF;
   private clipOriginZ = -HYBRID_CLIP_HALF;
+  private frameCounter = 0;
+  private frameStats: WaterHybridBridgeFrameStats = this.createEmptyFrameStats(0);
 
   constructor(public scene: Scene) {
     this.baseTextureData.fill(0);
@@ -205,7 +242,7 @@ export class DVEWaterHybridBridge {
     this.particleFlowField.fill(0);
     this.pressureField.fill(0);
     this.pressureFieldNext.fill(0);
-    this.massDeltaField.fill(0);
+    this.visualMassDeltaField.fill(0);
     this.baseTextureData.set(DEFAULT_PIXEL, 0);
     this.dynamicTextureData.set(DEFAULT_PIXEL, 0);
     this.flowTextureData.set(DEFAULT_PIXEL, 0);
@@ -262,6 +299,84 @@ export class DVEWaterHybridBridge {
     };
   }
 
+  private createEmptyFrameStats(frame: number): WaterHybridBridgeFrameStats {
+    return {
+      frame,
+      dirtyAtFrameStart: false,
+      targetsDirty: false,
+      targetsDirtyMarks: 0,
+      rebuildTargetsCalls: 0,
+      simulateStepCalls: 0,
+      textureUpdateCalls: 0,
+      textureUploadPasses: 0,
+      convergedTransitions: 0,
+      convergedState: false,
+      skippedForSettled: false,
+      skippedForConverged: false,
+      shallowInjectedSections: 0,
+      shallowRetainedSections: 0,
+      shallowRemovedSections: 0,
+      clipRecentered: false,
+      activeContinuousSections: 0,
+      activeShallowSections: 0,
+      dirtyReasons: {},
+    };
+  }
+
+  beginFrame() {
+    this.frameCounter += 1;
+    this.frameStats = this.createEmptyFrameStats(this.frameCounter);
+    this.frameStats.dirtyAtFrameStart = this.targetsDirty;
+    this.frameStats.targetsDirty = this.targetsDirty;
+    this.frameStats.convergedState = this._converged;
+    this.frameStats.activeContinuousSections = this.sectionStates.size;
+    this.frameStats.activeShallowSections = this.shallowSectionStates.size;
+  }
+
+  getFrameStats(): WaterHybridBridgeFrameStats {
+    return {
+      ...this.frameStats,
+      targetsDirty: this.targetsDirty,
+      convergedState: this._converged,
+      activeContinuousSections: this.sectionStates.size,
+      activeShallowSections: this.shallowSectionStates.size,
+      dirtyReasons: { ...this.frameStats.dirtyReasons },
+    };
+  }
+
+  private noteTargetsDirty(reason: string) {
+    this.targetsDirty = true;
+    this._converged = false;
+    this._stableFrames = 0;
+    this.frameStats.targetsDirty = true;
+    this.frameStats.targetsDirtyMarks += 1;
+    this.frameStats.convergedState = false;
+    this.frameStats.dirtyReasons[reason] = (this.frameStats.dirtyReasons[reason] ?? 0) + 1;
+  }
+
+  private runRebuildTargets() {
+    this.frameStats.rebuildTargetsCalls += 1;
+    this.rebuildTargets();
+  }
+
+  private runSimulateStep(deltaSeconds: number) {
+    this.frameStats.simulateStepCalls += 1;
+    this.simulateStep(deltaSeconds);
+  }
+
+  private uploadTextures(writeDebugTexture: boolean) {
+    this.frameStats.textureUploadPasses += 1;
+    this.baseTexture.update(this.baseTextureData);
+    this.dynamicTexture.update(this.dynamicTextureData);
+    this.flowTexture.update(this.flowTextureData);
+    this.frameStats.textureUpdateCalls += 3;
+    if (writeDebugTexture) {
+      this.debugTexture.update(this.debugTextureData);
+      this.frameStats.textureUpdateCalls += 1;
+    }
+    this.frameStats.targetsDirty = this.targetsDirty;
+  }
+
   reset() {
     this.width = HYBRID_TEXTURE_SIZE;
     this.height = HYBRID_TEXTURE_SIZE;
@@ -274,6 +389,8 @@ export class DVEWaterHybridBridge {
     this.flowStagingTextureData = new Uint8Array(HYBRID_TEXTURE_SIZE * HYBRID_TEXTURE_SIZE * 4);
     this.debugStagingTextureData = new Uint8Array(HYBRID_TEXTURE_SIZE * HYBRID_TEXTURE_SIZE * 4);
     this.sectionStates.clear();
+    this.shallowSectionStates.clear();
+    this.shallowSectionsSeenThisFrame.clear();
     this.elapsedTime = 0;
     this.accumulatedDelta = 0;
     this.targetRebuildAccumulator = 0;
@@ -306,13 +423,11 @@ export class DVEWaterHybridBridge {
     this.particleFlowField.fill(0);
     this.pressureField.fill(0);
     this.pressureFieldNext.fill(0);
-    this.massDeltaField.fill(0);
+    this.visualMassDeltaField.fill(0);
     this.baseTextureData.set(DEFAULT_PIXEL, 0);
     this.dynamicTextureData.set(DEFAULT_PIXEL, 0);
     this.flowTextureData.set(DEFAULT_PIXEL, 0);
-    this.baseTexture.update(this.baseTextureData);
-    this.dynamicTexture.update(this.dynamicTextureData);
-    this.flowTexture.update(this.flowTextureData);
+    this.uploadTextures(false);
     this.gpuSim?.clearSections();
   }
 
@@ -351,32 +466,6 @@ export class DVEWaterHybridBridge {
     this.shiftField(this.pressureField, shiftX, shiftZ);
   }
 
-  private clampVelocity(value: number) {
-    return Math.max(-VELOCITY_LIMIT, Math.min(VELOCITY_LIMIT, value));
-  }
-
-  private applyPairTransfer(
-    fromIndex: number,
-    toIndex: number,
-    signedDrive: number,
-    availableFrom: number,
-    availableTo: number,
-    deltaSeconds: number,
-  ) {
-    const proposedTransfer = signedDrive * MASS_TRANSFER_RATE * deltaSeconds;
-    if (proposedTransfer > 0) {
-      const transfer = Math.min(proposedTransfer, availableFrom * 0.5);
-      this.massDeltaField[fromIndex] -= transfer;
-      this.massDeltaField[toIndex] += transfer;
-      return;
-    }
-    if (proposedTransfer < 0) {
-      const transfer = Math.min(-proposedTransfer, availableTo * 0.5);
-      this.massDeltaField[fromIndex] += transfer;
-      this.massDeltaField[toIndex] -= transfer;
-    }
-  }
-
   private isInClipBounds(x: number, z: number) {
     return (
       x >= this.clipOriginX &&
@@ -386,7 +475,7 @@ export class DVEWaterHybridBridge {
     );
   }
 
-  private stampParticles(section: CachedWaterSectionState) {
+  private stampParticles(section: HybridBridgeContinuousSectionInput) {
     const particleStride = section.gpuData.particleSeedStride;
     const particleCount = section.gpuData.particleSeedCount;
     const particles = section.gpuData.particleSeedBuffer;
@@ -425,58 +514,6 @@ export class DVEWaterHybridBridge {
     }
   }
 
-  private getPaddedIndex(section: CachedWaterSectionState, localX: number, localZ: number) {
-    const paddedRadiusX = Math.max(0, Math.floor((section.paddedBoundsX - section.boundsX) * 0.5));
-    const paddedRadiusZ = Math.max(0, Math.floor((section.paddedBoundsZ - section.boundsZ) * 0.5));
-    return (localX + paddedRadiusX) * section.paddedBoundsZ + (localZ + paddedRadiusZ);
-  }
-
-  private sampleContinuity(section: CachedWaterSectionState, localX: number, localZ: number) {
-    const stride = section.gpuData.paddedColumnStride;
-    let fill = 0;
-    let flowX = 0;
-    let flowZ = 0;
-    let flowStrength = 0;
-    let turbulence = 0;
-    let shoreFactor = 0;
-    let samples = 0;
-
-    for (let offsetX = -1; offsetX <= 1; offsetX++) {
-      for (let offsetZ = -1; offsetZ <= 1; offsetZ++) {
-        const paddedX = localX + offsetX;
-        const paddedZ = localZ + offsetZ;
-        const paddedIndex = this.getPaddedIndex(section, paddedX, paddedZ);
-        if (paddedIndex < 0 || paddedIndex >= section.gpuData.paddedColumnMetadata.length) continue;
-        const metadata = section.gpuData.paddedColumnMetadata[paddedIndex] ?? 0;
-        const filled = (metadata & 0x1) === 1;
-        if (!filled) continue;
-
-        const dataIndex = paddedIndex * stride;
-        fill += clamp01(section.gpuData.paddedColumnBuffer[dataIndex + 2] ?? 0);
-        flowX += section.gpuData.paddedColumnBuffer[dataIndex + 3] ?? 0;
-        flowZ += section.gpuData.paddedColumnBuffer[dataIndex + 4] ?? 0;
-        flowStrength += clamp01(section.gpuData.paddedColumnBuffer[dataIndex + 5] ?? 0);
-        turbulence += clamp01(section.gpuData.paddedColumnBuffer[dataIndex + 7] ?? 0);
-        const shoreDistance = decodeShoreDistance(metadata);
-        shoreFactor += shoreDistance < 0 ? 1 : clamp01(1 - Math.min(shoreDistance, 8) / 8);
-        samples += 1;
-      }
-    }
-
-    if (samples === 0) {
-      return null;
-    }
-
-    return {
-      fill: fill / samples,
-      flowX: flowX / samples,
-      flowZ: flowZ / samples,
-      flowStrength: flowStrength / samples,
-      turbulence: turbulence / samples,
-      shoreFactor: shoreFactor / samples,
-    };
-  }
-
   private rebuildTargets() {
     this.targetFillField.fill(0);
     this.targetVelocityXField.fill(0);
@@ -509,55 +546,38 @@ export class DVEWaterHybridBridge {
         const clipIndex = this.getClipIndex(worldX, worldZ);
         if (clipIndex < 0) continue;
         const dataIndex = index * stride;
-        const metadata = section.gpuData.columnMetadata[index] ?? 0;
-        const filled = (metadata & 0x1) === 1;
-        if (!filled) continue;
+        const column = readHybridContinuousColumn(section, localX, localZ);
+        if (!column.filled) continue;
 
-        const continuity = this.sampleContinuity(section, localX, localZ);
-        const fill = continuity?.fill ?? clamp01(section.gpuData.columnBuffer[dataIndex + 2] ?? 0);
-        const flowX = continuity?.flowX ?? section.gpuData.columnBuffer[dataIndex + 3] ?? 0;
-        const flowZ = continuity?.flowZ ?? section.gpuData.columnBuffer[dataIndex + 4] ?? 0;
-        const flowStrength = continuity?.flowStrength ?? clamp01(section.gpuData.columnBuffer[dataIndex + 5] ?? 0);
-        const turbulence = continuity?.turbulence ?? clamp01(section.gpuData.columnBuffer[dataIndex + 7] ?? 0);
-        const shoreDistance = decodeShoreDistance(metadata);
-        let resolvedFlowX = flowX;
-        let resolvedFlowZ = flowZ;
-        let resolvedFlowStrength = flowStrength;
-        let resolvedTurbulence = turbulence;
-        let shoreFactor = continuity?.shoreFactor ?? (shoreDistance < 0 ? 1 : clamp01(1 - Math.min(shoreDistance, 8) / 8));
-        const patchSummaryIndex = this.getColumnPatchSummaryIndex(section, index);
-        if (patchSummaryIndex >= 0) {
-          const patchStride = section.gpuData.patchSummaryStride;
-          const patchBaseIndex = patchSummaryIndex * patchStride;
-          const patchSummary = section.gpuData.patchSummaryBuffer;
-          const patchMeanFlow = clamp01(patchSummary[patchBaseIndex + PATCH_SUMMARY_MEAN_FLOW_INDEX] ?? 0);
-          const patchMeanTurbulence = clamp01(
-            patchSummary[patchBaseIndex + PATCH_SUMMARY_MEAN_TURBULENCE_INDEX] ?? 0,
-          );
-          const patchWaveDirectionX = patchSummary[patchBaseIndex + PATCH_SUMMARY_WAVE_DIRECTION_X_INDEX] ?? 0;
-          const patchWaveDirectionZ = patchSummary[patchBaseIndex + PATCH_SUMMARY_WAVE_DIRECTION_Z_INDEX] ?? 0;
-          const patchShoreInfluence = clamp01(
-            patchSummary[patchBaseIndex + PATCH_SUMMARY_SHORE_INFLUENCE_INDEX] ?? 0,
-          );
-          const patchPhase = this.getPatchPhase(
-            patchSummary[patchBaseIndex + PATCH_SUMMARY_ANTI_PERIODICITY_SEED_INDEX] ?? 0,
-          );
+        let resolvedFlowX = column.flowX;
+        let resolvedFlowZ = column.flowZ;
+        let resolvedFlowStrength = column.flowStrength;
+        let resolvedTurbulence = column.turbulence;
+        let shoreFactor = column.shoreFactor;
+        const patchSummary = column.patchSummary;
+        if (patchSummary) {
+          const patchMeanFlow = clamp01(patchSummary.meanFlow);
+          const patchMeanTurbulence = clamp01(patchSummary.meanTurbulence);
+          const patchWaveDirectionX = patchSummary.dominantWaveDirectionX;
+          const patchWaveDirectionZ = patchSummary.dominantWaveDirectionZ;
+          const patchShoreInfluence = clamp01(patchSummary.shoreInfluence);
+          const patchPhase = this.getPatchPhase(patchSummary.antiPeriodicitySeed);
           const directionWeight = 0.25 + patchMeanFlow * 0.35;
-          resolvedFlowX = flowX * (1 - directionWeight) + patchWaveDirectionX * directionWeight;
-          resolvedFlowZ = flowZ * (1 - directionWeight) + patchWaveDirectionZ * directionWeight;
-          resolvedFlowStrength = Math.max(flowStrength, patchMeanFlow);
-          resolvedTurbulence = Math.max(turbulence, patchMeanTurbulence * 0.9);
+          resolvedFlowX = column.flowX * (1 - directionWeight) + patchWaveDirectionX * directionWeight;
+          resolvedFlowZ = column.flowZ * (1 - directionWeight) + patchWaveDirectionZ * directionWeight;
+          resolvedFlowStrength = Math.max(column.flowStrength, patchMeanFlow);
+          resolvedTurbulence = Math.max(column.turbulence, patchMeanTurbulence * 0.9);
           shoreFactor = Math.max(shoreFactor, patchShoreInfluence * 0.9);
           if (patchMeanFlow >= this.targetPatchFlowField[clipIndex]) {
             this.targetPatchFlowField[clipIndex] = patchMeanFlow;
             this.targetPatchPhaseField[clipIndex] = patchPhase;
           }
         }
-        const interaction = this.sampleSectionInteractionField(section, localX, localZ);
-        const largeBody = this.sampleSectionLargeBodyField(section, localX, localZ);
+        const interaction = column.interaction;
+        const largeBody = column.largeBody;
         resolvedFlowStrength = Math.max(resolvedFlowStrength, largeBody * 0.7);
         resolvedTurbulence = Math.max(resolvedTurbulence, largeBody * 0.18);
-        this.targetFillField[clipIndex] = Math.max(this.targetFillField[clipIndex], fill);
+        this.targetFillField[clipIndex] = Math.max(this.targetFillField[clipIndex], column.fill);
         this.targetVelocityXField[clipIndex] = resolvedFlowX;
         this.targetVelocityZField[clipIndex] = resolvedFlowZ;
         this.targetFlowField[clipIndex] = Math.max(this.targetFlowField[clipIndex], resolvedFlowStrength);
@@ -569,205 +589,91 @@ export class DVEWaterHybridBridge {
       }
       this.stampParticles(section);
     }
+    this.stampShallowTargets();
   }
 
-  private sampleScalarField(field: Float32Array, x: number, z: number) {
-    const clampedX = Math.max(0, Math.min(this.width - 1, x));
-    const clampedZ = Math.max(0, Math.min(this.height - 1, z));
-    const x0 = Math.floor(clampedX);
-    const z0 = Math.floor(clampedZ);
-    const x1 = Math.min(this.width - 1, x0 + 1);
-    const z1 = Math.min(this.height - 1, z0 + 1);
-    const tx = clampedX - x0;
-    const tz = clampedZ - z0;
-    const a = field[x0 * this.height + z0];
-    const b = field[x1 * this.height + z0];
-    const c = field[x0 * this.height + z1];
-    const d = field[x1 * this.height + z1];
-    const ab = a + (b - a) * tx;
-    const cd = c + (d - c) * tx;
-    return ab + (cd - ab) * tz;
-  }
-
-  private sampleSectionInteractionField(section: CachedWaterSectionState, localX: number, localZ: number) {
-    const field = section.gpuData.interactionField;
-    const size = section.gpuData.interactionFieldSize;
-    if (!field || field.length === 0 || size <= 0) {
-      return 0;
+  private stampShallowTargets() {
+    for (const section of this.shallowSectionStates.values()) {
+      for (let xi = 0; xi < section.sizeX; xi++) {
+        for (let zi = 0; zi < section.sizeZ; zi++) {
+          const worldX = section.originX + xi;
+          const worldZ = section.originZ + zi;
+          const idx = this.getClipIndex(worldX, worldZ);
+          if (idx < 0) continue;
+          const column = readHybridShallowColumn(section, xi, zi);
+          if (!column.active || column.thickness <= 0) {
+            continue;
+          }
+          const fill = Math.min(1, column.thickness);
+          const speed = Math.sqrt(
+            column.spreadVX * column.spreadVX + column.spreadVZ * column.spreadVZ,
+          );
+          this.targetPresenceField[idx] = Math.max(this.targetPresenceField[idx], fill);
+          this.targetFillField[idx] = Math.max(this.targetFillField[idx], fill);
+          this.targetFlowField[idx] = Math.max(this.targetFlowField[idx], Math.min(1, speed));
+          this.targetVelocityXField[idx] = column.spreadVX;
+          this.targetVelocityZField[idx] = column.spreadVZ;
+          if (column.shoreDistance <= 1) {
+            this.targetShoreField[idx] = Math.max(this.targetShoreField[idx], 0.8);
+          }
+        }
+      }
     }
-    const fx = clamp01((localX + 0.5) / Math.max(section.boundsX, 1)) * (size - 1);
-    const fz = clamp01((localZ + 0.5) / Math.max(section.boundsZ, 1)) * (size - 1);
-    const x0 = Math.floor(fx);
-    const z0 = Math.floor(fz);
-    const x1 = Math.min(size - 1, x0 + 1);
-    const z1 = Math.min(size - 1, z0 + 1);
-    const tx = fx - x0;
-    const tz = fz - z0;
-    const v00 = field[x0 * size + z0] ?? 0;
-    const v10 = field[x1 * size + z0] ?? 0;
-    const v01 = field[x0 * size + z1] ?? 0;
-    const v11 = field[x1 * size + z1] ?? 0;
-    const north = v00 + (v10 - v00) * tx;
-    const south = v01 + (v11 - v01) * tx;
-    return clamp01(north + (south - north) * tz);
   }
 
-  private sampleSectionLargeBodyField(section: CachedWaterSectionState, localX: number, localZ: number) {
-    const field = section.gpuData.largeBodyField;
-    const size = section.gpuData.largeBodyFieldSize;
-    if (!field || field.length === 0 || size <= 0) {
-      return 0;
-    }
-    const fx = clamp01((localX + 0.5) / Math.max(section.boundsX, 1)) * (size - 1);
-    const fz = clamp01((localZ + 0.5) / Math.max(section.boundsZ, 1)) * (size - 1);
-    const x0 = Math.floor(fx);
-    const z0 = Math.floor(fz);
-    const x1 = Math.min(size - 1, x0 + 1);
-    const z1 = Math.min(size - 1, z0 + 1);
-    const tx = fx - x0;
-    const tz = fz - z0;
-    const v00 = field[x0 * size + z0] ?? 0;
-    const v10 = field[x1 * size + z0] ?? 0;
-    const v01 = field[x0 * size + z1] ?? 0;
-    const v11 = field[x1 * size + z1] ?? 0;
-    const north = v00 + (v10 - v00) * tx;
-    const south = v01 + (v11 - v01) * tx;
-    return clamp01(north + (south - north) * tz);
-  }
-
-  private getColumnPatchSummaryIndex(section: CachedWaterSectionState, columnIndex: number) {
-    const lookup = section.gpuData.columnPatchIndex[columnIndex] ?? 0;
-    if (lookup <= 0) {
-      return -1;
-    }
-    const patchIndex = lookup - 1;
-    return patchIndex >= 0 && patchIndex < section.gpuData.patchSummaryCount ? patchIndex : -1;
-  }
 
   private getPatchPhase(seed: number) {
     return fract(Math.abs(seed) * 0.61803398875);
   }
 
+  private createVisualRefinerFields(): HybridVisualRefinerFields {
+    return {
+      width: this.width,
+      height: this.height,
+      fillField: this.fillField,
+      fillFieldNext: this.fillFieldNext,
+      velocityXField: this.velocityXField,
+      velocityXFieldNext: this.velocityXFieldNext,
+      velocityZField: this.velocityZField,
+      velocityZFieldNext: this.velocityZFieldNext,
+      foamField: this.foamField,
+      foamFieldNext: this.foamFieldNext,
+      pressureField: this.pressureField,
+      pressureFieldNext: this.pressureFieldNext,
+      targetFillField: this.targetFillField,
+      targetVelocityXField: this.targetVelocityXField,
+      targetVelocityZField: this.targetVelocityZField,
+      targetFlowField: this.targetFlowField,
+      targetTurbulenceField: this.targetTurbulenceField,
+      targetShoreField: this.targetShoreField,
+      targetInteractionField: this.targetInteractionField,
+      targetPresenceField: this.targetPresenceField,
+      particleFoamField: this.particleFoamField,
+      visualMassDeltaField: this.visualMassDeltaField,
+    };
+  }
+
+  private applyVisualRefinerFields(next: HybridVisualRefinerFields) {
+    this.fillField = next.fillField as typeof this.fillField;
+    this.fillFieldNext = next.fillFieldNext as typeof this.fillFieldNext;
+    this.velocityXField = next.velocityXField as typeof this.velocityXField;
+    this.velocityXFieldNext = next.velocityXFieldNext as typeof this.velocityXFieldNext;
+    this.velocityZField = next.velocityZField as typeof this.velocityZField;
+    this.velocityZFieldNext = next.velocityZFieldNext as typeof this.velocityZFieldNext;
+    this.foamField = next.foamField as typeof this.foamField;
+    this.foamFieldNext = next.foamFieldNext as typeof this.foamFieldNext;
+    this.pressureField = next.pressureField as typeof this.pressureField;
+    this.pressureFieldNext = next.pressureFieldNext as typeof this.pressureFieldNext;
+  }
+
   private simulateStep(deltaSeconds: number) {
-    this.massDeltaField.fill(0);
-
-    for (let x = 0; x < this.width; x++) {
-      for (let z = 0; z < this.height; z++) {
-        const index = x * this.height + z;
-        const currentFill = this.fillField[index];
-        const currentVelocityX = this.velocityXField[index];
-        const currentVelocityZ = this.velocityZField[index];
-        const targetVelocityX = this.targetVelocityXField[index] * this.targetFlowField[index];
-        const targetVelocityZ = this.targetVelocityZField[index] * this.targetFlowField[index];
-
-        if (x + 1 < this.width) {
-          const rightIndex = (x + 1) * this.height + z;
-          const rightFill = this.fillField[rightIndex];
-          const rightTargetVelocityX = this.targetVelocityXField[rightIndex] * this.targetFlowField[rightIndex];
-          const pairVelocity = (currentVelocityX + this.velocityXField[rightIndex]) * 0.5;
-          const pairTargetVelocity = (targetVelocityX + rightTargetVelocityX) * 0.5;
-          const signedDrive =
-            (currentFill - rightFill) * 0.55 +
-            pairVelocity * 0.34 +
-            pairTargetVelocity * MOMENTUM_RESPONSE;
-          this.applyPairTransfer(index, rightIndex, signedDrive, currentFill, rightFill, deltaSeconds);
-        }
-
-        if (z + 1 < this.height) {
-          const downIndex = x * this.height + (z + 1);
-          const downFill = this.fillField[downIndex];
-          const downTargetVelocityZ = this.targetVelocityZField[downIndex] * this.targetFlowField[downIndex];
-          const pairVelocity = (currentVelocityZ + this.velocityZField[downIndex]) * 0.5;
-          const pairTargetVelocity = (targetVelocityZ + downTargetVelocityZ) * 0.5;
-          const signedDrive =
-            (currentFill - downFill) * 0.55 +
-            pairVelocity * 0.34 +
-            pairTargetVelocity * MOMENTUM_RESPONSE;
-          this.applyPairTransfer(index, downIndex, signedDrive, currentFill, downFill, deltaSeconds);
-        }
-      }
-    }
-
-    for (let x = 0; x < this.width; x++) {
-      for (let z = 0; z < this.height; z++) {
-        const index = x * this.height + z;
-        const currentFill = this.fillField[index];
-        const targetPresence = this.targetPresenceField[index];
-        const targetFill = this.targetFillField[index];
-        const currentVelocityX = this.velocityXField[index];
-        const currentVelocityZ = this.velocityZField[index];
-        const sampleX = x - currentVelocityX * VELOCITY_ADVECTION * deltaSeconds;
-        const sampleZ = z - currentVelocityZ * VELOCITY_ADVECTION * deltaSeconds;
-        const advectedFill = this.sampleScalarField(this.fillField, sampleX, sampleZ);
-        const advectedFoam = this.sampleScalarField(this.foamField, sampleX, sampleZ);
-
-        const leftFill = this.fillField[Math.max(0, x - 1) * this.height + z];
-        const rightFill = this.fillField[Math.min(this.width - 1, x + 1) * this.height + z];
-        const upFill = this.fillField[x * this.height + Math.max(0, z - 1)];
-        const downFill = this.fillField[x * this.height + Math.min(this.height - 1, z + 1)];
-        const neighborAverage = (leftFill + rightFill + upFill + downFill) * 0.25;
-        const netMass = this.massDeltaField[index];
-        // WaterBall tension-free Tait EOS: max(0,...) ensures fluid only pushes when
-        // compressed beyond rest density, never pulls back when sparse → water spreads freely.
-        const taitPressure = Math.max(0, TAIT_STIFFNESS * (Math.pow(advectedFill / TAIT_REST_DENSITY, 5) - 1));
-        const pressure = (taitPressure * 0.6 + (neighborAverage - advectedFill) * 0.4 + netMass * 2.2) * PRESSURE_RESPONSE;
-        const targetVelocityX = this.targetVelocityXField[index] * this.targetFlowField[index];
-        const targetVelocityZ = this.targetVelocityZField[index] * this.targetFlowField[index];
-        const interaction = this.targetInteractionField[index];
-        const gradientX = (leftFill - rightFill) * 0.5;
-        const gradientZ = (upFill - downFill) * 0.5;
-        const shoreDamping = 1 - this.targetShoreField[index] * 0.24;
-        const presenceMix = targetPresence > 0 ? TARGET_PULL : 0.03;
-        let nextVelocityX = currentVelocityX * VELOCITY_DAMPING + targetVelocityX * presenceMix + gradientX * 0.2;
-        let nextVelocityZ = currentVelocityZ * VELOCITY_DAMPING + targetVelocityZ * presenceMix + gradientZ * 0.2;
-        nextVelocityX += pressure * Math.sign(gradientX || targetVelocityX || 1) * 0.08;
-        nextVelocityZ += pressure * Math.sign(gradientZ || targetVelocityZ || 1) * 0.08;
-        nextVelocityX += netMass * 0.9;
-        nextVelocityZ += netMass * 0.9;
-        nextVelocityX += targetVelocityX * interaction * INTERACTION_TO_FLOW;
-        nextVelocityZ += targetVelocityZ * interaction * INTERACTION_TO_FLOW;
-        nextVelocityX *= shoreDamping;
-        nextVelocityZ *= shoreDamping;
-        nextVelocityX = this.clampVelocity(nextVelocityX);
-        nextVelocityZ = this.clampVelocity(nextVelocityZ);
-
-        const fillRelaxation = targetPresence > 0 ? FILL_RELAXATION : 0.08;
-        let nextFill = (
-          advectedFill * (1 - fillRelaxation) +
-          neighborAverage * 0.12 +
-          targetFill * fillRelaxation +
-          currentFill * MASS_RETENTION +
-          netMass +
-          pressure
-        ) * 0.5;
-        if (targetPresence <= 0) {
-          nextFill *= EDGE_DECAY;
-        }
-        nextFill = clamp01(nextFill);
-
-        const speed = Math.sqrt(nextVelocityX * nextVelocityX + nextVelocityZ * nextVelocityZ);
-        const foamSource =
-          this.targetTurbulenceField[index] * 0.24 +
-          this.targetShoreField[index] * 0.18 +
-          speed * 0.12 +
-          interaction * INTERACTION_TO_FOAM +
-          Math.abs(pressure) * 0.9 +
-          this.particleFoamField[index] * 0.9;
-        const nextFoam = clamp01(Math.max(advectedFoam * FOAM_DECAY, foamSource));
-
-        this.fillFieldNext[index] = nextFill;
-        this.velocityXFieldNext[index] = nextVelocityX;
-        this.velocityZFieldNext[index] = nextVelocityZ;
-        this.foamFieldNext[index] = nextFoam;
-        this.pressureFieldNext[index] = clamp01(Math.abs(pressure) * 2.6 + Math.abs(netMass) * 3.1 + interaction * INTERACTION_TO_PRESSURE);
-      }
-    }
-
-    [this.fillField, this.fillFieldNext] = [this.fillFieldNext, this.fillField];
-    [this.velocityXField, this.velocityXFieldNext] = [this.velocityXFieldNext, this.velocityXField];
-    [this.velocityZField, this.velocityZFieldNext] = [this.velocityZFieldNext, this.velocityZField];
-    [this.foamField, this.foamFieldNext] = [this.foamFieldNext, this.foamField];
-    [this.pressureField, this.pressureFieldNext] = [this.pressureFieldNext, this.pressureField];
+    this.applyVisualRefinerFields(
+      refineHybridVisualFields(
+        this.createVisualRefinerFields(),
+        HYBRID_VISUAL_REFINER_TUNING,
+        deltaSeconds,
+      ),
+    );
   }
 
   private packTextures(writeDebugTexture = shouldWriteDebugTexture(this.scene)) {
@@ -865,34 +771,43 @@ export class DVEWaterHybridBridge {
     const shiftZ = desiredOriginZ - this.clipOriginZ;
     this.clipOriginX = desiredOriginX;
     this.clipOriginZ = desiredOriginZ;
+    this.frameStats.clipRecentered = true;
     this.shiftSimulationFields(shiftX, shiftZ);
     // Notify the GPU sim so particles are re-seeded in the new clip frame
     this.gpuSim?.onClipMoved(this.clipOriginX, this.clipOriginZ);
-    this.targetsDirty = true;
-    this.rebuildTargets();
+    this.noteTargetsDirty("clip-recenter");
+    this.runRebuildTargets();
     this.targetsDirty = false;
     this.targetRebuildAccumulator = 0;
     const writeDebugTexture = shouldWriteDebugTexture(this.scene);
     this.packTextures(writeDebugTexture);
-    this.baseTexture.update(this.baseTextureData);
-    this.dynamicTexture.update(this.dynamicTextureData);
-    this.flowTexture.update(this.flowTextureData);
-    if (writeDebugTexture) {
-      this.debugTexture.update(this.debugTextureData);
-    }
+    this.uploadTextures(writeDebugTexture);
     return true;
   }
 
   advance(deltaSeconds: number) {
-    if (deltaSeconds <= 0 || this.sectionStates.size === 0) {
+    if (deltaSeconds <= 0) {
+      return;
+    }
+    if (this.sectionStates.size === 0 && this.shallowSectionStates.size === 0) {
+      if (this.targetsDirty) {
+        this.clearBridgeFieldsAndUpload();
+      }
       return;
     }
     // Skip simulation when settled and no new data injected
     if (!this.targetsDirty) {
-      if (isSettledBenchmarkHydrology()) return;
+      if (isSettledBenchmarkHydrology()) {
+        this.frameStats.skippedForSettled = true;
+        return;
+      }
       // General convergence: if we ran at least one cycle and fields haven't
       // changed, skip the expensive simulate+pack+upload path entirely.
-      if (this._converged) return;
+      if (this._converged) {
+        this.frameStats.skippedForConverged = true;
+        this.frameStats.convergedState = true;
+        return;
+      }
     }
     this.accumulatedDelta += deltaSeconds;
     this.targetRebuildAccumulator += deltaSeconds;
@@ -901,11 +816,12 @@ export class DVEWaterHybridBridge {
       this.accumulatedDelta -= SIMULATION_STEP;
       this.elapsedTime += SIMULATION_STEP;
       if (this.targetsDirty || this.targetRebuildAccumulator >= TARGET_REBUILD_INTERVAL) {
-        this.rebuildTargets();
+        this.runRebuildTargets();
         this.targetsDirty = false;
         this.targetRebuildAccumulator = 0;
       }
-      this.simulateStep(SIMULATION_STEP);
+      this.gpuSim?.flushDisturbances();
+      this.runSimulateStep(SIMULATION_STEP);
       this.applyGPUSimContributions();
 
       // Phase-9: if compute refiner is ready, submit GPU work for this step.
@@ -932,13 +848,15 @@ export class DVEWaterHybridBridge {
       }
       if (maxDelta < 0.001) {
         this._stableFrames++;
-        if (this._stableFrames >= 10) {
+        if (this._stableFrames >= 10 && !this._converged) {
           this._converged = true;
+          this.frameStats.convergedTransitions += 1;
         }
       } else {
         this._stableFrames = 0;
         this._converged = false;
       }
+      this.frameStats.convergedState = this._converged;
     }
 
     const writeDebugTexture = shouldWriteDebugTexture(this.scene);
@@ -958,11 +876,63 @@ export class DVEWaterHybridBridge {
       }
     }
 
-    this.baseTexture.update(this.baseTextureData);
-    this.dynamicTexture.update(this.dynamicTextureData);
-    this.flowTexture.update(this.flowTextureData);
-    if (writeDebugTexture) {
-      this.debugTexture.update(this.debugTextureData);
+    this.uploadTextures(writeDebugTexture);
+  }
+
+  private clearBridgeFieldsAndUpload() {
+    this.accumulatedDelta = 0;
+    this.targetRebuildAccumulator = 0;
+    this.fillField.fill(0);
+    this.fillFieldNext.fill(0);
+    this.velocityXField.fill(0);
+    this.velocityXFieldNext.fill(0);
+    this.velocityZField.fill(0);
+    this.velocityZFieldNext.fill(0);
+    this.foamField.fill(0);
+    this.foamFieldNext.fill(0);
+    this.targetFillField.fill(0);
+    this.targetVelocityXField.fill(0);
+    this.targetVelocityZField.fill(0);
+    this.targetFlowField.fill(0);
+    this.targetTurbulenceField.fill(0);
+    this.targetShoreField.fill(0);
+    this.targetInteractionField.fill(0);
+    this.targetLargeBodyField.fill(0);
+    this.targetPatchFlowField.fill(0);
+    this.targetPatchPhaseField.fill(0);
+    this.targetPresenceField.fill(0);
+    this.particleFoamField.fill(0);
+    this.particleFlowField.fill(0);
+    this.pressureField.fill(0);
+    this.pressureFieldNext.fill(0);
+    this.visualMassDeltaField.fill(0);
+    const writeDebugTexture = shouldWriteDebugTexture(this.scene);
+    this.packTextures(writeDebugTexture);
+    this.uploadTextures(writeDebugTexture);
+    this.targetsDirty = false;
+    this._converged = false;
+    this._stableFrames = 0;
+    this.frameStats.targetsDirty = false;
+    this.frameStats.convergedState = false;
+  }
+
+  private clearLiveFieldsForSection(originX: number, originZ: number, sizeX: number, sizeZ: number) {
+    for (let x = 0; x < sizeX; x++) {
+      for (let z = 0; z < sizeZ; z++) {
+        const clipIndex = this.getClipIndex(originX + x, originZ + z);
+        if (clipIndex < 0) continue;
+        this.fillField[clipIndex] = 0;
+        this.fillFieldNext[clipIndex] = 0;
+        this.velocityXField[clipIndex] = 0;
+        this.velocityXFieldNext[clipIndex] = 0;
+        this.velocityZField[clipIndex] = 0;
+        this.velocityZFieldNext[clipIndex] = 0;
+        this.foamField[clipIndex] = 0;
+        this.foamFieldNext[clipIndex] = 0;
+        this.pressureField[clipIndex] = 0;
+        this.pressureFieldNext[clipIndex] = 0;
+        this.visualMassDeltaField[clipIndex] = 0;
+      }
     }
   }
 
@@ -1004,7 +974,7 @@ export class DVEWaterHybridBridge {
   }
 
   private applyGPUSimContributions(): void {
-    if (!this.gpuSim?.ready) {
+    if (!this.gpuSim?.ready || !this.gpuSim.hasFreshContributions) {
       return;
     }
     const sim = this.gpuSim;
@@ -1025,6 +995,51 @@ export class DVEWaterHybridBridge {
     }
   }
 
+  beginShallowInjectionFrame() {
+    this.shallowSectionsSeenThisFrame.clear();
+  }
+
+  finishShallowInjectionFrame() {
+    let removed = false;
+    let removedCount = 0;
+    for (const key of Array.from(this.shallowSectionStates.keys())) {
+      if (this.shallowSectionsSeenThisFrame.has(key)) continue;
+      const section = this.shallowSectionStates.get(key);
+      this.shallowSectionStates.delete(key);
+      if (section) {
+        this.clearLiveFieldsForSection(section.originX, section.originZ, section.sizeX, section.sizeZ);
+      }
+      removed = true;
+      removedCount += 1;
+    }
+    this.shallowSectionsSeenThisFrame.clear();
+    if (!removed) return;
+    this.frameStats.shallowRemovedSections += removedCount;
+    this.noteTargetsDirty("shallow-frame-prune");
+  }
+
+  clearInjectedShallowSection(originX: number, originZ: number) {
+    const key = `${originX}:${originZ}`;
+    const section = this.shallowSectionStates.get(key);
+    if (!this.shallowSectionStates.delete(key)) return;
+    this.shallowSectionsSeenThisFrame.delete(key);
+    if (section) {
+      this.clearLiveFieldsForSection(section.originX, section.originZ, section.sizeX, section.sizeZ);
+    }
+    this.frameStats.shallowRemovedSections += 1;
+    this.noteTargetsDirty("shallow-section-clear");
+  }
+
+  retainInjectedShallowSection(originX: number, originZ: number) {
+    const key = `${originX}:${originZ}`;
+    if (!this.shallowSectionStates.has(key)) {
+      return false;
+    }
+    this.shallowSectionsSeenThisFrame.add(key);
+    this.frameStats.shallowRetainedSections += 1;
+    return true;
+  }
+
   /**
    * Inject shallow water simulation data from the editor shallow renderer into
    * the bridge target fields so that the hybrid water PBR shader becomes aware
@@ -1040,55 +1055,20 @@ export class DVEWaterHybridBridge {
     columnStride: number,
     columnMetadata: Uint32Array,
   ) {
-    let anyChange = false;
-    for (let xi = 0; xi < sizeX; xi++) {
-      for (let zi = 0; zi < sizeZ; zi++) {
-        const worldX = originX + xi;
-        const worldZ = originZ + zi;
-        const idx = this.getClipIndex(worldX, worldZ);
-        if (idx < 0) continue;
-        const ci = (xi * sizeZ + zi) * columnStride;
-        const meta = columnMetadata[xi * sizeZ + zi];
-        const active = (meta & 0x1) !== 0;
-        const thickness = columnBuffer[ci + 0];
-        if (!active || thickness <= 0) {
-          if (this.targetPresenceField[idx] !== 0 || this.targetFillField[idx] !== 0) {
-            this.targetPresenceField[idx] = 0;
-            this.targetFillField[idx] = 0;
-            anyChange = true;
-          }
-          continue;
-        }
-        const fill = Math.min(1, thickness);
-        const newPresence = Math.max(this.targetPresenceField[idx], fill);
-        const newFill = Math.max(this.targetFillField[idx], fill);
-        const spreadVX = columnBuffer[ci + 3];
-        const spreadVZ = columnBuffer[ci + 4];
-        const speed = Math.sqrt(spreadVX * spreadVX + spreadVZ * spreadVZ);
-        const newFlow = Math.max(this.targetFlowField[idx], Math.min(1, speed));
-        if (newPresence !== this.targetPresenceField[idx] ||
-            newFill !== this.targetFillField[idx] ||
-            newFlow !== this.targetFlowField[idx] ||
-            spreadVX !== this.targetVelocityXField[idx] ||
-            spreadVZ !== this.targetVelocityZField[idx]) {
-          anyChange = true;
-        }
-        this.targetPresenceField[idx] = newPresence;
-        this.targetFillField[idx] = newFill;
-        this.targetFlowField[idx] = newFlow;
-        this.targetVelocityXField[idx] = spreadVX;
-        this.targetVelocityZField[idx] = spreadVZ;
-        const shoreDist = columnBuffer[ci + 9];
-        if (shoreDist <= 1) {
-          this.targetShoreField[idx] = Math.max(this.targetShoreField[idx], 0.8);
-        }
-      }
-    }
-    if (anyChange) {
-      this.targetsDirty = true;
-      this._converged = false;
-      this._stableFrames = 0;
-    }
+    const key = `${originX}:${originZ}`;
+    this.shallowSectionsSeenThisFrame.add(key);
+    this.shallowSectionStates.set(key, {
+      key,
+      originX,
+      originZ,
+      sizeX,
+      sizeZ,
+      columnBuffer,
+      columnStride,
+      columnMetadata,
+    });
+    this.frameStats.shallowInjectedSections += 1;
+    this.noteTargetsDirty("shallow-section-inject");
   }
 
   updateFromSectionGPUData(
@@ -1102,6 +1082,15 @@ export class DVEWaterHybridBridge {
   ) {
     if (width <= 0 || height <= 0) {
       return;
+    }
+    const sectionKey = `${originX}:${originZ}:${width}:${height}`;
+    let removedVariant = false;
+    for (const [key, section] of Array.from(this.sectionStates.entries())) {
+      if (section.originX !== originX || section.originZ !== originZ || key === sectionKey) {
+        continue;
+      }
+      this.sectionStates.delete(key);
+      removedVariant = true;
     }
     // Register the section with the GPU sim so particles can be seeded from it
     if (this.gpuSim) {
@@ -1117,7 +1106,6 @@ export class DVEWaterHybridBridge {
         interactionFieldSize: gpuData.interactionFieldSize,
       });
     }
-    const sectionKey = `${originX}:${originZ}:${width}:${height}`;
     this.sectionStates.set(sectionKey, {
       key: sectionKey,
       originX,
@@ -1128,9 +1116,20 @@ export class DVEWaterHybridBridge {
       paddedBoundsZ,
       gpuData,
     });
-    this.targetsDirty = true;
-    this._converged = false;
-    this._stableFrames = 0;
+    this.noteTargetsDirty("continuous-section-update");
+  }
+
+  removeSection(originX: number, originZ: number) {
+    let removed = false;
+    for (const [key, section] of Array.from(this.sectionStates.entries())) {
+      if (section.originX !== originX || section.originZ !== originZ) continue;
+      this.sectionStates.delete(key);
+      this.clearLiveFieldsForSection(section.originX, section.originZ, section.boundsX, section.boundsZ);
+      removed = true;
+    }
+    this.gpuSim?.removeSection(originX, originZ);
+    if (!removed) return;
+    this.noteTargetsDirty("continuous-section-remove");
   }
 
   /** Sprint 10: Optional callback injected by shallow water system to receive puddle spawn requests */

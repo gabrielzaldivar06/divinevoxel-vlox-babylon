@@ -110,10 +110,14 @@ function applyInitialVertexData(record: SectionRecord) {
   record.initialized = true;
 }
 
+type DVEEditorShallowSectionRendererOptions = {
+  autoUpdate?: boolean;
+};
+
 export class DVEEditorShallowSectionRenderer {
   private readonly sections = new Map<string, SectionRecord>();
   private readonly material: PBRMaterial;
-  private readonly observer: Observer<Scene>;
+  private readonly observer: Observer<Scene> | null;
   private normalTex: Texture | null = null;
   private detailNormalTex: Texture | null = null;
   private disposed = false;
@@ -123,7 +127,10 @@ export class DVEEditorShallowSectionRenderer {
   private detailNormalUOffset = 0;
   private detailNormalVOffset = 0;
 
-  constructor(private readonly scene: Scene) {
+  constructor(
+    private readonly scene: Scene,
+    options: DVEEditorShallowSectionRendererOptions = {},
+  ) {
     this.material = new PBRMaterial("dve_editor_shallow_section_material", scene);
     this.material.albedoColor = new Color3(1, 1, 1);
     this.material.emissiveColor = new Color3(0.006, 0.02, 0.04);
@@ -182,10 +189,14 @@ export class DVEEditorShallowSectionRenderer {
       this.detailNormalTex = null;
     }
 
-    this.observer = this.scene.onBeforeRenderObservable.add(() => {
-      if (this.disposed) return;
-      this.update(this.scene.getEngine().getDeltaTime() / 1000);
-    });
+    if (options.autoUpdate === false) {
+      this.observer = null;
+    } else {
+      this.observer = this.scene.onBeforeRenderObservable.add(() => {
+        if (this.disposed) return;
+        this.update(this.scene.getEngine().getDeltaTime() / 1000);
+      });
+    }
   }
 
   updateSection(
@@ -647,7 +658,9 @@ export class DVEEditorShallowSectionRenderer {
   dispose() {
     if (this.disposed) return;
     this.disposed = true;
-    this.scene.onBeforeRenderObservable.remove(this.observer);
+    if (this.observer) {
+      this.scene.onBeforeRenderObservable.remove(this.observer);
+    }
     for (const record of this.sections.values()) {
       record.mesh.dispose();
     }

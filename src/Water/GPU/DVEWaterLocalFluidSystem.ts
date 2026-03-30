@@ -33,6 +33,10 @@ export class DVEWaterLocalFluidSystem implements WaterLocalFluidBackend {
     return this.backend?.velocityXField ?? this.emptyField;
   }
 
+  get hasFreshContributions() {
+    return this.backend?.hasFreshContributions ?? false;
+  }
+
   get velocityZField() {
     return this.backend?.velocityZField ?? this.emptyField;
   }
@@ -87,8 +91,17 @@ export class DVEWaterLocalFluidSystem implements WaterLocalFluidBackend {
     this.backend?.registerSection(record);
   }
 
+  removeSection(originX: number, originZ: number): void {
+    this._flushDisturbances();
+    this.backend?.removeSection(originX, originZ);
+  }
+
   clearSections(): void {
     this.backend?.clearSections();
+  }
+
+  flushDisturbances(): void {
+    this._flushDisturbances();
   }
 
   dispose(): void {
@@ -111,6 +124,10 @@ export class DVEWaterLocalFluidSystem implements WaterLocalFluidBackend {
 
   getBudget(): Readonly<WaterLocalFluidBudget> {
     return this._budget;
+  }
+
+  getEmitterCount(): number {
+    return this._emitters.size;
   }
 
   dispatchActorWake(worldX: number, worldZ: number, velocityX: number, velocityZ: number, radius = 1.5, energy = 0.5): void {

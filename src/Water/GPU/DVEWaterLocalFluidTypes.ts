@@ -42,6 +42,7 @@ function canUseWebGPU() {
 
 export interface WaterLocalFluidBackend {
   ready: boolean;
+  hasFreshContributions: boolean;
   velocityXField: Float32Array;
   velocityZField: Float32Array;
   fillContribField: Float32Array;
@@ -49,6 +50,7 @@ export interface WaterLocalFluidBackend {
   init(): Promise<boolean>;
   onClipMoved(clipOriginX: number, clipOriginZ: number): void;
   registerSection(record: WaterLocalFluidSectionRecord): void;
+  removeSection(originX: number, originZ: number): void;
   clearSections(): void;
   dispose(): void;
   applyDisturbances?(events: WaterDisturbanceEvent[]): void;
