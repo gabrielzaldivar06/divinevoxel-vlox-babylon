@@ -294,6 +294,69 @@ float dveValueNoise(vec2 p) {
   return mix(a, b, u.x) + (c - a) * u.y * (1.0 - u.x) + (d - b) * u.x * u.y;
 }
 
+// ─── Hex-tiling (Mikkelsen, JCGT 2022) — 3-sample non-periodic texture lookup ──
+// Eliminates visible tiling repetition on foam textures by blending three
+// rotated samples weighted by barycentric proximity inside a hex cell.
+// Works on any standard 2D sampler: body foam, breaker foam, or normal maps.
+vec2 dveHexCenter(vec2 hexId) {
+  return hexId + step(mod(hexId.y, 2.0), vec2(0.5)) * 0.5;
+}
+void dveHexTileUV(vec2 uv, out vec2 uv1, out vec2 uv2, out vec2 uv3, out float w1, out float w2, out float w3) {
+  // Map to hex grid: squash Y by 2/sqrt(3) for regular hexagons.
+  const float HEX_SCALE = 1.1547; // 2.0 / sqrt(3.0)
+  vec2 hexUV = vec2(uv.x, uv.y * HEX_SCALE);
+  vec2 a = floor(hexUV);
+  vec2 b = a + vec2(1.0, 0.0);
+  vec2 c = a + vec2(0.5, 1.0);
+  // Which of the three hex cell centers is closest?
+  vec2 ca = dveHexCenter(a);
+  vec2 cb = dveHexCenter(b);
+  vec2 cc = dveHexCenter(c);
+  vec2 f = fract(hexUV);
+  float da = length(f - fract(ca));
+  float db = length(f - fract(cb));
+  float dc = length(f - fract(cc));
+  // Barycentric weights with smooth falloff (power 8 for tight blending zone).
+  w1 = pow(max(1.0 - da * 2.0, 0.0), 8.0);
+  w2 = pow(max(1.0 - db * 2.0, 0.0), 8.0);
+  w3 = pow(max(1.0 - dc * 2.0, 0.0), 8.0);
+  float wSum = w1 + w2 + w3 + 0.0001;
+  w1 /= wSum;
+  w2 /= wSum;
+  w3 /= wSum;
+  // Per-cell random rotation + offset from cell ID hash.
+  float ha = dveHash12(floor(ca) * 71.37);
+  float hb = dveHash12(floor(cb) * 71.37);
+  float hc = dveHash12(floor(cc) * 71.37);
+  float ra = ha * 6.2832;
+  float rb = hb * 6.2832;
+  float rc = hc * 6.2832;
+  mat2 ma = mat2(cos(ra), -sin(ra), sin(ra), cos(ra));
+  mat2 mb = mat2(cos(rb), -sin(rb), sin(rb), cos(rb));
+  mat2 mc = mat2(cos(rc), -sin(rc), sin(rc), cos(rc));
+  uv1 = ma * uv + vec2(ha * 47.3, ha * 31.7);
+  uv2 = mb * uv + vec2(hb * 47.3, hb * 31.7);
+  uv3 = mc * uv + vec2(hc * 47.3, hc * 31.7);
+}
+
+// Convenience: hex-tiled single-channel sample from body or breaker sampler.
+float dveHexSampleBody(vec2 uv) {
+  vec2 uv1, uv2, uv3;
+  float w1, w2, w3;
+  dveHexTileUV(uv, uv1, uv2, uv3, w1, w2, w3);
+  return texture(dve_water_foam_body, uv1).r * w1
+       + texture(dve_water_foam_body, uv2).r * w2
+       + texture(dve_water_foam_body, uv3).r * w3;
+}
+float dveHexSampleBreaker(vec2 uv) {
+  vec2 uv1, uv2, uv3;
+  float w1, w2, w3;
+  dveHexTileUV(uv, uv1, uv2, uv3, w1, w2, w3);
+  return texture(dve_water_foam_breaker, uv1).r * w1
+       + texture(dve_water_foam_breaker, uv2).r * w2
+       + texture(dve_water_foam_breaker, uv3).r * w3;
+}
+
 float dveGetLargeScaleWaterVariation(vec2 positionXZ) {
   float n0 = dveValueNoise(mat2(0.9171, -0.3986, 0.3986, 0.9171) * positionXZ * 0.031 + vec2(43.0, -27.0));
   float n1 = dveValueNoise(mat2(0.7648, -0.6442, 0.6442, 0.7648) * positionXZ * 0.019 + vec2(-17.3, 8.6));
@@ -1182,19 +1245,40 @@ float dveGetDistanceStableDetailFade(vec3 positionW, vec3 eyePosition, float wav
 }
 
 float dveSampleFoamTexture(vec2 uv, float breakerMix) {
-  // Tiled UV scales — body uses larger tiles (calmer pattern), breaker uses finer tiles.
+  // Hex-tiled UV scales — body uses larger tiles (calmer pattern),
+  // breaker uses finer tiles. Hex tiling eliminates visible repetition.
   vec2 bodyUV    = uv * mix(0.38, 0.46, 0.0) + vec2(17.3, -9.1) * 0.07;
   vec2 breakerUV = uv * mix(0.52, 0.68, clamp(breakerMix, 0.0, 1.0)) + vec2(-4.7, 12.9) * 0.07;
-  // Sample body foam (ambientCG Foam001 Displacement — organic sheet foam)
-  // No manual fract() — texture wrap mode (REPEAT) handles tiling without seam discontinuities.
-  float bodyA = texture(dve_water_foam_body, bodyUV).r;
-  float bodyB = texture(dve_water_foam_body, dveRotate2D(0.62) * bodyUV * 0.88).r;
+  // Hex-tiled body foam — two octaves at different rotations for organic variation.
+  float bodyA = dveHexSampleBody(bodyUV);
+  float bodyB = dveHexSampleBody(dveRotate2D(0.62) * bodyUV * 0.88);
   float body  = bodyA * 0.60 + bodyB * 0.40;
-  // Sample breaker foam (ambientCG Foam003 Displacement — active sea foam)
-  float brkA  = texture(dve_water_foam_breaker, breakerUV).r;
-  float brkB  = texture(dve_water_foam_breaker, dveRotate2D(-0.48) * breakerUV * 0.76).r;
+  // Hex-tiled breaker foam — active sea foam pattern.
+  float brkA  = dveHexSampleBreaker(breakerUV);
+  float brkB  = dveHexSampleBreaker(dveRotate2D(-0.48) * breakerUV * 0.76);
   float brk   = brkA * 0.55 + brkB * 0.45;
   return mix(body, brk, clamp(breakerMix, 0.0, 1.0));
+}
+
+// Sprint 7 — Event-scale foam sampler: uses breaker texture at different tiling,
+// rotation and temporal offset to differentiate from body-scale foam. This creates
+// a visually distinct splashy/chaotic pattern for drop impact and pressure events.
+float dveSampleEventFoamTexture(vec2 uv, float eventEnergy, float time) {
+  // Distance-based LOD: skip event foam detail beyond 60 units where it's invisible.
+  float evViewDist = length(vEyePosition.xyz - vPositionW);
+  float evLOD = 1.0 - smoothstep(40.0, 60.0, evViewDist);
+  if (evLOD < 0.01) return 0.5;
+  // Faster tiling with temporal drift — event foam is small-scale and dynamic.
+  float drift = time * 0.12;
+  vec2 evUV_A = uv * mix(0.72, 1.06, eventEnergy) + vec2(drift, -drift * 0.73) + vec2(5.3, -11.7) * 0.09;
+  vec2 evUV_B = dveRotate2D(0.91 + time * 0.03) * uv * mix(0.56, 0.88, eventEnergy) + vec2(-drift * 0.61, drift * 0.44);
+  // Hex-tiled cross-samples for non-periodic event foam.
+  float evA = dveHexSampleBreaker(evUV_A);
+  float evB = dveHexSampleBreaker(evUV_B);
+  // Hex-tiled body sheet under splashes for organic variation.
+  vec2 sheetUV = dveRotate2D(-1.22) * uv * 0.34 + vec2(7.1, -3.9) * 0.06;
+  float evSheet = dveHexSampleBody(sheetUV);
+  return clamp((evA * 0.48 + evB * 0.36 + evSheet * 0.16) * evLOD + 0.5 * (1.0 - evLOD), 0.0, 1.0);
 }
 
 float dveGetTextureFoamMask(
@@ -1618,7 +1702,8 @@ DVEFoamLayers dveGetFoamOwnership(
   float localFluidEventSignal,
   float impactFoamMask,
   float ssfrWeight,
-  float patchWeight
+  float patchWeight,
+  float eventTextureIntensity
 ) {
   DVEFoamLayers layers;
   // Body-scale: owned by continuous patch layer
@@ -1630,9 +1715,11 @@ DVEFoamLayers dveGetFoamOwnership(
   ) * max(patchWeight, 0.3);
 
   // Event-scale: owned by SSFR local-fluid layer
+  // Sprint 7: modulated by dedicated event texture intensity for visual variety.
+  float eventTextureMod = mix(1.0, 0.68 + eventTextureIntensity * 0.64, ssfrWeight);
   layers.eventFoam = clamp(
-    dropFoam * 0.72 +
-    impactFoamMask * localFluidEventSignal * 0.52 +
+    dropFoam * 0.72 * eventTextureMod +
+    impactFoamMask * localFluidEventSignal * 0.52 * eventTextureMod +
     localFluidThickness * 0.18 * ssfrWeight,
     0.0, 1.0
   ) * max(ssfrWeight, 0.15);
@@ -1983,6 +2070,17 @@ dveCrestFoam = clamp(dveCrestFoam + dveWhitecapFoam * 0.85, 0.0, 1.0);
 float dveDropFoam = dveDropFactor * (0.42 + dveFoamClassMask.z * 0.88) * (0.3 + dveImpactFoamMask * 0.84 + dveFoamMask * 0.12);
 float dveOrganicShoreline = clamp(dveSoftShorelineBand * (0.82 + dveMacroVariation * 0.14) + dveShoreFoamMask * 0.08, 0.0, 1.0);
 float dveShallowBreakup = clamp(dveShallowClarity * 0.36 + dveOrganicShoreline * 0.22 + dveMacroVariation * 0.18 + (1.0 - dveSoftFillFactor) * 0.035 + dveHybridPressure * 0.16 + dveHybridFlowMagnitude * 0.08, 0.0, 1.0);
+// Sprint 7 — Multi-octave FBM modulation for aperiodic shoreline breakup.
+// Three noise octaves at progressive scales with flow advection break the
+// repetitive look of single-frequency breakup patterns along the coastline.
+{
+  vec2 breakupCoord = vPositionW.xz + dveHybridFlowVector * dveHybridFlowMagnitude * 6.0;
+  float fbmO1 = dveValueNoise(breakupCoord * 0.14 + vec2(dve_time * 0.018, -dve_time * 0.011));
+  float fbmO2 = dveValueNoise(breakupCoord * 0.31 + vec2(-dve_time * 0.026, dve_time * 0.014)) * 0.5;
+  float fbmO3 = dveValueNoise(breakupCoord * 0.67 + vec2(dve_time * 0.009, dve_time * 0.022)) * 0.25;
+  float fbmScatter = (fbmO1 + fbmO2 + fbmO3) / 1.75;
+  dveShallowBreakup = clamp(dveShallowBreakup * (0.78 + fbmScatter * 0.44), 0.0, 1.0);
+}
 vec3 dveShallowColor = vec3(0.34, 0.74, 0.95);
 vec3 dveMidColor = vec3(0.1, 0.34, 0.62);
 vec3 dveDeepColor = vec3(0.02, 0.09, 0.24);
@@ -2019,6 +2117,8 @@ vec3 dveReflectiveLift = mix(dveReflectionColor, vec3(0.96, 0.98, 1.0), dveUnder
 vec3 dveLiquidColor = mix(dveTransmissionColor, dveReflectiveLift, 0.11 + dveUnderwaterFresnel * 0.42 + dveWaterClassWeights.z * 0.08 - dveWaterClassWeights.x * 0.06 - dveUnderwaterFactor * 0.09);
 dveLiquidColor = mix(dveLiquidColor, dveShallowBreakupColor, dveShallowBreakup * 0.22);
 // Sprint 6 — Foam ownership split: body-scale vs event-scale
+// Sprint 7 — Event foam texture: dedicated sampler with temporal drift.
+float dveEventFoamTexIntensity = dveSampleEventFoamTexture(vPositionW.xz, dveLocalFluidEventSignal, dve_time);
 DVEFoamLayers dveFoamLayers = dveGetFoamOwnership(
   dveCoastalFoam,
   dveCrestFoam,
@@ -2028,7 +2128,8 @@ DVEFoamLayers dveFoamLayers = dveGetFoamOwnership(
   dveLocalFluidEventSignal,
   dveImpactFoamMask,
   dveCompSSFR,
-  dveCompPatch
+  dveCompPatch,
+  dveEventFoamTexIntensity
 );
 // Sprint 6 — Unified depth/refraction handoff
 float dveUnifiedRefraction = dveGetUnifiedRefractionDarkening(

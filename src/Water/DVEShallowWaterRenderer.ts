@@ -18,7 +18,6 @@
  */
 import { Color3 } from "@babylonjs/core/Maths/math.color";
 import { Mesh } from "@babylonjs/core/Meshes/mesh";
-import { VertexBuffer } from "@babylonjs/core/Meshes/buffer";
 import { VertexData } from "@babylonjs/core/Meshes/mesh.vertexData";
 import { PBRMaterial } from "@babylonjs/core/Materials/PBR/pbrMaterial";
 import { Texture } from "@babylonjs/core/Materials/Textures/texture";
@@ -416,243 +415,258 @@ export class DVEShallowWaterRenderer {
   // ─────────────────────────────────────────
 
   private _rebuildSection(record: SectionRecord) {
-    const { gpuData, posArr, norArr, uvArr, colArr } = record;
+    const { gpuData } = record;
     const { columnBuffer: cb, columnMetadata: cm, sizeX, sizeZ, originX, originZ } = gpuData;
-
-    // Vertex grid is (sizeX+1) × (sizeZ+1) — fixed topology, never changes
     const gx = sizeX + 1;
     const gz = sizeZ + 1;
+    const columnCount = sizeX * sizeZ;
 
-    // ── 1. Compute heights ─────────────────────────────────────────────
-    // First pass: find average water-table Y across all active columns.
-    // Inactive vertices will be placed at this level so that quads spanning the
-    // active/inactive boundary stay horizontal — avoiding the "vertical clear plate"
-    // artifact caused by height discontinuities between water surface and terrain.
-    let waterTableY = 0;
-    let activeCount = 0;
-    for (let ci = 0; ci < sizeX * sizeZ; ci++) {
-      const dec = decodeShallowColumnMetadata(cm[ci]);
-      if (dec.active && dec.thicknessFraction >= MIN_VISIBLE_THICKNESS) {
-        waterTableY += cb[ci * SHALLOW_COLUMN_STRIDE + 1]; // surfaceY
-        activeCount++;
-      }
+    const cellActive = new Uint8Array(columnCount);
+    const cellThickness = new Float32Array(columnCount);
+    const cellSettled = new Float32Array(columnCount);
+    let activeCellCount = 0;
+
+    for (let i = 0; i < columnCount; i++) {
+      const decoded = decodeShallowColumnMetadata(cm[i]);
+      if (!decoded.active || decoded.thicknessFraction < MIN_VISIBLE_THICKNESS) continue;
+      cellActive[i] = 1;
+      cellThickness[i] = decoded.thicknessFraction;
+      cellSettled[i] = clamp01(decoded.settledFraction);
+      activeCellCount += 1;
     }
-    waterTableY = activeCount > 0 ? waterTableY / activeCount : 0;
+
+    if (activeCellCount === 0) {
+      record.mesh.setEnabled(false);
+      return;
+    }
 
     const heights = new Float32Array(gx * gz);
     const alphas = new Float32Array(gx * gz);
+    const thicknesses = new Float32Array(gx * gz);
+    const shoreDistances = new Float32Array(gx * gz);
+    const settledValues = new Float32Array(gx * gz);
+    const supportedVertices = new Uint8Array(gx * gz);
 
     for (let vz = 0; vz < gz; vz++) {
       for (let vx = 0; vx < gx; vx++) {
-        const cx = Math.min(vx, sizeX - 1);
-        const cz = Math.min(vz, sizeZ - 1);
-        const colI = cz * sizeX + cx;
-        const meta = cm[colI];
-        const decoded = decodeShallowColumnMetadata(meta);
+        let totalWeight = 0;
+        let surfaceY = 0;
+        let terrainY = 0;
+        let shoreDist = 0;
+        let spreadVX = 0;
+        let spreadVZ = 0;
+        let settled = 0;
+        let thickness = 0;
+        let fadeOut = 0;
 
-        if (!decoded.active || decoded.thicknessFraction < MIN_VISIBLE_THICKNESS) {
-          // Use waterTableY, NOT terrain surfaceY — keeps boundary quads horizontal.
-          heights[vz * gx + vx] = waterTableY;
-          alphas[vz * gx + vx] = 0;
+        for (let dz = -1; dz <= 0; dz++) {
+          const cz = vz + dz;
+          if (cz < 0 || cz >= sizeZ) continue;
+          for (let dx = -1; dx <= 0; dx++) {
+            const cx = vx + dx;
+            if (cx < 0 || cx >= sizeX) continue;
+
+            const cellIndex = cz * sizeX + cx;
+            if (!cellActive[cellIndex]) continue;
+
+            const weight = 1;
+            const base = cellIndex * SHALLOW_COLUMN_STRIDE;
+            totalWeight += weight;
+            surfaceY += cb[base + 1] * weight;
+            terrainY += cb[base + 2] * weight;
+            shoreDist += cb[base + 9] * weight;
+            spreadVX += cb[base + 3] * weight;
+            spreadVZ += cb[base + 4] * weight;
+            settled += cellSettled[cellIndex] * weight;
+            thickness += cellThickness[cellIndex] * weight;
+
+            const fadeProgress = this.handoffFades.get(`${originX + cx},${originZ + cz}`);
+            fadeOut += (fadeProgress !== undefined ? 1 - fadeProgress * fadeProgress : 1) * weight;
+          }
+        }
+
+        if (totalWeight <= 0) {
           continue;
         }
 
-        const baseY = sampleSurfaceY(cb, sizeX, sizeZ, cx, cz);
-        const terrainY = sampleTerrainBottomY(cb, sizeX, sizeZ, cx, cz);
-        const shoreDist = sampleShoreDist(cb, sizeX, sizeZ, cx, cz);
-        const depth = Math.max(0, baseY - terrainY);
+        const vertexIndex = vz * gx + vx;
+        supportedVertices[vertexIndex] = 1;
+
+        const avgSurfaceY = surfaceY / totalWeight;
+        const avgTerrainY = terrainY / totalWeight;
+        const avgShoreDist = shoreDist / totalWeight;
+        const avgSpreadVX = spreadVX / totalWeight;
+        const avgSpreadVZ = spreadVZ / totalWeight;
+        const avgSettled = clamp01(settled / totalWeight);
+        const avgThickness = thickness / totalWeight;
+        const avgFadeOut = clamp01(fadeOut / totalWeight);
+
+        const depth = Math.max(0, avgSurfaceY - avgTerrainY);
         const depthFade = clamp01(depth / 0.4);
-        const shoreFade = clamp01(shoreDist / 4.0);
-
-        const vVX = sampleField(cb, sizeX, sizeZ, cx, cz, 3);
-        const vVZ = sampleField(cb, sizeX, sizeZ, cx, cz, 4);
-        const settled = clamp01(decoded.settledFraction);
-        const unsettled = 1 - settled;
-
+        const shoreFade = lerp(0.55, 1, clamp01(avgShoreDist / 4.0));
+        const unsettled = 1 - avgSettled;
         const wx = originX + vx;
         const wz = originZ + vz;
 
-        // ── Multi-octave Gerstner ripples (3 wave directions) ────────
-        // Replaces single-sine: more organic, less repetitive
         let gerstnerY = 0;
-        const flowMag = Math.hypot(vVX, vVZ);
+        const flowMag = Math.hypot(avgSpreadVX, avgSpreadVZ);
         for (let wi = 0; wi < GERSTNER_WAVES.length; wi++) {
           const w = GERSTNER_WAVES[wi];
           const phase = (w.dx * wx + w.dz * wz) * w.freq + this.time * w.speed;
-          // Unsettled water: full amplitude. Settled pools: reduced but not zero.
-          const ampScale = (0.3 + unsettled * 0.7) * depthFade * shoreFade;
+          const ampScale = (0.35 + unsettled * 0.65) * depthFade * shoreFade;
           gerstnerY += Math.sin(phase) * w.amp * ampScale;
         }
-        // Flow-driven directional ripple on top of Gerstner base
-        const flowPhase = (vVX * wx + vVZ * wz) * RIPPLE_FREQ + this.time * WAVE_SPEED;
-        const flowRipple = Math.sin(flowPhase) * Math.min(flowMag, 1) *
-          RIPPLE_AMPLITUDE * unsettled * depthFade * shoreFade;
-        // Ambient micro-shimmer for settled pools
-        const ambientA = Math.sin(wx * 2.1 + this.time * 0.8) * Math.cos(wz * 1.75 + this.time * 0.65);
-        const ambientRipple = ambientA * RIPPLE_AMPLITUDE * AMBIENT_RIPPLE_FRACTION *
-          settled * depthFade * shoreFade * 0.5;
 
+        const flowPhase =
+          (avgSpreadVX * wx + avgSpreadVZ * wz) * RIPPLE_FREQ + this.time * WAVE_SPEED;
+        const flowRipple =
+          Math.sin(flowPhase) *
+          Math.min(flowMag, 1) *
+          RIPPLE_AMPLITUDE *
+          unsettled *
+          depthFade *
+          shoreFade;
+        const ambientA =
+          Math.sin(wx * 2.1 + this.time * 0.8) *
+          Math.cos(wz * 1.75 + this.time * 0.65);
+        const ambientRipple =
+          ambientA *
+          RIPPLE_AMPLITUDE *
+          AMBIENT_RIPPLE_FRACTION *
+          avgSettled *
+          depthFade *
+          shoreFade *
+          0.5;
         const ripple = gerstnerY + flowRipple + ambientRipple;
 
-        heights[vz * gx + vx] = baseY + ripple;
+        heights[vertexIndex] = avgSurfaceY + ripple;
+        thicknesses[vertexIndex] = avgThickness;
+        shoreDistances[vertexIndex] = avgShoreDist;
+        settledValues[vertexIndex] = avgSettled;
 
-        // ── WaterBall-inspired alpha: density-proportional + Fresnel ─────
-        // Beer-Lambert: thicker water → more opaque
-        const densityAlpha = clamp01(1.0 - Math.exp(-decoded.thicknessFraction * 4.5));
-        // Shore edge fade (organic outline, not rectangular)
-        const shoreAlpha = clamp01(shoreDist / 3.0);
-        // Section boundary fade
-        const bx = Math.min(vx, sizeX - vx) / Math.max(sizeX * 0.15, 1);
-        const bz = Math.min(vz, sizeZ - vz) / Math.max(sizeZ * 0.15, 1);
-        const boundaryFade = clamp01(Math.min(bx, bz));
-        const edgeFade = shoreAlpha * (0.6 + 0.4 * boundaryFade);
-        // Depth modulation
-        const depthMod = clamp01(0.35 + depthFade * 0.65);
-        // Schlick Fresnel: more reflective at grazing angles → higher alpha
+        const densityAlpha = clamp01(1.0 - Math.exp(-avgThickness * 4.5));
+        const shoreAlpha = lerp(0.45, 1, clamp01(avgShoreDist / 3.0));
+        const depthMod = lerp(0.55, 1, depthFade);
         const eyeX = this.camX - wx;
-        const eyeY = this.camY - heights[vz * gx + vx];
+        const eyeY = this.camY - heights[vertexIndex];
         const eyeZ = this.camZ - wz;
         const eyeLen = Math.sqrt(eyeX * eyeX + eyeY * eyeY + eyeZ * eyeZ);
-        // dot(up, viewDir) — up = (0,1,0) for water surface
         const cosTheta = eyeLen > 0.001 ? Math.abs(eyeY / eyeLen) : 1;
         const fresnel = FRESNEL_F0 + (1.0 - FRESNEL_F0) * Math.pow(1.0 - cosTheta, 5);
-        // Combine: base density alpha boosted by Fresnel at grazing
         const fresnelBoost = clamp01(densityAlpha + fresnel * 0.6);
-        alphas[vz * gx + vx] = clamp01(fresnelBoost * edgeFade * depthMod);
-
-        // Apply handoff fade-out if this column is being promoted to Layer B
-        const fadeKey = `${originX + cx},${originZ + cz}`;
-        const fadeProgress = this.handoffFades.get(fadeKey);
-        if (fadeProgress !== undefined) {
-          // Smooth ease-out so puddle dissolves gracefully
-          const fadeOut = 1 - fadeProgress * fadeProgress; // quadratic ease
-          alphas[vz * gx + vx] *= fadeOut;
-        }
+        alphas[vertexIndex] = clamp01(fresnelBoost * shoreAlpha * depthMod * avgFadeOut);
       }
     }
 
-    // ── 2. Normals ─────────────────────────────────────────────────────
+    const getSupportedHeight = (vx: number, vz: number, fallback: number) => {
+      const clampedX = Math.max(0, Math.min(gx - 1, vx));
+      const clampedZ = Math.max(0, Math.min(gz - 1, vz));
+      const index = clampedZ * gx + clampedX;
+      return supportedVertices[index] ? heights[index] : fallback;
+    };
 
     const normals = new Float32Array(gx * gz * 3);
     for (let vz = 0; vz < gz; vz++) {
       for (let vx = 0; vx < gx; vx++) {
-        const hl = heights[vz * gx + Math.max(0, vx - 1)];
-        const hr = heights[vz * gx + Math.min(gx - 1, vx + 1)];
-        const hd = heights[Math.max(0, vz - 1) * gx + vx];
-        const hu = heights[Math.min(gz - 1, vz + 1) * gx + vx];
+        const vertexIndex = vz * gx + vx;
+        if (!supportedVertices[vertexIndex]) continue;
+
+        const center = heights[vertexIndex];
+        const hl = getSupportedHeight(vx - 1, vz, center);
+        const hr = getSupportedHeight(vx + 1, vz, center);
+        const hd = getSupportedHeight(vx, vz - 1, center);
+        const hu = getSupportedHeight(vx, vz + 1, center);
         const nx = -(hr - hl);
         const ny = 2.0;
         const nz = -(hu - hd);
-        const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
-        const ni = (vz * gx + vx) * 3;
-        normals[ni]     = nx / len;
+        const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+        const ni = vertexIndex * 3;
+        normals[ni] = nx / len;
         normals[ni + 1] = ny / len;
         normals[ni + 2] = nz / len;
       }
     }
 
-    // ── 3. Fill pre-allocated vertex arrays ────────────────────────────
+    const localPositions: number[] = [];
+    const localNormals: number[] = [];
+    const localUvs: number[] = [];
+    const localColors: number[] = [];
+    const localIndices: number[] = [];
+    const vertexMap = new Int32Array(gx * gz).fill(-1);
 
-    let anyVisible = false;
     for (let vz = 0; vz < gz; vz++) {
       for (let vx = 0; vx < gx; vx++) {
-        const vi = vz * gx + vx;
-        const alpha = alphas[vi];
-        const wx = originX + vx;
-        const wz = originZ + vz;
+        const vertexIndex = vz * gx + vx;
+        if (!supportedVertices[vertexIndex]) continue;
+        if (alphas[vertexIndex] < 0.01) continue;
 
-        const pi = vi * 3;
-        posArr[pi]     = wx;
-        posArr[pi + 1] = heights[vi];
-        posArr[pi + 2] = wz;
+        vertexMap[vertexIndex] = localPositions.length / 3;
+        localPositions.push(originX + vx, heights[vertexIndex], originZ + vz);
 
-        const ni = vi * 3;
-        norArr[ni]     = normals[ni];
-        norArr[ni + 1] = normals[ni + 1];
-        norArr[ni + 2] = normals[ni + 2];
+        const ni = vertexIndex * 3;
+        localNormals.push(normals[ni], normals[ni + 1], normals[ni + 2]);
+        localUvs.push(vx / sizeX, vz / sizeZ);
 
-        const ui = vi * 2;
-        uvArr[ui]     = vx / sizeX;
-        uvArr[ui + 1] = vz / sizeZ;
+        const thickness = thicknesses[vertexIndex];
+        const shoreDist = shoreDistances[vertexIndex];
+        const settled = settledValues[vertexIndex];
+        const beerR = Math.exp(-ABSORB_R * thickness);
+        const beerG = Math.exp(-ABSORB_G * thickness);
+        const beerB = Math.exp(-ABSORB_B * thickness);
+        const shallowR = 0.45 * beerR;
+        const shallowG = 0.78 * beerG;
+        const shallowB = 0.92 * beerB;
+        const foamT = clamp01(1.0 - shoreDist / 2.5);
+        const crestFoam = clamp01((heights[vertexIndex] - (heights[vertexIndex] - 0.01)) / (RIPPLE_AMPLITUDE * 1.5)) * 0.08;
+        const totalFoam = clamp01(foamT * 0.65 + crestFoam);
+        const calmDarken = settled * 0.08;
 
-        const ci = vi * 4;
-        if (alpha < 0.01) {
-          // Invisible vertex: stays at grid position but fully transparent.
-          // Do NOT collapse to origin — that would create giant stretched triangles
-          // because all quads are always indexed.
-          colArr[ci]     = 0;
-          colArr[ci + 1] = 0;
-          colArr[ci + 2] = 0;
-          colArr[ci + 3] = 0;
+        localColors.push(
+          clamp01(lerp(shallowR - calmDarken, 1.0, totalFoam)),
+          clamp01(lerp(shallowG - calmDarken * 0.5, 1.0, totalFoam)),
+          clamp01(lerp(shallowB, 1.0, totalFoam * 0.6)),
+          alphas[vertexIndex],
+        );
+      }
+    }
+
+    for (let vz = 0; vz < sizeZ; vz++) {
+      for (let vx = 0; vx < sizeX; vx++) {
+        const cellIndex = vz * sizeX + vx;
+        if (!cellActive[cellIndex]) continue;
+
+        const i00 = vz * gx + vx;
+        const i10 = vz * gx + (vx + 1);
+        const i01 = (vz + 1) * gx + vx;
+        const i11 = (vz + 1) * gx + (vx + 1);
+        const v00 = vertexMap[i00];
+        const v10 = vertexMap[i10];
+        const v01 = vertexMap[i01];
+        const v11 = vertexMap[i11];
+        if (v00 < 0 || v10 < 0 || v01 < 0 || v11 < 0) continue;
+
+        if ((vx + vz) % 2 === 0) {
+          localIndices.push(v00, v11, v01, v00, v10, v11);
         } else {
-          anyVisible = true;
-          const cx = Math.min(vx, sizeX - 1);
-          const cz = Math.min(vz, sizeZ - 1);
-          const shoreD = sampleShoreDist(cb, sizeX, sizeZ, cx, cz);
-          const colMeta = decodeShallowColumnMetadata(cm[cz * sizeX + cx]);
-          const thickness = colMeta.thicknessFraction;
-          const settledV = clamp01(colMeta.settledFraction);
-
-          // ── Beer-Lambert absorption: realistic depth-dependent color ──
-          const beerR = Math.exp(-ABSORB_R * thickness);
-          const beerG = Math.exp(-ABSORB_G * thickness);
-          const beerB = Math.exp(-ABSORB_B * thickness);
-          // Shallow teal → deep blue-green via absorption
-          const shallowR = 0.45 * beerR;
-          const shallowG = 0.78 * beerG;
-          const shallowB = 0.92 * beerB;
-
-          // Shore foam: white foam at edges
-          const foamT = clamp01(1.0 - shoreD / 2.5);
-          // Wave crest micro-foam: slight whitening at ripple peaks
-          const surfY = sampleSurfaceY(cb, sizeX, sizeZ, cx, cz);
-          const crestFoam = clamp01((heights[vi] - surfY) / (RIPPLE_AMPLITUDE * 1.5)) * 0.15;
-          const totalFoam = clamp01(foamT * 0.7 + crestFoam);
-
-          // Settled pools: slightly darker (calmer = clearer)
-          const calmDarken = settledV * 0.08;
-          colArr[ci]     = clamp01(lerp(shallowR - calmDarken, 1.0, totalFoam));
-          colArr[ci + 1] = clamp01(lerp(shallowG - calmDarken * 0.5, 1.0, totalFoam));
-          colArr[ci + 2] = clamp01(lerp(shallowB, 1.0, totalFoam * 0.6));
-          colArr[ci + 3] = alpha;
+          localIndices.push(v00, v10, v01, v10, v11, v01);
         }
       }
     }
 
-    if (!record.initialized) {
-      // ── First build: fixed indices + applyToMesh once ──────────────────
-      const idx: number[] = [];
-      for (let vz = 0; vz < sizeZ; vz++) {
-        for (let vx = 0; vx < sizeX; vx++) {
-          const i00 = vz * gx + vx;
-          const i10 = vz * gx + (vx + 1);
-          const i01 = (vz + 1) * gx + vx;
-          const i11 = (vz + 1) * gx + (vx + 1);
-          if ((vx + vz) % 2 === 0) {
-            idx.push(i00, i11, i01, i00, i10, i11);
-          } else {
-            idx.push(i00, i10, i01, i10, i11, i01);
-          }
-        }
-      }
-      const vd = new VertexData();
-      vd.positions = posArr;
-      vd.normals    = norArr;
-      vd.uvs        = uvArr;
-      vd.colors     = colArr;
-      vd.indices    = idx;
-      // applyToMesh with updatable=true registers the buffers for streaming updates
-      vd.applyToMesh(record.mesh, true);
-      record.mesh.refreshBoundingInfo();
-      record.initialized = true;
-      record.mesh.setEnabled(anyVisible);
-    } else {
-      // ── Subsequent frames: stream-update vertex data only ──────────────
-      record.mesh.updateVerticesData(VertexBuffer.PositionKind, posArr, false);
-      record.mesh.updateVerticesData(VertexBuffer.NormalKind,   norArr, false);
-      record.mesh.updateVerticesData(VertexBuffer.ColorKind,    colArr, false);
-      record.mesh.refreshBoundingInfo();
-      record.mesh.setEnabled(anyVisible);
+    if (!localPositions.length || !localIndices.length) {
+      record.mesh.setEnabled(false);
+      return;
     }
+
+    const vd = new VertexData();
+    vd.positions = localPositions;
+    vd.normals = localNormals;
+    vd.uvs = localUvs;
+    vd.colors = localColors;
+    vd.indices = localIndices;
+    vd.applyToMesh(record.mesh, true);
+    record.mesh.refreshBoundingInfo();
+    record.initialized = true;
+    record.mesh.setEnabled(true);
   }
 }

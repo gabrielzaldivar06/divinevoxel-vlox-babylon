@@ -14,8 +14,8 @@ import { DVEBRSectionMeshesMultiBuffer } from "../Scene/MultiBuffer/DVEBRSection
 import { SplatManager } from "../Splats/SplatManager";
 import { DVEWaterLocalFluidSystem } from "../Water/GPU/DVEWaterLocalFluidSystem.js";
 import { getSceneWaterHybridBridge } from "../Water/DVEWaterHybridBridge.js";
-import { DVEEditorShallowSectionRenderer } from "../Water/DVEEditorShallowSectionRenderer.js";
-import { DVEShallowWaterRenderer } from "../Water/DVEShallowWaterRenderer.js";
+import { DVEShallowWaterCompositeController } from "../Water/DVEShallowWaterCompositeController.js";
+import { DVEShallowWaterLocalFluidCoupler } from "../Water/DVEShallowWaterLocalFluidCoupler.js";
 import { LODSectorTracker } from "../LOD/LODSectorTracker";
 import { DVEWaterContinuumController } from "../Water/DVEWaterContinuumController.js";
 import { SpillFxRenderer } from "../Water/SpillFxRenderer.js";
@@ -37,14 +37,18 @@ import {
   removeShallowSection,
   clearAllShallowWater,
   createEmptyShallowColumn,
+  buildShallowWaterVisualSnapshot,
+  buildShallowWaterEdgeFieldSectionRenderData,
   measureShallowWaterMass,
   placeShallowWaterSeed,
+  setShallowWaterFlowHints,
+  type ShallowRenderSectionSnapshot,
+  type ShallowWaterExternalFlowHint,
 } from "@divinevoxel/vlox/Water/Shallow/index.js";
 import {
   packShallowWaterSection,
   type ShallowWaterGPUData,
 } from "@divinevoxel/vlox/Water/Shallow/ShallowWaterGPUDataPacker.js";
-import type { ShallowHandoffResult } from "@divinevoxel/vlox/Water/Contracts/WaterSemanticContract.js";
 import {
   addContinuousWaterSeed,
   clearAllContinuousWater,
@@ -56,18 +60,21 @@ import {
   removeContinuousSection,
   syncContinuousSectionFromGPUData,
   tickContinuousWater,
+  getNeighborPressures,
 } from "@divinevoxel/vlox/Water/Continuous/index.js";
 import {
   clearAllSpillWater,
   getActiveSpillEmitters,
   getPendingSpillEmitterCount,
   measureSpillWaterMass,
+  queueSpillTransfer,
   removeSpillEmittersForSection,
   updateSpillWater,
 } from "@divinevoxel/vlox/Water/Spill/index.js";
 import { WaterChunkRegistry } from "@divinevoxel/vlox/Water/Runtime/WaterChunkRegistry.js";
 import {
   drainWaterRuntimeInputEvents,
+  enqueueWaterRuntimeInputEvent,
   getPendingWaterRuntimeInputEventCount,
 } from "@divinevoxel/vlox/Water/Runtime/WaterInputQueue.js";
 import { WaterOwnershipResolver } from "@divinevoxel/vlox/Water/Runtime/WaterOwnershipResolver.js";
@@ -85,11 +92,30 @@ import {
 import {
   JsonWaterPersistenceCodec,
   WaterPersistence,
+  IndexedDBWaterPersistenceBackend,
+  type WaterWorldPersistenceBackend,
 } from "@divinevoxel/vlox/Water/Runtime/WaterPersistence.js";
+import {
+  resolveEvents as resolveWaterEvents,
+  getRecentEvents as getRecentWaterEvents,
+  type WaterEventResolverDeps,
+} from "@divinevoxel/vlox/Water/Runtime/WaterEventResolver.js";
+import {
+  tickGates as tickWaterGates,
+  setGateOpenness,
+  getGateCount as getWaterGateCount,
+  type WaterGateTickDeps,
+} from "@divinevoxel/vlox/Water/Runtime/WaterGateRegistry.js";
+import {
+  processTerrainCarve,
+  processTerrainFill,
+  type WaterTerrainEditDeps,
+} from "@divinevoxel/vlox/Water/Runtime/WaterTerrainEditResolver.js";
 import {
   classifyTerrainMaterial,
   TerrainMaterialFamily,
 } from "../Matereials/PBR/MaterialFamilyProfiles";
+import { WorldCursor } from "@divinevoxel/vlox/World/Cursor/WorldCursor.js";
 
 /** Neutral base color per material family for fracture splats. */
 function familyDefaultColor(family: string): [number, number, number] {
@@ -112,6 +138,20 @@ function familyDefaultColor(family: string): [number, number, number] {
 }
 
 const WATER_RUNTIME_SECTION_SIZE = 16;
+const WATER_HANDOFF_GRACE_TICKS = 4;
+const SHALLOW_TERRAIN_SCAN_UP = 4;
+const SHALLOW_TERRAIN_SCAN_DOWN = 24;
+
+function clamp01(value: number) {
+  return Math.max(0, Math.min(1, value));
+}
+
+function isTerrainSupportVoxel(voxel: ReturnType<WorldCursor["getVoxel"]>) {
+  if (!voxel || voxel.isAir()) return false;
+  const substance = voxel.getSubstanceData?.();
+  if (substance?.dve_is_liquid) return false;
+  return voxel.checkCollisions() || voxel.isOpaque();
+}
 
 function getRuntimeSectionOrigin(world: number) {
   return Math.floor(world / WATER_RUNTIME_SECTION_SIZE) * WATER_RUNTIME_SECTION_SIZE;
@@ -194,7 +234,20 @@ function addShallowSpillMassAtColumn(
 ) {
   if (amount <= 0) return 0;
 
-  const accepted = placeShallowWaterSeed(worldX, worldZ, surfaceY, amount, emitterId);
+  const accepted = placeShallowWaterSeed(
+    worldX,
+    worldZ,
+    surfaceY,
+    amount,
+    emitterId,
+    undefined,
+    {
+      authority: "spill-handoff",
+      ownershipConfidence: 1,
+      ownershipTicks: WATER_HANDOFF_GRACE_TICKS,
+      handoffGraceTicks: WATER_HANDOFF_GRACE_TICKS,
+    },
+  );
   if (accepted <= 0) return 0;
 
   const originX = getRuntimeSectionOrigin(worldX);
@@ -224,23 +277,28 @@ function addContinuousSpillMassAtColumn(
 ) {
   if (amount <= 0) return 0;
 
-  const inserted = addContinuousWaterSeed(worldX, worldZ, surfaceY, amount, 1);
-  if (!inserted) return 0;
+  const inserted = addContinuousWaterSeed(worldX, worldZ, surfaceY, amount, 1, {
+    authority: "spill-handoff",
+    ownershipConfidence: 1,
+    ownershipTicks: WATER_HANDOFF_GRACE_TICKS,
+    handoffGraceTicks: WATER_HANDOFF_GRACE_TICKS,
+  });
+  if (inserted <= 0) return 0;
 
   const originX = getRuntimeSectionOrigin(worldX);
   const originZ = getRuntimeSectionOrigin(worldZ);
   const section = getContinuousSection(originX, originZ);
   // The mass is already committed to the continuous runtime at this point.
-  if (!section) return amount;
+  if (!section) return inserted;
 
   const localX = getRuntimeLocalCoord(worldX);
   const localZ = getRuntimeLocalCoord(worldZ);
   const column = section.columns[localZ * section.sizeX + localX];
-  if (!column) return amount;
+  if (!column) return inserted;
 
   column.authority = "spill-handoff";
   column.ownershipDomain = "continuous";
-  return amount;
+  return inserted;
 }
 
 function processWaterRuntimeInputEvents() {
@@ -249,6 +307,13 @@ function processWaterRuntimeInputEvents() {
   let unhandled = 0;
   let sourceDelta = 0;
   let sinkDelta = 0;
+
+  const terrainEditDeps: WaterTerrainEditDeps = {
+    getContinuousSection: (ox, oz) => getContinuousSection(ox, oz),
+    getShallowSection: (ox, oz) => getShallowSection(ox, oz),
+    getRuntimeSectionOrigin,
+    getRuntimeLocalCoord,
+  };
 
   for (const event of events) {
     switch (event.kind) {
@@ -259,14 +324,25 @@ function processWaterRuntimeInputEvents() {
           break;
         }
 
-        const addedMass = placeShallowWaterSeed(
+        // Shallow first: editor water belongs to the shallow runtime domain.
+        // That domain now owns its own terrain-conforming visual stack
+        // (film + edge splats) instead of painting dve_liquid directly.
+        // Continuous seeds only create runtime state without writing voxel
+        // data, so the terrain mesher never produces visible geometry for them.
+        // Fall back to continuous only when shallow rejects the seed.
+        let addedMass = 0;
+        addedMass = placeShallowWaterSeed(
           event.worldX,
           event.worldZ,
           event.worldY + massDelta,
           massDelta,
           0,
+          undefined,
+          {
+            bedY: event.worldY,
+            authority: "player",
+          },
         );
-
         if (addedMass > 0) {
           const section = getShallowSection(
             getRuntimeSectionOrigin(event.worldX),
@@ -280,6 +356,23 @@ function processWaterRuntimeInputEvents() {
               column.authority = "player";
               column.ownershipDomain = "shallow";
             }
+          }
+        } else {
+          const inserted = addContinuousWaterSeed(
+            event.worldX,
+            event.worldZ,
+            event.worldY,
+            massDelta,
+            1,
+            {
+              authority: "continuous-handoff",
+              ownershipConfidence: 1,
+              ownershipTicks: WATER_HANDOFF_GRACE_TICKS,
+              handoffGraceTicks: WATER_HANDOFF_GRACE_TICKS,
+            },
+          );
+          if (inserted > 0) {
+            addedMass = inserted;
           }
         }
 
@@ -301,6 +394,66 @@ function processWaterRuntimeInputEvents() {
           remaining -= removeContinuousMassAtColumn(event.worldX, event.worldZ, remaining);
         }
         sinkDelta += requested - remaining;
+        handled += 1;
+        break;
+      }
+
+      case "gate-control": {
+        if (event.gateId && event.gateOpenness !== undefined) {
+          setGateOpenness(event.gateId, event.gateOpenness);
+          handled += 1;
+        } else {
+          unhandled += 1;
+        }
+        break;
+      }
+
+      case "pressure-impulse": {
+        const impulse = event.pressureDelta ?? 0;
+        if (impulse <= 0) {
+          unhandled += 1;
+          break;
+        }
+        const originX = getRuntimeSectionOrigin(event.worldX);
+        const originZ = getRuntimeSectionOrigin(event.worldZ);
+        const section = getContinuousSection(originX, originZ);
+        if (section) {
+          const localX = getRuntimeLocalCoord(event.worldX);
+          const localZ = getRuntimeLocalCoord(event.worldZ);
+          const column = section.columns[localZ * section.sizeX + localX];
+          if (column?.active) {
+            column.pressure += impulse;
+            column.turbulence = Math.min(1, column.turbulence + impulse * 0.1);
+            handled += 1;
+          } else {
+            unhandled += 1;
+          }
+        } else {
+          unhandled += 1;
+        }
+        break;
+      }
+
+      case "terrain-carve": {
+        const carveResult = processTerrainCarve(
+          event.worldX,
+          event.worldY,
+          event.worldZ,
+          terrainEditDeps,
+        );
+        sinkDelta += carveResult.sinkDelta ?? 0;
+        handled += 1;
+        break;
+      }
+
+      case "terrain-fill": {
+        const fillResult = processTerrainFill(
+          event.worldX,
+          event.worldY,
+          event.worldZ,
+          terrainEditDeps,
+        );
+        sinkDelta += fillResult.sinkDelta ?? 0;
         handled += 1;
         break;
       }
@@ -350,6 +503,7 @@ function getWaterRuntimeLOD0Radius() {
 type ShallowSectionRenderCache = {
   signature: number;
   gpuData: ShallowWaterGPUData;
+  snapshot: ShallowRenderSectionSnapshot;
 };
 
 function foldShallowSignature(signature: number, value: number) {
@@ -408,8 +562,8 @@ export class DVEBabylonRenderer extends DVERenderer {
   sceneOptions: SceneOptions;
   splatManager: SplatManager | null = null;
   lodTracker: LODSectorTracker | null = null;
-  shallowSectionRenderer: DVEEditorShallowSectionRenderer | null = null;
-  shallowWaterRenderer: DVEShallowWaterRenderer | null = null;
+  shallowCompositeController: DVEShallowWaterCompositeController | null = null;
+  shallowLocalFluidCoupler: DVEShallowWaterLocalFluidCoupler | null = null;
   continuumController: DVEWaterContinuumController | null = null;
   waterRuntime = new WaterRuntimeOrchestrator();
   waterChunkRegistry = new WaterChunkRegistry();
@@ -430,10 +584,13 @@ export class DVEBabylonRenderer extends DVERenderer {
     maxSupportedLOD: WaterPhysicalLOD.LOD3_DORMANT,
   });
   waterTransferResolver: WaterTransferResolver | null = null;
+  private readonly _shallowTerrainCursor = new WorldCursor();
   private _beforeRenderObservers: Observer<Scene>[] = [];
   private _disposed = false;
   private readonly _dormantWaterSnapshotFallbackCache = new Map<string, string>();
   private readonly _dormantWaterSnapshotKeys = new Set<string>();
+  private readonly _durablePersistenceBackend: WaterWorldPersistenceBackend =
+    new IndexedDBWaterPersistenceBackend();
   private readonly _shallowSectionFrameCache = new Map<string, ShallowSectionRenderCache>();
   private readonly spillFxRenderer = new SpillFxRenderer();
 
@@ -463,20 +620,18 @@ export class DVEBabylonRenderer extends DVERenderer {
 
       const encoded = this.waterPersistenceCodec.encode(persisted);
       const key = this.getDormantWaterSnapshotKey(snapshot.originX, snapshot.originZ);
-      const storage = this.getDormantWaterStorage();
 
-      if (storage) {
-        try {
-          storage.setItem(key, encoded);
-          this._dormantWaterSnapshotFallbackCache.delete(key);
-        } catch {
-          this._dormantWaterSnapshotFallbackCache.set(key, encoded);
-        }
-      } else {
-        this._dormantWaterSnapshotFallbackCache.set(key, encoded);
-      }
-
+      // Store in synchronous fallback cache immediately for same-session reads.
+      this._dormantWaterSnapshotFallbackCache.set(key, encoded);
       this._dormantWaterSnapshotKeys.add(key);
+
+      // Fire-and-forget durable write via IndexedDB.
+      this._durablePersistenceBackend
+        .store(snapshot.originX, snapshot.originZ, encoded)
+        .catch((err) => {
+          console.warn("[DVE] Failed to persist dormant water snapshot to IndexedDB:", err);
+        });
+
       return true;
     } catch {
       return false;
@@ -490,15 +645,32 @@ export class DVEBabylonRenderer extends DVERenderer {
       return cached;
     }
 
+    // Synchronous fallback — sessionStorage may still hold legacy data.
     const storage = this.getDormantWaterStorage();
-    if (!storage) {
-      return null;
+    if (storage) {
+      try {
+        const legacy = storage.getItem(key);
+        if (legacy) return legacy;
+      } catch {
+        // ignore
+      }
     }
 
-    try {
-      return storage.getItem(key);
-    } catch {
-      return null;
+    return null;
+  }
+
+  /**
+   * Pre-load a specific dormant snapshot from IndexedDB into the synchronous
+   * in-memory cache. Call during sector loading to warm the cache before the
+   * LOD manager's synchronous restore callback fires.
+   */
+  async warmDormantSnapshotFromDurable(originX: number, originZ: number): Promise<void> {
+    const key = this.getDormantWaterSnapshotKey(originX, originZ);
+    if (this._dormantWaterSnapshotFallbackCache.has(key)) return;
+    const encoded = await this._durablePersistenceBackend.load(originX, originZ);
+    if (encoded) {
+      this._dormantWaterSnapshotFallbackCache.set(key, encoded);
+      this._dormantWaterSnapshotKeys.add(key);
     }
   }
 
@@ -513,6 +685,11 @@ export class DVEBabylonRenderer extends DVERenderer {
       } catch {
       }
     }
+
+    // Fire-and-forget durable removal.
+    this._durablePersistenceBackend.remove(originX, originZ).catch((err) => {
+      console.warn("[DVE] Failed to remove dormant water snapshot from IndexedDB:", err);
+    });
 
     this._dormantWaterSnapshotKeys.delete(key);
   }
@@ -594,24 +771,74 @@ export class DVEBabylonRenderer extends DVERenderer {
 
   async init(dver: DivineVoxelEngineRender) {
     const waterHybridBridge = getSceneWaterHybridBridge(this.scene);
-    this.shallowSectionRenderer = new DVEEditorShallowSectionRenderer(this.scene, {
+    this.shallowCompositeController = new DVEShallowWaterCompositeController(this.scene, {
       autoUpdate: false,
     });
-    this.shallowWaterRenderer = new DVEShallowWaterRenderer(this.scene);
+    this.shallowLocalFluidCoupler = new DVEShallowWaterLocalFluidCoupler(
+      () => getSceneWaterHybridBridge(this.scene).localFluidSystem,
+    );
     this.continuumController = new DVEWaterContinuumController(
       waterHybridBridge,
-      this.shallowWaterRenderer ?? null,
+      null,
     );
 
     this.waterTransferResolver = new WaterTransferResolver({
-      continuousToShallow: (worldX, worldZ, _bedY, surfaceY, depth) => {
-        return placeShallowWaterSeed(worldX, worldZ, surfaceY, depth, 0);
+      continuousToShallow: (worldX, worldZ, bedY, surfaceY, depth) => {
+        const acceptedMass = placeShallowWaterSeed(
+          worldX,
+          worldZ,
+          surfaceY,
+          depth,
+          0,
+          undefined,
+          {
+            bedY,
+            authority: "continuous-handoff",
+            ownershipConfidence: 1,
+            ownershipTicks: WATER_HANDOFF_GRACE_TICKS,
+            handoffGraceTicks: WATER_HANDOFF_GRACE_TICKS,
+          },
+        );
+        if (acceptedMass > 0.0001) {
+          this.shallowCompositeController?.beginContinuousToShallowTransition(
+            worldX,
+            worldZ,
+            bedY,
+            surfaceY,
+            acceptedMass,
+            0,
+          );
+          if (acceptedMass >= depth - 0.0001) {
+            const section = getShallowSection(
+              getRuntimeSectionOrigin(worldX),
+              getRuntimeSectionOrigin(worldZ),
+            );
+            if (section) {
+              const localX = getRuntimeLocalCoord(worldX);
+              const localZ = getRuntimeLocalCoord(worldZ);
+              const column = section.columns[localZ * section.sizeX + localX];
+              if (column?.active) {
+                column.handoffGraceTicks = Math.max(
+                  column.handoffGraceTicks,
+                  WATER_HANDOFF_GRACE_TICKS,
+                );
+                column.authority = "continuous-handoff";
+                column.ownershipDomain = "shallow";
+              }
+            }
+          }
+        }
+        return acceptedMass;
       },
-      shallowToContinuous: (worldX, worldZ, surfaceY, thickness, emitterId) => {
-        const allowLogicalContinuousHandoff =
-          (globalThis as any).__DVE_ENABLE_CONTINUOUS_RUNTIME_HANDOFF__ === true;
+      shallowToContinuous: (worldX, worldZ, bedY, surfaceY, thickness, emitterId) => {
+        const runtimeHandoffFlag = (globalThis as any)
+          .__DVE_ENABLE_CONTINUOUS_RUNTIME_HANDOFF__;
+        const allowLogicalContinuousHandoff = runtimeHandoffFlag !== false;
         if (!allowLogicalContinuousHandoff) {
-          return "rejected";
+          return {
+            acceptedMass: 0,
+            disposition: "rejected",
+          };
         }
 
         const accepted = addContinuousWaterSeed(
@@ -620,9 +847,49 @@ export class DVEBabylonRenderer extends DVERenderer {
           surfaceY,
           thickness,
           Math.max(1, emitterId),
+          {
+            bedY,
+            authority: "continuous-handoff",
+            ownershipConfidence: 1,
+            ownershipTicks: WATER_HANDOFF_GRACE_TICKS,
+            handoffGraceTicks: WATER_HANDOFF_GRACE_TICKS,
+          },
         );
-        const result: ShallowHandoffResult = accepted ? "accepted" : "deferred";
-        return result;
+        if (accepted > 0.0001) {
+          const section = getContinuousSection(
+            getRuntimeSectionOrigin(worldX),
+            getRuntimeSectionOrigin(worldZ),
+          );
+          let continuousDepth = 0;
+          if (section) {
+            const localX = getRuntimeLocalCoord(worldX);
+            const localZ = getRuntimeLocalCoord(worldZ);
+            const column = section.columns[localZ * section.sizeX + localX];
+            if (column?.active) {
+              continuousDepth = column.depth;
+              column.handoffGraceTicks = Math.max(
+                column.handoffGraceTicks,
+                WATER_HANDOFF_GRACE_TICKS,
+              );
+              column.authority = "continuous-handoff";
+              column.ownershipDomain = "continuous";
+            }
+          }
+          if (continuousDepth > 0 && continuousDepth < Math.max(0.18, accepted * 1.28)) {
+            this.shallowCompositeController?.beginShallowToContinuousTransition(
+              worldX,
+              worldZ,
+              bedY,
+              surfaceY,
+              accepted,
+              emitterId,
+            );
+          }
+        }
+        return {
+          acceptedMass: accepted,
+          disposition: accepted > 0.0001 ? "accepted" : "deferred",
+        };
       },
     });
 
@@ -708,6 +975,7 @@ export class DVEBabylonRenderer extends DVERenderer {
           ).accounting;
         },
         tickShallow: (tickDt) => {
+          this.syncShallowTerrainSupport();
           return tickShallowWater(
             tickDt,
             undefined,
@@ -744,6 +1012,117 @@ export class DVEBabylonRenderer extends DVERenderer {
 
           return transferSummary.accounting;
         },
+        resolveEvents: (tickDt, tick) => {
+          const SECTION_SIZE = WATER_RUNTIME_SECTION_SIZE;
+
+          const eventDeps: WaterEventResolverDeps = {
+            getContinuousSections: () => getActiveContinuousSections(),
+            getNeighborPressures: (section, x, z) =>
+              getNeighborPressures(section, x, z),
+            removeContinuousMass: (originX, originZ, columnIndex, mass) => {
+              const section = getContinuousSection(originX, originZ);
+              if (!section) return 0;
+              const col = section.columns[columnIndex];
+              if (!col?.active) return 0;
+              const removed = Math.min(mass, col.mass);
+              col.mass -= removed;
+              col.depth = col.mass;
+              col.surfaceY = col.bedY + col.depth;
+              col.pressure = col.depth;
+              return removed;
+            },
+            queueSpillTransfer: (worldX, worldZ, surfaceY, mass, fallHeight) => {
+              queueSpillTransfer({
+                sourceDomain: "continuous",
+                targetDomain: "continuous",
+                worldX,
+                worldY: surfaceY + fallHeight,
+                worldZ,
+                landingSurfaceY: surfaceY,
+                mass,
+                fallHeight,
+              });
+            },
+            sectionSize: SECTION_SIZE,
+          };
+
+          const eventAccounting = resolveWaterEvents(tick, eventDeps);
+
+          const gateDeps: WaterGateTickDeps = {
+            getUpstreamPressure: (worldX, worldZ) => {
+              const section = getContinuousSection(
+                getRuntimeSectionOrigin(worldX),
+                getRuntimeSectionOrigin(worldZ),
+              );
+              if (!section) return 0;
+              const lx = getRuntimeLocalCoord(worldX);
+              const lz = getRuntimeLocalCoord(worldZ);
+              const col = section.columns[lz * section.sizeX + lx];
+              return col?.active ? col.pressure : 0;
+            },
+            getUpstreamSurfaceY: (worldX, worldZ) => {
+              const section = getContinuousSection(
+                getRuntimeSectionOrigin(worldX),
+                getRuntimeSectionOrigin(worldZ),
+              );
+              if (!section) return 0;
+              const lx = getRuntimeLocalCoord(worldX);
+              const lz = getRuntimeLocalCoord(worldZ);
+              const col = section.columns[lz * section.sizeX + lx];
+              return col?.active ? col.surfaceY : col?.bedY ?? 0;
+            },
+            getDownstreamSurfaceY: (worldX, worldZ) => {
+              const section = getContinuousSection(
+                getRuntimeSectionOrigin(worldX),
+                getRuntimeSectionOrigin(worldZ),
+              );
+              if (!section) return 0;
+              const lx = getRuntimeLocalCoord(worldX);
+              const lz = getRuntimeLocalCoord(worldZ);
+              const col = section.columns[lz * section.sizeX + lx];
+              return col?.active ? col.surfaceY : col?.bedY ?? 0;
+            },
+            removeContinuousMass: (worldX, worldZ, mass) => {
+              return removeContinuousMassAtColumn(worldX, worldZ, mass);
+            },
+            queueSpillTransfer: (worldX, worldZ, landingSurfaceY, mass, fallHeight) => {
+              queueSpillTransfer({
+                sourceDomain: "continuous",
+                targetDomain: "continuous",
+                worldX,
+                worldY: landingSurfaceY + fallHeight,
+                worldZ,
+                landingSurfaceY,
+                mass,
+                fallHeight,
+              });
+            },
+          };
+
+          const gateAccounting = tickWaterGates(tickDt, gateDeps);
+
+          const merged: WaterRuntimePhaseAccounting = {
+            sourceDelta: (eventAccounting.sourceDelta ?? 0) + (gateAccounting.sourceDelta ?? 0),
+            sinkDelta: (eventAccounting.sinkDelta ?? 0) + (gateAccounting.sinkDelta ?? 0),
+            transferDelta: {
+              continuousToSpill:
+                (eventAccounting.transferDelta?.continuousToSpill ?? 0) +
+                (gateAccounting.transferDelta?.continuousToSpill ?? 0),
+            },
+          };
+
+          // Sprint 8 Phase C/D telemetry
+          (globalThis as any).__DVE_WATER_EVENT_SINK_DELTA__ =
+            (eventAccounting.sinkDelta ?? 0) + (gateAccounting.sinkDelta ?? 0);
+          (globalThis as any).__DVE_WATER_EVENT_SPILL_DELTA__ =
+            (eventAccounting.transferDelta?.continuousToSpill ?? 0) +
+            (gateAccounting.transferDelta?.continuousToSpill ?? 0);
+          (globalThis as any).__DVE_WATER_RECENT_EVENT_COUNT__ =
+            getRecentWaterEvents().length;
+          (globalThis as any).__DVE_WATER_GATE_COUNT__ = getWaterGateCount();
+
+          return merged;
+        },
         updateSpill: (tickDt) => {
           const spillSummary = updateSpillWater(tickDt, {
             landToShallow: addShallowSpillMassAtColumn,
@@ -767,17 +1146,30 @@ export class DVEBabylonRenderer extends DVERenderer {
           for (const [key, grid] of activeSections) {
             const previousCache = this._shallowSectionFrameCache.get(key);
             const gpuData = packShallowWaterSection(grid, previousCache?.gpuData);
+            const shallowGhosts =
+              this.shallowBoundaryRegistry.getGhostColumns(grid.originX, grid.originZ) ?? null;
+            const snapshot = buildShallowWaterVisualSnapshot(
+              grid,
+              previousCache?.snapshot,
+              shallowGhosts,
+            );
+            this.applyContinuousIntegrationMask(snapshot.film);
+            snapshot.edgeField = buildShallowWaterEdgeFieldSectionRenderData(
+              snapshot.film,
+              snapshot.edgeField,
+            );
             const signature = computeShallowSectionMaterialSignature(gpuData);
             const shallowChanged = !previousCache || previousCache.signature !== signature;
             this._shallowSectionFrameCache.set(key, {
               signature,
               gpuData,
+              snapshot,
             });
             if (gpuData.activeColumnCount <= 0) {
               this._shallowSectionFrameCache.delete(key);
               removeEditorShallowSurfaceSection(gpuData.originX, gpuData.originZ);
-              this.shallowSectionRenderer?.removeSection(key);
-              this.shallowWaterRenderer?.removeSection(key);
+              this.shallowCompositeController?.removeSection(key);
+              this.shallowLocalFluidCoupler?.removeSection(key);
               waterHybridBridge.clearInjectedShallowSection(gpuData.originX, gpuData.originZ);
               continue;
             }
@@ -801,13 +1193,8 @@ export class DVEBabylonRenderer extends DVERenderer {
             }
 
             activeShallowKeys.add(key);
-            this.shallowSectionRenderer?.updateSection(key, {
-              originX: gpuData.originX,
-              originZ: gpuData.originZ,
-              boundsX: gpuData.sizeX,
-              boundsZ: gpuData.sizeZ,
-              gpuData,
-            });
+            this.shallowCompositeController?.updateSection(key, snapshot);
+            this.shallowLocalFluidCoupler?.syncSection(key, gpuData);
             updateEditorShallowSurfaceSection(
               gpuData.originX,
               gpuData.originZ,
@@ -815,15 +1202,14 @@ export class DVEBabylonRenderer extends DVERenderer {
               gpuData.sizeZ,
               gpuData,
             );
-            this.shallowWaterRenderer?.updateSection(key, gpuData);
           }
           for (const key of Array.from(previousActiveShallowKeys)) {
             if (activeShallowKeys.has(key)) continue;
             const [originX, originZ] = key.split("_").map((value) => Number(value));
             this._shallowSectionFrameCache.delete(key);
             removeEditorShallowSurfaceSection(originX, originZ);
-            this.shallowSectionRenderer?.removeSection(key);
-            this.shallowWaterRenderer?.removeSection(key);
+            this.shallowCompositeController?.removeSection(key);
+            this.shallowLocalFluidCoupler?.removeSection(key);
             waterHybridBridge.clearInjectedShallowSection(originX, originZ);
           }
           previousActiveShallowKeys.clear();
@@ -865,18 +1251,37 @@ export class DVEBabylonRenderer extends DVERenderer {
         },
       });
 
-      this.shallowSectionRenderer?.update(dt);
-      this.shallowWaterRenderer?.update(dt, activeShallowKeys);
+      this.shallowLocalFluidCoupler?.update(dt);
       this.spillFxRenderer.sync(
         waterHybridBridge.localFluidSystem,
         getActiveSpillEmitters().values(),
       );
       waterHybridBridge.advance(dt);
+      const shallowClipState = waterHybridBridge.getClipState();
+      const shallowLocalFluidSystem = waterHybridBridge.localFluidSystem;
+      this.shallowCompositeController?.setLocalFluidContributions(
+        shallowLocalFluidSystem
+          ? {
+              originX: shallowClipState.originX,
+              originZ: shallowClipState.originZ,
+              width: Math.max(1, Math.round(1 / shallowClipState.invWidth)),
+              height: Math.max(1, Math.round(1 / shallowClipState.invHeight)),
+              velocityXField: shallowLocalFluidSystem.velocityXField,
+              velocityZField: shallowLocalFluidSystem.velocityZField,
+              fillField: shallowLocalFluidSystem.fillContribField,
+              foamField: shallowLocalFluidSystem.foamContribField,
+              hasFreshContributions: shallowLocalFluidSystem.hasFreshContributions,
+            }
+          : null,
+      );
+      this.shallowCompositeController?.update(dt, activeShallowKeys);
       this.continuumController?.advance(dt);
       (globalThis as any).__DVE_WATER_HYBRID_BRIDGE_FRAME__ =
         waterHybridBridge.getFrameStats();
       (globalThis as any).__DVE_WATER_LOCAL_FLUID_SOLVER_ACTIVE__ =
         waterHybridBridge.localFluidSystem?.getSolver() ?? "off";
+      (globalThis as any).__DVE_SHALLOW_LOCAL_FLUID_STATS__ =
+        this.shallowLocalFluidCoupler?.getStats() ?? null;
 
       // ── Sprint 12: Expose water capability flags for validation ──
       (globalThis as any).__DVE_SHALLOW_WATER_SECTIONS__ = activeShallowKeys?.size ?? 0;
@@ -884,7 +1289,7 @@ export class DVEBabylonRenderer extends DVERenderer {
       (globalThis as any).__DVE_SSFR_ACTIVE__ = true;
       (globalThis as any).__DVE_GRID_DISSOLUTION_ACTIVE__ = true;
       (globalThis as any).__DVE_PUDDLE_HANDOFF_WIRED__ =
-        (globalThis as any).__DVE_ENABLE_CONTINUOUS_RUNTIME_HANDOFF__ === true;
+        (globalThis as any).__DVE_ENABLE_CONTINUOUS_RUNTIME_HANDOFF__ !== false;
       (globalThis as any).__DVE_ACTIVE_WATER_LAYERS__ = _countActiveWaterLayers(activeShallowKeys);
       (globalThis as any).__DVE_CONTINUOUS_RUNTIME_SECTIONS__ = getActiveContinuousSections().size;
       (globalThis as any).__DVE_WATER_RUNTIME_LOD_ENABLED__ = isWaterRuntimeLODEnabled();
@@ -933,6 +1338,9 @@ export class DVEBabylonRenderer extends DVERenderer {
         (!existingContinuousSection ||
           !existingContinuousSection.columns.some((column) => column.active));
       if (canBootstrapContinuousRuntime) {
+        // This bootstrap happens outside the orchestrator tick, so massBefore
+        // already includes the hydrated state on the next tick. Do not feed it
+        // into input-phase accounting or the invariant double-counts it.
         syncContinuousSectionFromGPUData(waterUpdate);
       }
       updateEditorShallowSurfaceSection(
@@ -967,8 +1375,8 @@ export class DVEBabylonRenderer extends DVERenderer {
       waterHybridBridge.removeSection(originX, originZ);
       waterHybridBridge.clearInjectedShallowSection(originX, originZ);
       removeEditorShallowSurfaceSection(originX, originZ);
-      this.shallowSectionRenderer?.removeSection(sectionKey);
-      this.shallowWaterRenderer?.removeSection(sectionKey);
+      this.shallowCompositeController?.removeSection(sectionKey);
+      this.shallowLocalFluidCoupler?.removeSection(sectionKey);
     };
 
     const clearWaterRuntimeSection = (
@@ -1047,6 +1455,7 @@ export class DVEBabylonRenderer extends DVERenderer {
         this.splatManager!.removeSector(sectorKey);
         const { originX, originZ } = getWaterSectionContext(sectorKey);
         clearWaterRuntimeSection(originX, originZ, true);
+        this.waterLODManager.removeChunk(originX, originZ);
       };
 
       // Wire fracture splats: when a voxel is erased, emit dynamic splats
@@ -1078,6 +1487,29 @@ export class DVEBabylonRenderer extends DVERenderer {
           shearStrength,
           color
         );
+
+        // Notify water runtime of terrain removal
+        enqueueWaterRuntimeInputEvent({
+          kind: "terrain-carve",
+          worldX: x,
+          worldY: y,
+          worldZ: z,
+        });
+      };
+
+      // Notify water runtime when a voxel is placed (terrain-fill)
+      MeshManager.onVoxelPainted = (
+        _dimensionId: number,
+        x: number,
+        y: number,
+        z: number,
+      ) => {
+        enqueueWaterRuntimeInputEvent({
+          kind: "terrain-fill",
+          worldX: x,
+          worldY: y,
+          worldZ: z,
+        });
       };
     }
 
@@ -1104,7 +1536,42 @@ export class DVEBabylonRenderer extends DVERenderer {
       MeshManager.onSectorRemoved = (sectorKey) => {
         const { originX, originZ } = getWaterSectionContext(sectorKey);
         clearWaterRuntimeSection(originX, originZ, true);
+        this.waterLODManager.removeChunk(originX, originZ);
       };
+
+      // When splats are off the onVoxelErased/Painted callbacks are not set
+      // above, so wire water-runtime terrain notifications here.
+      if (!MeshManager.onVoxelErased) {
+        MeshManager.onVoxelErased = (
+          _dimensionId: number,
+          x: number,
+          y: number,
+          z: number,
+          _voxelId: number,
+        ) => {
+          enqueueWaterRuntimeInputEvent({
+            kind: "terrain-carve",
+            worldX: x,
+            worldY: y,
+            worldZ: z,
+          });
+        };
+      }
+      if (!MeshManager.onVoxelPainted) {
+        MeshManager.onVoxelPainted = (
+          _dimensionId: number,
+          x: number,
+          y: number,
+          z: number,
+        ) => {
+          enqueueWaterRuntimeInputEvent({
+            kind: "terrain-fill",
+            worldX: x,
+            worldY: y,
+            worldZ: z,
+          });
+        };
+      }
     }
 
     // Initialize LODSectorTracker when lodMorph is enabled
@@ -1120,6 +1587,360 @@ export class DVEBabylonRenderer extends DVERenderer {
     }
   }
 
+  private sampleTerrainBedY(worldX: number, worldZ: number, guessY: number) {
+    const cursor = this._shallowTerrainCursor;
+    const baseY = Math.round(Number.isFinite(guessY) ? guessY : 0);
+    cursor.setFocalPoint(0, worldX, baseY, worldZ);
+
+    const startY = baseY + SHALLOW_TERRAIN_SCAN_UP;
+    const endY = baseY - SHALLOW_TERRAIN_SCAN_DOWN;
+    for (let y = startY; y >= endY; y--) {
+      const voxel = cursor.getVoxel(worldX, y, worldZ);
+      if (!isTerrainSupportVoxel(voxel)) continue;
+      return y + 1;
+    }
+
+    return Number.isFinite(guessY) ? guessY : 0;
+  }
+
+  private sampleShallowBedYForHint(
+    gridOriginX: number,
+    gridOriginZ: number,
+    localX: number,
+    localZ: number,
+    fallbackBedY: number,
+  ) {
+    const worldX = gridOriginX + localX;
+    const worldZ = gridOriginZ + localZ;
+    const originX = getRuntimeSectionOrigin(worldX);
+    const originZ = getRuntimeSectionOrigin(worldZ);
+    const grid = getShallowSection(originX, originZ);
+    if (!grid) return fallbackBedY;
+    const sampleX = getRuntimeLocalCoord(worldX);
+    const sampleZ = getRuntimeLocalCoord(worldZ);
+    const column = grid.columns[sampleZ * grid.sizeX + sampleX];
+    return Number.isFinite(column?.bedY) ? column.bedY : fallbackBedY;
+  }
+
+  private hasShallowWaterAt(worldX: number, worldZ: number) {
+    const section = getShallowSection(
+      getRuntimeSectionOrigin(worldX),
+      getRuntimeSectionOrigin(worldZ),
+    );
+    if (!section) return false;
+    const localX = getRuntimeLocalCoord(worldX);
+    const localZ = getRuntimeLocalCoord(worldZ);
+    const column = section.columns[localZ * section.sizeX + localX];
+    return !!column?.active && column.ownershipDomain === "shallow" && column.thickness > 0.0001;
+  }
+
+  private hasContinuousWaterAt(worldX: number, worldZ: number) {
+    const section = getContinuousSection(
+      getRuntimeSectionOrigin(worldX),
+      getRuntimeSectionOrigin(worldZ),
+    );
+    if (!section) return false;
+    const localX = getRuntimeLocalCoord(worldX);
+    const localZ = getRuntimeLocalCoord(worldZ);
+    const column = section.columns[localZ * section.sizeX + localX];
+    return !!column?.active && column.ownershipDomain === "continuous" && column.depth > 0.0001;
+  }
+
+  private getContinuousColumnAt(worldX: number, worldZ: number) {
+    const section = getContinuousSection(
+      getRuntimeSectionOrigin(worldX),
+      getRuntimeSectionOrigin(worldZ),
+    );
+    if (!section) return null;
+    const localX = getRuntimeLocalCoord(worldX);
+    const localZ = getRuntimeLocalCoord(worldZ);
+    return section.columns[localZ * section.sizeX + localX] ?? null;
+  }
+
+  private sampleContinuousIntegrationField(worldX: number, worldZ: number) {
+    let strongestDepth = 0;
+    let strongestSurfaceY = Number.NEGATIVE_INFINITY;
+    let strongestWeightedDepth = 0;
+    let neighborhoodDepth = 0;
+    let neighborhoodWeight = 0;
+    let neighborCount = 0;
+
+    for (let dz = -1; dz <= 1; dz++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const column = this.getContinuousColumnAt(worldX + dx, worldZ + dz);
+        if (
+          !column?.active ||
+          column.ownershipDomain !== "continuous" ||
+          column.depth <= 0.0001
+        ) {
+          continue;
+        }
+        const distance = Math.abs(dx) + Math.abs(dz);
+        const weight = distance === 0 ? 1 : distance === 1 ? 0.42 : 0.22;
+        neighborCount += 1;
+        neighborhoodDepth += column.depth * weight;
+        neighborhoodWeight += weight;
+        const weightedDepth = column.depth * weight;
+        if (weightedDepth > strongestWeightedDepth) {
+          strongestWeightedDepth = weightedDepth;
+          strongestDepth = column.depth;
+          strongestSurfaceY = column.surfaceY;
+        }
+      }
+    }
+
+    return {
+      neighborCount,
+      strongestDepth,
+      strongestSurfaceY: Number.isFinite(strongestSurfaceY) ? strongestSurfaceY : 0,
+      averageDepth: neighborhoodWeight > 0.0001 ? neighborhoodDepth / neighborhoodWeight : 0,
+    };
+  }
+
+  private applyContinuousIntegrationMask(
+    film: ShallowRenderSectionSnapshot["film"],
+  ) {
+    let activeColumnCount = 0;
+    for (let z = 0; z < film.sizeZ; z++) {
+      for (let x = 0; x < film.sizeX; x++) {
+        const index = z * film.sizeX + x;
+        const column = film.columns[index];
+        if (!column?.active || column.coverage <= 0) continue;
+
+        const integrationField = this.sampleContinuousIntegrationField(
+          film.originX + x,
+          film.originZ + z,
+        );
+        if (integrationField.neighborCount <= 0) {
+          activeColumnCount += 1;
+          continue;
+        }
+
+        const depthDominance = clamp01(
+          (
+            Math.max(
+              integrationField.strongestDepth,
+              integrationField.averageDepth * 0.96,
+            ) -
+            column.thickness * 0.34 +
+            0.065
+          ) / 0.26,
+        );
+        const handoffSignal = clamp01(
+          column.handoffBlend * 0.54 +
+            (column.patchHandoffReady ? 0.22 : 0) +
+            (column.handoffPending ? 0.12 : 0) +
+            column.deepBlend * 0.12 +
+            clamp01(integrationField.neighborCount / 6) * 0.08,
+        );
+        const coastalPull = clamp01(integrationField.neighborCount / 6);
+        const integration = clamp01(
+          depthDominance * 0.68 + handoffSignal * 0.22 + coastalPull * 0.1,
+        );
+
+        if (integration <= 0.02) {
+          activeColumnCount += 1;
+          continue;
+        }
+
+        column.coverage *= 1 - integration;
+        column.filmOpacity *= 1 - integration * 0.95;
+        column.edgeStrength *= 1 - integration;
+        column.foam *= 1 - integration * 0.92;
+        column.wetness *= 1 - integration * 0.62;
+        column.breakup *= 1 - integration * 0.88;
+        column.microRipple *= 1 - integration * 0.7;
+        column.filmThickness = Math.max(0.006, column.filmThickness * (1 - integration * 0.78));
+        column.visualSurfaceY = Math.min(
+          column.visualSurfaceY,
+          integrationField.strongestSurfaceY || column.visualSurfaceY,
+        );
+        column.handoffBlend = Math.max(column.handoffBlend, integration);
+        column.deepBlend = Math.max(column.deepBlend, integration * 0.72);
+
+        if (column.coverage <= 0.035 || column.filmOpacity <= 0.03) {
+          column.active = false;
+          column.coverage = 0;
+          column.filmOpacity = 0;
+          column.edgeStrength = 0;
+          column.foam = 0;
+          column.breakup = 0;
+          column.microRipple = 0;
+          continue;
+        }
+
+        activeColumnCount += 1;
+      }
+    }
+    film.activeColumnCount = activeColumnCount;
+  }
+
+  private buildShallowTerrainFlowHints(grid: ReturnType<typeof getShallowSection> extends infer T ? Exclude<T, undefined> : never) {
+    const hints = new Array<ShallowWaterExternalFlowHint>(grid.sizeX * grid.sizeZ);
+    for (let z = 0; z < grid.sizeZ; z++) {
+      for (let x = 0; x < grid.sizeX; x++) {
+        const index = z * grid.sizeX + x;
+        const column = grid.columns[index];
+        const currentBedY = Number.isFinite(column.bedY) ? column.bedY : grid.terrainY;
+        const westBedY = this.sampleShallowBedYForHint(grid.originX, grid.originZ, x - 1, z, currentBedY);
+        const eastBedY = this.sampleShallowBedYForHint(grid.originX, grid.originZ, x + 1, z, currentBedY);
+        const northBedY = this.sampleShallowBedYForHint(grid.originX, grid.originZ, x, z - 1, currentBedY);
+        const southBedY = this.sampleShallowBedYForHint(grid.originX, grid.originZ, x, z + 1, currentBedY);
+        const northWestBedY = this.sampleShallowBedYForHint(grid.originX, grid.originZ, x - 1, z - 1, currentBedY);
+        const northEastBedY = this.sampleShallowBedYForHint(grid.originX, grid.originZ, x + 1, z - 1, currentBedY);
+        const southWestBedY = this.sampleShallowBedYForHint(grid.originX, grid.originZ, x - 1, z + 1, currentBedY);
+        const southEastBedY = this.sampleShallowBedYForHint(grid.originX, grid.originZ, x + 1, z + 1, currentBedY);
+
+        const westDrop = Math.max(0, currentBedY - westBedY);
+        const eastDrop = Math.max(0, currentBedY - eastBedY);
+        const northDrop = Math.max(0, currentBedY - northBedY);
+        const southDrop = Math.max(0, currentBedY - southBedY);
+        const northWestDrop = Math.max(0, currentBedY - northWestBedY);
+        const northEastDrop = Math.max(0, currentBedY - northEastBedY);
+        const southWestDrop = Math.max(0, currentBedY - southWestBedY);
+        const southEastDrop = Math.max(0, currentBedY - southEastBedY);
+
+        let flowX = eastDrop - westDrop + (northEastDrop + southEastDrop - northWestDrop - southWestDrop) * 0.38;
+        let flowZ = southDrop - northDrop + (southWestDrop + southEastDrop - northWestDrop - northEastDrop) * 0.38;
+
+        const westWorldX = grid.originX + x - 1;
+        const eastWorldX = grid.originX + x + 1;
+        const northWorldZ = grid.originZ + z - 1;
+        const southWorldZ = grid.originZ + z + 1;
+        const worldX = grid.originX + x;
+        const worldZ = grid.originZ + z;
+
+        const continuousWest = this.hasContinuousWaterAt(westWorldX, worldZ) ? 1 : 0;
+        const continuousEast = this.hasContinuousWaterAt(eastWorldX, worldZ) ? 1 : 0;
+        const continuousNorth = this.hasContinuousWaterAt(worldX, northWorldZ) ? 1 : 0;
+        const continuousSouth = this.hasContinuousWaterAt(worldX, southWorldZ) ? 1 : 0;
+        const continuousNorthWest = this.hasContinuousWaterAt(westWorldX, northWorldZ) ? 1 : 0;
+        const continuousNorthEast = this.hasContinuousWaterAt(eastWorldX, northWorldZ) ? 1 : 0;
+        const continuousSouthWest = this.hasContinuousWaterAt(westWorldX, southWorldZ) ? 1 : 0;
+        const continuousSouthEast = this.hasContinuousWaterAt(eastWorldX, southWorldZ) ? 1 : 0;
+        flowX += (continuousEast - continuousWest) * 0.35;
+        flowZ += (continuousSouth - continuousNorth) * 0.35;
+        flowX +=
+          (continuousNorthEast + continuousSouthEast - continuousNorthWest - continuousSouthWest) *
+          0.16;
+        flowZ +=
+          (continuousSouthWest + continuousSouthEast - continuousNorthWest - continuousNorthEast) *
+          0.16;
+
+        const slopeStrength = clamp01(
+          Math.max(
+            westDrop,
+            eastDrop,
+            northDrop,
+            southDrop,
+            northWestDrop * 0.72,
+            northEastDrop * 0.72,
+            southWestDrop * 0.72,
+            southEastDrop * 0.72,
+          ) / 1.2,
+        );
+        const length = Math.hypot(flowX, flowZ);
+        if (length > 0.0001) {
+          flowX /= length;
+          flowZ /= length;
+        } else {
+          flowX = 0;
+          flowZ = 0;
+        }
+
+        const shallowWetNeighbors =
+          (this.hasShallowWaterAt(westWorldX, worldZ) ? 1 : 0) +
+          (this.hasShallowWaterAt(eastWorldX, worldZ) ? 1 : 0) +
+          (this.hasShallowWaterAt(worldX, northWorldZ) ? 1 : 0) +
+          (this.hasShallowWaterAt(worldX, southWorldZ) ? 1 : 0);
+        const continuousNeighbors =
+          continuousWest + continuousEast + continuousNorth + continuousSouth;
+        const diagonalContinuousNeighbors =
+          continuousNorthWest + continuousNorthEast + continuousSouthWest + continuousSouthEast;
+        const continuousPresence = continuousNeighbors + diagonalContinuousNeighbors * 0.55;
+        const dryNeighbors = Math.max(0, 4 - shallowWetNeighbors - continuousNeighbors);
+
+        const shoreFactor = clamp01(
+          dryNeighbors / 4 * 0.4 +
+            continuousPresence / 4 * 0.48 +
+            slopeStrength * 0.12,
+        );
+        const drainageMultiplier = Math.max(
+          0.45,
+          Math.min(
+            1.28,
+            0.55 +
+              slopeStrength * 0.66 +
+              dryNeighbors * 0.08 -
+              continuousNeighbors * 0.06 -
+              shallowWetNeighbors * 0.04,
+          ),
+        );
+
+        hints[index] = {
+          flowX,
+          flowZ,
+          drainageMultiplier,
+          shoreFactor,
+        };
+      }
+    }
+    return hints;
+  }
+
+  private syncShallowTerrainSupport() {
+    for (const grid of getActiveShallowSections().values()) {
+      let guessY = Number.isFinite(grid.terrainY) ? grid.terrainY : 0;
+      let hasActive = false;
+
+      for (const column of grid.columns) {
+        if (!column.active || column.thickness <= 0.0001) continue;
+        hasActive = true;
+        if (Number.isFinite(column.bedY) && column.bedY !== 0) {
+          guessY = column.bedY;
+          break;
+        }
+      }
+
+      if (!hasActive) continue;
+
+      let minBedY = Number.POSITIVE_INFINITY;
+      for (let z = 0; z < grid.sizeZ; z++) {
+        for (let x = 0; x < grid.sizeX; x++) {
+          const index = z * grid.sizeX + x;
+          const column = grid.columns[index];
+          const sampleGuess =
+            Number.isFinite(column.bedY) && column.bedY !== 0 ? column.bedY : guessY;
+          const sampledBedY = this.sampleTerrainBedY(
+            grid.originX + x,
+            grid.originZ + z,
+            sampleGuess,
+          );
+          if (!Number.isFinite(sampledBedY)) continue;
+
+          minBedY = Math.min(minBedY, sampledBedY);
+          if (!column.active || column.thickness <= 0.0001) {
+            column.bedY = sampledBedY;
+            column.surfaceY = sampledBedY;
+            continue;
+          }
+
+          column.bedY = sampledBedY;
+          column.surfaceY = sampledBedY + Math.max(0, column.thickness);
+        }
+      }
+
+      if (Number.isFinite(minBedY)) {
+        grid.terrainY = minBedY;
+      }
+      setShallowWaterFlowHints(
+        grid.originX,
+        grid.originZ,
+        this.buildShallowTerrainFlowHints(grid),
+      );
+    }
+  }
+
   dispose() {
     if (this._disposed) return;
     this._disposed = true;
@@ -1131,10 +1952,10 @@ export class DVEBabylonRenderer extends DVERenderer {
     this.splatManager = null;
     this.lodTracker?.dispose();
     this.lodTracker = null;
-    this.shallowSectionRenderer?.dispose();
-    this.shallowSectionRenderer = null;
-    this.shallowWaterRenderer?.dispose();
-    this.shallowWaterRenderer = null;
+    this.shallowCompositeController?.dispose();
+    this.shallowCompositeController = null;
+    this.shallowLocalFluidCoupler?.dispose();
+    this.shallowLocalFluidCoupler = null;
     this.continuumController?.dispose();
     this.continuumController = null;
     this.spillFxRenderer.clear(getSceneWaterHybridBridge(this.scene).localFluidSystem);
@@ -1144,6 +1965,7 @@ export class DVEBabylonRenderer extends DVERenderer {
     clearAllContinuousWater();
     clearAllSpillWater();
     this.clearDormantWaterSnapshots();
+    this._durablePersistenceBackend.dispose();
     this.waterLODManager.clear();
     this.waterTransferResolver = null;
     this.waterChunkRegistry.clear();
@@ -1152,6 +1974,7 @@ export class DVEBabylonRenderer extends DVERenderer {
     if (MeshManager.onSectionUpdated) MeshManager.onSectionUpdated = null;
     if (MeshManager.onSectorRemoved) MeshManager.onSectorRemoved = null;
     if (MeshManager.onVoxelErased) MeshManager.onVoxelErased = null;
+    if (MeshManager.onVoxelPainted) MeshManager.onVoxelPainted = null;
     if (DVEBabylonRenderer.instance === this) {
       DVEBabylonRenderer.instance = null as any;
     }

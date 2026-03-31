@@ -237,16 +237,16 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
     const isCultivated = materialClass.isCultivated;
     const isExotic = materialClass.isExotic;
     const materialWetnessPorosity = isFlora
-      ? 0.72
+      ? 0.68
       : isSoil || isCultivated
-        ? 0.58
+        ? 0.54
         : isWood
-          ? 0.34
+          ? 0.38
           : isRock
-            ? 0.12
+            ? 0.08
             : isExotic
-              ? 0.26
-              : 0.2;
+              ? 0.22
+              : 0.18;
     const disableUnstablePBRSurfaceContext = isUnstablePBRSurfaceContextPreset(benchmarkPreset);
     const enableVisualV2 = terrain.visualV2 && !disableUnstablePBRSurfaceContext;
     const enableMacroVariation = terrain.macroVariation && !isTransparent && !isGlow;
@@ -268,16 +268,22 @@ export class DVEPBRMaterialPlugin extends MaterialPluginBase {
       terrain.surfaceMetadata &&
       !isTransparent &&
       !isGlow &&
-      !disableUnstablePBRSurfaceContext;
+      !disableUnstablePBRSurfaceContext &&
+      (!terrain.surfaceNets || terrain.surfaceNetsTopologyRefinement === false);
     const enableWorldContext =
       (enableSurfaceMetadata || enableWetness) &&
       !isTransparent &&
       !isGlow;
+    const enableBakedWorldContext =
+      enableWorldContext &&
+      (!terrain.surfaceNets || terrain.surfaceNetsTopologyRefinement === false);
     const enableSurfaceHeightGradient =
       terrain.surfaceHeightGradient &&
       !isTransparent &&
       !isGlow &&
       !disableUnstablePBRSurfaceContext;
+    const enableScreenEdgeNormalSoftening =
+      !terrain.surfaceNets || terrain.surfaceNetsTopologyRefinement === false;
     const enablePBRPremium = (benchmarkPreset === "pbr-premium" || benchmarkPreset === "pbr-premium-v2") && !isTransparent;
     const enableImportedMaterialMaps =
       this.shouldUseImportedMaterialMaps() && !isTransparent;
@@ -336,14 +342,14 @@ varying vec3 dveLight2;
 varying vec3 dveLight3;
 varying vec3 dveLight4;
   ${enableSurfaceMetadata ? "varying vec4 dveMetadata;" : ""}
-  ${enableWorldContext ? "varying vec3 dveWorldContext;" : ""}
+  ${enableBakedWorldContext ? "varying vec3 dveWorldContext;" : ""}
 `;
 
     const attributes = /* glsl */ `
 attribute vec3 textureIndex;
 attribute vec4 voxelData;
   ${enableSurfaceMetadata ? "attribute vec4 metadata;" : ""}
-  ${enableWorldContext ? "attribute vec3 worldContext;" : ""}
+  ${enableBakedWorldContext ? "attribute vec3 worldContext;" : ""}
 `;
     const coreFunctions = /* glsl */ `
 const uint dveLightMask = uint(0xf);
@@ -490,7 +496,18 @@ float dveNearFieldMask(float distanceValue, float startDistance, float endDistan
 }
 
 vec2 dveGetWaterHybridUV(vec3 worldPos) {
-  return fract((worldPos.xz - dve_water_hybrid_clip.xy) * dve_water_hybrid_clip.zw);
+  vec2 texel = dve_water_hybrid_clip.zw;
+  vec2 texelCenter = texel * 0.5;
+  vec2 snappedWorld = floor(worldPos.xz) + vec2(0.5);
+  vec2 uv = (snappedWorld - dve_water_hybrid_clip.xy) * texel;
+  return clamp(uv, texelCenter, vec2(1.0) - texelCenter);
+}
+
+vec2 dveGetWaterHybridNeighborUV(vec2 hybridUV, vec2 offsetInTexels) {
+  vec2 texel = dve_water_hybrid_clip.zw;
+  vec2 texelCenter = texel * 0.5;
+  vec2 uv = hybridUV + offsetInTexels * texel;
+  return clamp(uv, texelCenter, vec2(1.0) - texelCenter);
 }
 
 vec4 dveGetTerrainHydrologyFields(
@@ -500,15 +517,41 @@ vec4 dveGetTerrainHydrologyFields(
   float materialPorosity
 ) {
   vec2 hybridUV = dveGetWaterHybridUV(worldPos);
-  vec2 texel = dve_water_hybrid_clip.zw;
-  vec4 hybridBase = texture(dve_water_hybrid_base, hybridUV);
-  vec4 hybridDynamic = texture(dve_water_hybrid_dynamic, hybridUV);
-  vec4 hybridFlow = texture(dve_water_hybrid_flow, hybridUV);
+  vec4 hybridBaseCenter = texture(dve_water_hybrid_base, hybridUV);
+  vec4 hybridDynamicCenter = texture(dve_water_hybrid_dynamic, hybridUV);
+  vec4 hybridFlowCenter = texture(dve_water_hybrid_flow, hybridUV);
+  vec4 hybridBaseXP = texture(dve_water_hybrid_base, dveGetWaterHybridNeighborUV(hybridUV, vec2(1.0, 0.0)));
+  vec4 hybridBaseXN = texture(dve_water_hybrid_base, dveGetWaterHybridNeighborUV(hybridUV, vec2(-1.0, 0.0)));
+  vec4 hybridBaseZP = texture(dve_water_hybrid_base, dveGetWaterHybridNeighborUV(hybridUV, vec2(0.0, 1.0)));
+  vec4 hybridBaseZN = texture(dve_water_hybrid_base, dveGetWaterHybridNeighborUV(hybridUV, vec2(0.0, -1.0)));
+  vec4 hybridDynamicXP = texture(dve_water_hybrid_dynamic, dveGetWaterHybridNeighborUV(hybridUV, vec2(1.0, 0.0)));
+  vec4 hybridDynamicXN = texture(dve_water_hybrid_dynamic, dveGetWaterHybridNeighborUV(hybridUV, vec2(-1.0, 0.0)));
+  vec4 hybridDynamicZP = texture(dve_water_hybrid_dynamic, dveGetWaterHybridNeighborUV(hybridUV, vec2(0.0, 1.0)));
+  vec4 hybridDynamicZN = texture(dve_water_hybrid_dynamic, dveGetWaterHybridNeighborUV(hybridUV, vec2(0.0, -1.0)));
+  vec4 hybridFlowXP = texture(dve_water_hybrid_flow, dveGetWaterHybridNeighborUV(hybridUV, vec2(1.0, 0.0)));
+  vec4 hybridFlowXN = texture(dve_water_hybrid_flow, dveGetWaterHybridNeighborUV(hybridUV, vec2(-1.0, 0.0)));
+  vec4 hybridFlowZP = texture(dve_water_hybrid_flow, dveGetWaterHybridNeighborUV(hybridUV, vec2(0.0, 1.0)));
+  vec4 hybridFlowZN = texture(dve_water_hybrid_flow, dveGetWaterHybridNeighborUV(hybridUV, vec2(0.0, -1.0)));
+  vec4 hybridBase = mix(
+    hybridBaseCenter,
+    (hybridBaseCenter * 2.0 + hybridBaseXP + hybridBaseXN + hybridBaseZP + hybridBaseZN) / 6.0,
+    0.38
+  );
+  vec4 hybridDynamic = mix(
+    hybridDynamicCenter,
+    (hybridDynamicCenter * 2.0 + hybridDynamicXP + hybridDynamicXN + hybridDynamicZP + hybridDynamicZN) / 6.0,
+    0.28
+  );
+  vec4 hybridFlow = mix(
+    hybridFlowCenter,
+    (hybridFlowCenter * 2.0 + hybridFlowXP + hybridFlowXN + hybridFlowZP + hybridFlowZN) / 6.0,
+    0.24
+  );
   float neighborFill = 0.0;
-  neighborFill = max(neighborFill, texture(dve_water_hybrid_base, fract(hybridUV + vec2(texel.x, 0.0))).a);
-  neighborFill = max(neighborFill, texture(dve_water_hybrid_base, fract(hybridUV - vec2(texel.x, 0.0))).a);
-  neighborFill = max(neighborFill, texture(dve_water_hybrid_base, fract(hybridUV + vec2(0.0, texel.y))).a);
-  neighborFill = max(neighborFill, texture(dve_water_hybrid_base, fract(hybridUV - vec2(0.0, texel.y))).a);
+  neighborFill = max(neighborFill, hybridBaseXP.a);
+  neighborFill = max(neighborFill, hybridBaseXN.a);
+  neighborFill = max(neighborFill, hybridBaseZP.a);
+  neighborFill = max(neighborFill, hybridBaseZN.a);
 
   float explicitWetness = clamp(
     max(baseHydrology * 0.38, hybridBase.a * 0.86 + neighborFill * 0.34 + hybridFlow.a * 0.16),
@@ -601,7 +644,7 @@ vec3 dveDecodeLightValue(uint value) {
   dveLight4 = dveDecodeLightValue(uint(voxelData.w));
   dveIUV = dveQuadUVArray[(uint(voxelData.z) >> dveVertexIndex) & dveVertexMask];
   ${enableSurfaceMetadata ? "dveMetadata = metadata;" : ""}
-  ${enableWorldContext ? "dveWorldContext = worldContext;" : ""}
+  ${enableBakedWorldContext ? "dveWorldContext = worldContext;" : ""}
 
 #endif
         `,
@@ -623,13 +666,13 @@ float dveSlope = 1.0 - abs(dveNormalW.y);
       float dveSurfaceTop = smoothstep(0.45, 0.8, dveNormalW.y);
       float dveBakedHeight = 0.0;
   ${enableSurfaceMetadata ? "vec4 dveMetadataClamped = clamp(dveMetadata, 0.0, 1.0); float dveMetadataWeight = smoothstep(0.04, 0.28, dot(dveMetadataClamped, vec4(0.25))); dveSurfaceExposure = mix(dveSurfaceExposure, dveMetadataClamped.x, dveMetadataWeight * 0.72); dveSurfaceSlope = mix(dveSurfaceSlope, dveMetadataClamped.y, dveMetadataWeight * 0.72); dveSurfaceCavity = mix(dveSurfaceCavity, dveMetadataClamped.z, dveMetadataWeight * 0.72); dveSurfaceTop = mix(dveSurfaceTop, smoothstep(0.4, 0.85, dveMetadataClamped.x), dveMetadataWeight * 0.72); dveBakedHeight = dveMetadataClamped.w; dveTopExposure = mix(dveTopExposure, max(dveTopExposure, dveSurfaceExposure), dveMetadataWeight * 0.55);" : ""}
-      float dveSunExposure = ${enableWorldContext ? "clamp(dveWorldContext.x, 0.0, 1.0)" : "1.0"};
-      float dveEnclosure = ${enableWorldContext ? "clamp(dveWorldContext.y, 0.0, 1.0)" : "0.0"};
+      float dveSunExposure = ${enableBakedWorldContext ? "clamp(dveWorldContext.x, 0.0, 1.0)" : "1.0"};
+      float dveEnclosure = ${enableBakedWorldContext ? "clamp(dveWorldContext.y, 0.0, 1.0)" : "0.0"};
       float dveEdgeBoundary = ${enableSurfaceMetadata ? "clamp((1.0 - dveEdgeWear * 0.72) * (0.76 + dveSurfaceExposure * 0.16 + dveSurfaceTop * 0.08) + dveSurfaceCavity * 0.08, 0.0, 1.0)" : "1.0"};
       float dveHeightNorm = ${enableSurfaceMetadata ? "dveBakedHeight" : enableSurfaceHeightGradient ? "clamp((vPositionW.y - 16.0) / 112.0, 0.0, 1.0)" : "0.0"};
       float dveBaseCavity = clamp(max(dveSurfaceCavity * 0.82, dveEdgeMask(fract(dveBaseUV * 0.85 + vec2(vPositionW.y * 0.03))) * 0.18), 0.0, 1.0);
       float dveMaterialPorosity = ${materialWetnessPorosity.toFixed(2)};
-      float dveLegacyHydrologyWetness = ${enableWorldContext ? "clamp(dveWorldContext.z, 0.0, 1.0)" : "0.0"};
+      float dveLegacyHydrologyWetness = ${enableBakedWorldContext ? "clamp(dveWorldContext.z, 0.0, 1.0)" : "0.0"};
       vec4 dveHydrologyFields = dveGetTerrainHydrologyFields(vPositionW, dveNormalW, dveLegacyHydrologyWetness, dveMaterialPorosity);
       float dveHydrologyWetness = dveHydrologyFields.x;
       float dveHydrologyFresh = dveHydrologyFields.y;
@@ -697,13 +740,13 @@ voxelBaseColor = mix(voxelBaseColor, dveTriplanarColor, dveTriplanarMix);
         ? /* glsl */ `
 voxelBaseColor.rgb = mix(
   voxelBaseColor.rgb,
-  voxelBaseColor.rgb * vec3(0.72, 0.76, 0.82),
-  dveWetFilm * mix(0.16, 0.34, dveMaterialPorosity)
+  voxelBaseColor.rgb * vec3(0.68, 0.73, 0.80),
+  dveWetFilm * mix(0.18, 0.38, dveMaterialPorosity)
 );
 voxelBaseColor.rgb = mix(
   voxelBaseColor.rgb,
-  voxelBaseColor.rgb * vec3(0.84, 0.86, 0.9),
-  dveDryingWetness * mix(0.08, 0.18, dveWetnessRetention)
+  voxelBaseColor.rgb * vec3(0.82, 0.85, 0.90),
+  dveDryingWetness * mix(0.10, 0.22, dveWetnessRetention)
 );
 `
         : "";
@@ -883,18 +926,18 @@ voxelBaseColor.rgb = mix(
         ? /* glsl */ `
 #ifdef  DVE_${this.name}
 vec3 dveNormalW = normalize(vNormalW);
-float dveHydrologyWetness = ${enableWorldContext ? "clamp(dveWorldContext.z, 0.0, 1.0)" : "0.0"};
+float dveHydrologyWetness = ${enableBakedWorldContext ? "clamp(dveWorldContext.z, 0.0, 1.0)" : "0.0"};
 vec4 dveHydrologyFields = dveGetTerrainHydrologyFields(vPositionW, dveNormalW, dveHydrologyWetness, ${materialWetnessPorosity.toFixed(2)});
 float dveWetnessBase = clamp(dveComputeWetness(dveNormalW, vPositionW) + dveHydrologyFields.x * (0.22 + ${materialWetnessPorosity.toFixed(2)} * 0.24) + dveHydrologyFields.w * (0.10 + ${materialWetnessPorosity.toFixed(2)} * 0.08), 0.0, 1.0);
 float dveWetnessRetention = clamp(0.26 + ${materialWetnessPorosity.toFixed(2)} * 0.58 + dveHydrologyFields.z * 0.18 + dveHydrologyFields.w * 0.08, 0.0, 1.0);
 float dveFreshWetness = max(max(smoothstep(0.24, 0.78, dveWetnessBase), smoothstep(0.08, 0.52, dveHydrologyFields.x) * (0.72 + ${materialWetnessPorosity.toFixed(2)} * 0.18)), smoothstep(0.08, 0.58, dveHydrologyFields.y) * (0.68 + ${materialWetnessPorosity.toFixed(2)} * 0.22));
 float dveDryingWetness = clamp(dveWetnessBase * (0.42 + dveWetnessRetention * 0.42) * (1.0 - dveFreshWetness * 0.55) + dveHydrologyFields.x * (0.12 + dveWetnessRetention * 0.22) * (1.0 - dveFreshWetness * 0.45) + dveHydrologyFields.z * (0.18 + dveWetnessRetention * 0.14), 0.0, 1.0);
 float dveWetnessMask = clamp(dveFreshWetness * (0.58 + ${materialWetnessPorosity.toFixed(2)} * 0.18) + dveDryingWetness + dveHydrologyFields.x * (0.08 + ${materialWetnessPorosity.toFixed(2)} * 0.16) + dveHydrologyFields.w * (0.08 + ${materialWetnessPorosity.toFixed(2)} * 0.12), 0.0, 1.0);
-microSurface = mix(microSurface, mix(0.9, 0.98, dveFreshWetness), dveWetnessMask * mix(0.42, 0.82, ${materialWetnessPorosity.toFixed(2)}));
+microSurface = mix(microSurface, mix(0.92, 0.985, dveFreshWetness), dveWetnessMask * mix(0.48, 0.78, ${materialWetnessPorosity.toFixed(2)}));
 surfaceReflectivityColor = mix(
   surfaceReflectivityColor,
-  max(surfaceReflectivityColor, vec3(0.08, 0.08, 0.08)),
-  dveWetnessMask * mix(0.12, 0.32, ${materialWetnessPorosity.toFixed(2)})
+  max(surfaceReflectivityColor, vec3(0.10, 0.10, 0.10)),
+  dveWetnessMask * mix(0.16, 0.36, ${materialWetnessPorosity.toFixed(2)})
 );
 #endif
 `
@@ -952,7 +995,7 @@ surfaceReflectivityColor *= mix(vec3(1.0), vec3(0.96), dveAmbientOcclusion * 0.0
       const wetnessFinalCode = enableWetness
         ? /* glsl */ `
 vec3 dveNormalW = normalize(vNormalW);
-float dveHydrologyWetness = ${enableWorldContext ? "clamp(dveWorldContext.z, 0.0, 1.0)" : "0.0"};
+float dveHydrologyWetness = ${enableBakedWorldContext ? "clamp(dveWorldContext.z, 0.0, 1.0)" : "0.0"};
 vec4 dveHydrologyFields = dveGetTerrainHydrologyFields(vPositionW, dveNormalW, dveHydrologyWetness, ${materialWetnessPorosity.toFixed(2)});
 float dveWetnessBase = clamp(dveComputeWetness(dveNormalW, vPositionW) + dveHydrologyFields.x * (0.22 + ${materialWetnessPorosity.toFixed(2)} * 0.24) + dveHydrologyFields.w * (0.10 + ${materialWetnessPorosity.toFixed(2)} * 0.08), 0.0, 1.0);
 float dveWetnessRetention = clamp(0.26 + ${materialWetnessPorosity.toFixed(2)} * 0.58 + dveHydrologyFields.z * 0.18 + dveHydrologyFields.w * 0.08, 0.0, 1.0);
@@ -1073,9 +1116,10 @@ ${importedMaterialMicroSurfaceCode}
 }
 #endif
 `,
-  CUSTOM_FRAGMENT_BEFORE_LIGHTS: /*glsl*/ `
+        CUSTOM_FRAGMENT_BEFORE_LIGHTS: /*glsl*/ `
 ${importedMaterialBeforeLightsCode}
 #ifdef DVE_${this.name}
+${enableScreenEdgeNormalSoftening ? `
 // SE-01: Screen-space edge normal softening via dFdx/dFdy reconstruction.
 // At flat face interiors the derivative normal matches the geometry normal → edgeFactor ≈ 0 → no change.
 // At edge pixels where the hardware 2×2 derivative quad spans two adjacent face orientations,
@@ -1115,6 +1159,7 @@ ${importedMaterialBeforeLightsCode}
   // (it lives inside reflectivityOut which is computed after this injection point).
   // Specular occlusion removed to avoid GLSL compile error; edge normal softening still active above.
 }
+` : ""}
 #endif
 `,
         /* "!finalIrradiance\\*\\=surfaceAlbedo.rgb;":
