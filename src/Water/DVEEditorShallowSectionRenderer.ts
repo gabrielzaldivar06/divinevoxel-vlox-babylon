@@ -480,7 +480,9 @@ export class DVEEditorShallowSectionRenderer {
 
         const fallback = this.sampleFallbackHeight(snapshot, worldX, worldZ);
         if (!fallback) {
-          heights[idx] = snapshot.records[0]?.y ?? 0;
+          heights[idx] = 0;
+          bottoms[idx] = 0;
+          thicknesses[idx] = 0;
           alphas[idx] = 0;
           continue;
         }

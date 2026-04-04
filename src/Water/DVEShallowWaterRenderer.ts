@@ -201,6 +201,8 @@ const NORMAL_SCROLL_RATE = 0.018;
 /** Minimum ambient UV drift speed so settled pools never have a frozen normal-map. */
 const NORMAL_AMBIENT_DRIFT = 0.004;
 
+export type DVEShallowWaterRenderProfile = "dynamic" | "minimal";
+
 export class DVEShallowWaterRenderer {
   private readonly sections = new Map<string, SectionRecord>();
   private readonly material: PBRMaterial;
@@ -231,6 +233,7 @@ export class DVEShallowWaterRenderer {
   private camX = 0;
   private camY = 10;
   private camZ = 0;
+  private renderProfile: DVEShallowWaterRenderProfile = "dynamic";
 
   constructor(private readonly scene: Scene) {
     const mat = new PBRMaterial("dve_shallow_water_material", scene);
@@ -286,6 +289,8 @@ export class DVEShallowWaterRenderer {
     } catch {
       // Texture load failure is non-fatal
     }
+
+    this.applyRenderProfileToMaterial();
   }
 
   // ─────────────────────────────────────────
@@ -333,9 +338,22 @@ export class DVEShallowWaterRenderer {
     record.pendingDispose = true;
   }
 
+  setRenderProfile(profile: DVEShallowWaterRenderProfile) {
+    if (this.renderProfile === profile) return;
+    this.renderProfile = profile;
+    this.applyRenderProfileToMaterial();
+  }
+
+  getRenderProfile() {
+    return this.renderProfile;
+  }
+
   update(dt: number, activeKeys?: ReadonlySet<string>) {
     if (this.disposed) return;
-    this.time += dt;
+    const isMinimalProfile = this.renderProfile === "minimal";
+    if (!isMinimalProfile) {
+      this.time += dt;
+    }
 
     // ── Advance handoff fade-out timers ──────────────────────────
     for (const [key, progress] of this.handoffFades) {
@@ -367,17 +385,27 @@ export class DVEShallowWaterRenderer {
 
     // ── Scroll normal-map UVs driven by real flow velocity ────────────────
     if (this.normalTex) {
-      this.uvOffU1 += (avgVX * NORMAL_SCROLL_RATE + NORMAL_AMBIENT_DRIFT) * dt;
-      this.uvOffV1 += (avgVZ * NORMAL_SCROLL_RATE + NORMAL_AMBIENT_DRIFT * 0.6) * dt;
-      this.normalTex.uOffset = this.uvOffU1;
-      this.normalTex.vOffset = this.uvOffV1;
+      if (isMinimalProfile) {
+        this.normalTex.uOffset = 0;
+        this.normalTex.vOffset = 0;
+      } else {
+        this.uvOffU1 += (avgVX * NORMAL_SCROLL_RATE + NORMAL_AMBIENT_DRIFT) * dt;
+        this.uvOffV1 += (avgVZ * NORMAL_SCROLL_RATE + NORMAL_AMBIENT_DRIFT * 0.6) * dt;
+        this.normalTex.uOffset = this.uvOffU1;
+        this.normalTex.vOffset = this.uvOffV1;
+      }
     }
     // Second normal layer scrolls in opposite direction for detail breakup
     if (this.normalTex2) {
-      this.uvOffU2 -= (avgVX * NORMAL_SCROLL_RATE * 0.7 + NORMAL_AMBIENT_DRIFT * 0.8) * dt;
-      this.uvOffV2 += (avgVZ * NORMAL_SCROLL_RATE * 0.5 + NORMAL_AMBIENT_DRIFT * 0.4) * dt;
-      this.normalTex2.uOffset = this.uvOffU2;
-      this.normalTex2.vOffset = this.uvOffV2;
+      if (isMinimalProfile) {
+        this.normalTex2.uOffset = 0;
+        this.normalTex2.vOffset = 0;
+      } else {
+        this.uvOffU2 -= (avgVX * NORMAL_SCROLL_RATE * 0.7 + NORMAL_AMBIENT_DRIFT * 0.8) * dt;
+        this.uvOffV2 += (avgVZ * NORMAL_SCROLL_RATE * 0.5 + NORMAL_AMBIENT_DRIFT * 0.4) * dt;
+        this.normalTex2.uOffset = this.uvOffU2;
+        this.normalTex2.vOffset = this.uvOffV2;
+      }
     }
 
     // ── Cache camera position for Fresnel in _rebuildSection ──────────
@@ -420,6 +448,7 @@ export class DVEShallowWaterRenderer {
     const gx = sizeX + 1;
     const gz = sizeZ + 1;
     const columnCount = sizeX * sizeZ;
+    const isMinimalProfile = this.renderProfile === "minimal";
 
     const cellActive = new Uint8Array(columnCount);
     const cellThickness = new Float32Array(columnCount);
@@ -508,53 +537,70 @@ export class DVEShallowWaterRenderer {
         const wx = originX + vx;
         const wz = originZ + vz;
 
-        let gerstnerY = 0;
-        const flowMag = Math.hypot(avgSpreadVX, avgSpreadVZ);
-        for (let wi = 0; wi < GERSTNER_WAVES.length; wi++) {
-          const w = GERSTNER_WAVES[wi];
-          const phase = (w.dx * wx + w.dz * wz) * w.freq + this.time * w.speed;
-          const ampScale = (0.35 + unsettled * 0.65) * depthFade * shoreFade;
-          gerstnerY += Math.sin(phase) * w.amp * ampScale;
-        }
+        // Edge dampening: reduce ripple amplitude near section boundaries to prevent
+        // inter-section height seams. Damps to 0 at the border, full amplitude 2 cells in.
+        const EDGE_DAMP_COLS = 2.0;
+        const edgeDampenX = clamp01(Math.min(vx, sizeX - vx) / EDGE_DAMP_COLS);
+        const edgeDampenZ = clamp01(Math.min(vz, sizeZ - vz) / EDGE_DAMP_COLS);
+        const edgeDampen = edgeDampenX * edgeDampenZ;
 
-        const flowPhase =
-          (avgSpreadVX * wx + avgSpreadVZ * wz) * RIPPLE_FREQ + this.time * WAVE_SPEED;
-        const flowRipple =
-          Math.sin(flowPhase) *
-          Math.min(flowMag, 1) *
-          RIPPLE_AMPLITUDE *
-          unsettled *
-          depthFade *
-          shoreFade;
-        const ambientA =
-          Math.sin(wx * 2.1 + this.time * 0.8) *
-          Math.cos(wz * 1.75 + this.time * 0.65);
-        const ambientRipple =
-          ambientA *
-          RIPPLE_AMPLITUDE *
-          AMBIENT_RIPPLE_FRACTION *
-          avgSettled *
-          depthFade *
-          shoreFade *
-          0.5;
-        const ripple = gerstnerY + flowRipple + ambientRipple;
+        let ripple = 0;
+        let flowMag = 0;
+        if (!isMinimalProfile) {
+          let gerstnerY = 0;
+          flowMag = Math.hypot(avgSpreadVX, avgSpreadVZ);
+          for (let wi = 0; wi < GERSTNER_WAVES.length; wi++) {
+            const w = GERSTNER_WAVES[wi];
+            const phase = (w.dx * wx + w.dz * wz) * w.freq + this.time * w.speed;
+            const ampScale = (0.35 + unsettled * 0.65) * depthFade * shoreFade;
+            gerstnerY += Math.sin(phase) * w.amp * ampScale;
+          }
+
+          const flowPhase =
+            (avgSpreadVX * wx + avgSpreadVZ * wz) * RIPPLE_FREQ + this.time * WAVE_SPEED;
+          const flowRipple =
+            Math.sin(flowPhase) *
+            Math.min(flowMag, 1) *
+            RIPPLE_AMPLITUDE *
+            unsettled *
+            depthFade *
+            shoreFade;
+          const ambientA =
+            Math.sin(wx * 2.1 + this.time * 0.8) *
+            Math.cos(wz * 1.75 + this.time * 0.65);
+          const ambientRipple =
+            ambientA *
+            RIPPLE_AMPLITUDE *
+            AMBIENT_RIPPLE_FRACTION *
+            avgSettled *
+            depthFade *
+            shoreFade *
+            0.5;
+          ripple = (gerstnerY + flowRipple + ambientRipple) * edgeDampen;
+        }
 
         heights[vertexIndex] = avgSurfaceY + ripple;
         thicknesses[vertexIndex] = avgThickness;
         shoreDistances[vertexIndex] = avgShoreDist;
         settledValues[vertexIndex] = avgSettled;
 
-        const densityAlpha = clamp01(1.0 - Math.exp(-avgThickness * 4.5));
-        const shoreAlpha = lerp(0.45, 1, clamp01(avgShoreDist / 3.0));
-        const depthMod = lerp(0.55, 1, depthFade);
-        const eyeX = this.camX - wx;
-        const eyeY = this.camY - heights[vertexIndex];
-        const eyeZ = this.camZ - wz;
-        const eyeLen = Math.sqrt(eyeX * eyeX + eyeY * eyeY + eyeZ * eyeZ);
-        const cosTheta = eyeLen > 0.001 ? Math.abs(eyeY / eyeLen) : 1;
-        const fresnel = FRESNEL_F0 + (1.0 - FRESNEL_F0) * Math.pow(1.0 - cosTheta, 5);
-        const fresnelBoost = clamp01(densityAlpha + fresnel * 0.6);
-        alphas[vertexIndex] = clamp01(fresnelBoost * shoreAlpha * depthMod * avgFadeOut);
+        if (isMinimalProfile) {
+          const thicknessAlpha = lerp(0.82, 0.96, clamp01(avgThickness / 0.22));
+          alphas[vertexIndex] = clamp01(thicknessAlpha * avgFadeOut);
+        } else {
+          const densityAlpha = clamp01(1.0 - Math.exp(-avgThickness * 4.5));
+          // Depth softening: alpha fades smoothly to 0 at shoreline (no hard water edge)
+          const shoreAlpha = Math.pow(clamp01(avgShoreDist / 3.0), 0.7);
+          const depthMod = lerp(0.55, 1, depthFade);
+          const eyeX = this.camX - wx;
+          const eyeY = this.camY - heights[vertexIndex];
+          const eyeZ = this.camZ - wz;
+          const eyeLen = Math.sqrt(eyeX * eyeX + eyeY * eyeY + eyeZ * eyeZ);
+          const cosTheta = eyeLen > 0.001 ? Math.abs(eyeY / eyeLen) : 1;
+          const fresnel = FRESNEL_F0 + (1.0 - FRESNEL_F0) * Math.pow(1.0 - cosTheta, 5);
+          const fresnelBoost = clamp01(densityAlpha + fresnel * 0.6);
+          alphas[vertexIndex] = clamp01(fresnelBoost * shoreAlpha * depthMod * avgFadeOut);
+        }
       }
     }
 
@@ -610,23 +656,37 @@ export class DVEShallowWaterRenderer {
         const thickness = thicknesses[vertexIndex];
         const shoreDist = shoreDistances[vertexIndex];
         const settled = settledValues[vertexIndex];
-        const beerR = Math.exp(-ABSORB_R * thickness);
-        const beerG = Math.exp(-ABSORB_G * thickness);
-        const beerB = Math.exp(-ABSORB_B * thickness);
-        const shallowR = 0.45 * beerR;
-        const shallowG = 0.78 * beerG;
-        const shallowB = 0.92 * beerB;
-        const foamT = clamp01(1.0 - shoreDist / 2.5);
-        const crestFoam = clamp01((heights[vertexIndex] - (heights[vertexIndex] - 0.01)) / (RIPPLE_AMPLITUDE * 1.5)) * 0.08;
-        const totalFoam = clamp01(foamT * 0.65 + crestFoam);
-        const calmDarken = settled * 0.08;
+        if (isMinimalProfile) {
+          const thicknessTint = clamp01(thickness / 0.24);
+          localColors.push(
+            lerp(0.12, 0.18, thicknessTint),
+            lerp(0.34, 0.46, thicknessTint),
+            lerp(0.72, 0.84, thicknessTint),
+            1,
+          );
+        } else {
+          const beerR = Math.exp(-ABSORB_R * thickness);
+          const beerG = Math.exp(-ABSORB_G * thickness);
+          const beerB = Math.exp(-ABSORB_B * thickness);
+          const shallowR = 0.45 * beerR;
+          const shallowG = 0.78 * beerG;
+          const shallowB = 0.92 * beerB;
+          // Shore foam: strong foam ring at water/land boundary
+          const shoreFoamFade = clamp01(1.0 - shoreDist / 2.5);
+          const shoreFoam = Math.pow(shoreFoamFade, 2.0) * 0.72;
+          // Crest foam: positive ripple peaks get whitened (fixed: use actual ripple value)
+          const crestRipple = heights[vertexIndex] - sampleSurfaceY(cb, sizeX, sizeZ, vx - 0.5, vz - 0.5);
+          const crestFoam = clamp01(crestRipple / (RIPPLE_AMPLITUDE * 1.5)) * 0.12;
+          const totalFoam = clamp01(shoreFoam + crestFoam);
+          const calmDarken = settled * 0.08;
 
-        localColors.push(
-          clamp01(lerp(shallowR - calmDarken, 1.0, totalFoam)),
-          clamp01(lerp(shallowG - calmDarken * 0.5, 1.0, totalFoam)),
-          clamp01(lerp(shallowB, 1.0, totalFoam * 0.6)),
-          alphas[vertexIndex],
-        );
+          localColors.push(
+            clamp01(lerp(shallowR - calmDarken, 1.0, totalFoam)),
+            clamp01(lerp(shallowG - calmDarken * 0.5, 1.0, totalFoam)),
+            clamp01(lerp(shallowB, 1.0, totalFoam * 0.6)),
+            alphas[vertexIndex],
+          );
+        }
       }
     }
 
@@ -668,5 +728,25 @@ export class DVEShallowWaterRenderer {
     record.mesh.refreshBoundingInfo();
     record.initialized = true;
     record.mesh.setEnabled(true);
+  }
+
+  private applyRenderProfileToMaterial() {
+    const isMinimalProfile = this.renderProfile === "minimal";
+    this.material.forceDepthWrite = isMinimalProfile;
+    this.material.backFaceCulling = isMinimalProfile;
+    this.material.needDepthPrePass = !isMinimalProfile;
+    this.material.environmentIntensity = isMinimalProfile ? 0.2 : 1.2;
+    this.material.roughness = isMinimalProfile ? 0.65 : 0.08;
+    this.material.alpha = isMinimalProfile ? 1 : 0.75;
+    this.material.transparencyMode = isMinimalProfile
+      ? PBRMaterial.PBRMATERIAL_OPAQUE
+      : PBRMaterial.PBRMATERIAL_ALPHATESTANDBLEND;
+    this.material.alphaCutOff = isMinimalProfile ? 0 : 0.04;
+
+    if (this.material.bumpTexture) {
+      this.material.bumpTexture.level = isMinimalProfile ? 0 : 0.22;
+    }
+    this.material.detailMap.isEnabled = !isMinimalProfile && !!this.normalTex2;
+    this.material.detailMap.bumpLevel = isMinimalProfile ? 0 : 0.12;
   }
 }

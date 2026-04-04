@@ -39,6 +39,7 @@ import {
   createEmptyShallowColumn,
   buildShallowWaterVisualSnapshot,
   buildShallowWaterEdgeFieldSectionRenderData,
+  getShallowWaterDebugStageProfile,
   measureShallowWaterMass,
   placeShallowWaterSeed,
   setShallowWaterFlowHints,
@@ -70,6 +71,7 @@ import {
   queueSpillTransfer,
   removeSpillEmittersForSection,
   updateSpillWater,
+  type SpillEmitterRuntime,
 } from "@divinevoxel/vlox/Water/Spill/index.js";
 import { WaterChunkRegistry } from "@divinevoxel/vlox/Water/Runtime/WaterChunkRegistry.js";
 import {
@@ -140,7 +142,26 @@ function familyDefaultColor(family: string): [number, number, number] {
 const WATER_RUNTIME_SECTION_SIZE = 16;
 const WATER_HANDOFF_GRACE_TICKS = 4;
 const SHALLOW_TERRAIN_SCAN_UP = 4;
-const SHALLOW_TERRAIN_SCAN_DOWN = 24;
+const SHALLOW_TERRAIN_SCAN_DOWN = 128;
+const SHALLOW_TERRAIN_SCAN_DOWN_FAR = 512;
+const SHALLOW_TERRAIN_COARSE_STEP = 4;
+const SHALLOW_DIRECT_PLACEMENT_MAX_FALL = 1.25;
+
+type ShallowTerrainSupportSample = {
+  bedY: number;
+  foundSupport: boolean;
+};
+
+let resolveQueuedShallowTerrainSupport:
+  | ((worldX: number, worldZ: number, guessY: number) => ShallowTerrainSupportSample)
+  | null = null;
+
+function getActiveShallowDebugProfile() {
+  return getShallowWaterDebugStageProfile(
+    (globalThis as any).__DVE_SHALLOW_DEBUG_STAGE__,
+    "full",
+  );
+}
 
 function clamp01(value: number) {
   return Math.max(0, Math.min(1, value));
@@ -231,41 +252,136 @@ function addShallowSpillMassAtColumn(
   surfaceY: number,
   amount: number,
   emitterId: number,
+  emitter?: SpillEmitterRuntime,
 ) {
   if (amount <= 0) return 0;
 
-  const accepted = placeShallowWaterSeed(
-    worldX,
-    worldZ,
-    surfaceY,
-    amount,
-    emitterId,
-    undefined,
-    {
-      authority: "spill-handoff",
-      ownershipConfidence: 1,
-      ownershipTicks: WATER_HANDOFF_GRACE_TICKS,
-      handoffGraceTicks: WATER_HANDOFF_GRACE_TICKS,
-    },
-  );
-  if (accepted <= 0) return 0;
+  const applyImpactToColumn = (
+    targetX: number,
+    targetZ: number,
+    cellMass: number,
+    bedYGuess: number,
+    impulseX: number,
+    impulseZ: number,
+  ) => {
+    if (cellMass <= 0.0001) return 0;
 
-  const originX = getRuntimeSectionOrigin(worldX);
-  const originZ = getRuntimeSectionOrigin(worldZ);
-  const section = getShallowSection(originX, originZ);
-  if (!section) return accepted;
+    const sampledSupport = resolveQueuedShallowTerrainSupport?.(
+      targetX,
+      targetZ,
+      bedYGuess,
+    );
+    // Use sampled bedY when terrain is confirmed; fall back to the caller's
+    // bedYGuess (e.g. impactBedY) so mass is never silently discarded for
+    // cells where the terrain scan just failed to resolve (e.g. narrow scan
+    // window, borderline altitude).  Void cells off the platform will have
+    // no section and placeShallowWaterSeed will return 0 anyway.
+    const bedY = (sampledSupport?.foundSupport) ? sampledSupport.bedY : bedYGuess;
 
-  const localX = getRuntimeLocalCoord(worldX);
-  const localZ = getRuntimeLocalCoord(worldZ);
-  const column = section.columns[localZ * section.sizeX + localX];
-  if (!column) return accepted;
+    const accepted = placeShallowWaterSeed(
+      targetX,
+      targetZ,
+      bedY + cellMass,
+      cellMass,
+      emitterId,
+      undefined,
+      {
+        authority: "spill-handoff",
+        ownershipConfidence: 1,
+        ownershipTicks: WATER_HANDOFF_GRACE_TICKS,
+        handoffGraceTicks: WATER_HANDOFF_GRACE_TICKS,
+        bedY,
+      },
+    );
+    if (accepted <= 0) return 0;
 
-  column.authority = "spill-handoff";
-  column.ownershipDomain = "shallow";
-  if (emitterId > 0) {
-    column.emitterId = emitterId;
+    const originX = getRuntimeSectionOrigin(targetX);
+    const originZ = getRuntimeSectionOrigin(targetZ);
+    const section = getShallowSection(originX, originZ);
+    if (!section) return accepted;
+
+    const localX = getRuntimeLocalCoord(targetX);
+    const localZ = getRuntimeLocalCoord(targetZ);
+    const column = section.columns[localZ * section.sizeX + localX];
+    if (!column) return accepted;
+
+    column.authority = "spill-handoff";
+    column.ownershipDomain = "shallow";
+    if (emitterId > 0) {
+      column.emitterId = emitterId;
+    }
+    column.spreadVX += impulseX;
+    column.spreadVZ += impulseZ;
+    column.settled = 0;
+    column.adhesion = Math.min(column.adhesion, 0.08);
+    return accepted;
+  };
+
+  if (emitter?.fxProfile === "waterball" && emitter.fallHeight > 0.1) {
+    const impactRadius = Math.min(
+      2.75,
+      0.95 + Math.max(0, emitter.fallHeight) * 0.11 + Math.cbrt(Math.max(0.01, amount)) * 0.45,
+    );
+    const impactSpeed = Math.min(
+      1.8,
+      0.35 + Math.max(0, emitter.fallHeight) * 0.12 + Math.sqrt(Math.max(0.01, amount)) * 0.18,
+    );
+    const impactBedY = surfaceY - amount;
+    const radiusCeil = Math.max(1, Math.ceil(impactRadius));
+    const weightedTargets: Array<{
+      x: number;
+      z: number;
+      weight: number;
+      dirX: number;
+      dirZ: number;
+      bedY: number;
+    }> = [];
+    let totalWeight = 0;
+
+    for (let dz = -radiusCeil; dz <= radiusCeil; dz++) {
+      for (let dx = -radiusCeil; dx <= radiusCeil; dx++) {
+        const distance = Math.hypot(dx, dz);
+        if (distance > impactRadius) continue;
+        const radial = Math.max(0, 1 - distance / Math.max(0.0001, impactRadius));
+        const weight = dx === 0 && dz === 0 ? 1.35 : radial * radial;
+        if (weight <= 0.0001) continue;
+        const sampledSupport = resolveQueuedShallowTerrainSupport?.(
+          worldX + dx,
+          worldZ + dz,
+          impactBedY,
+        );
+        if (!sampledSupport?.foundSupport) continue;
+        const invDistance = distance > 0.0001 ? 1 / distance : 0;
+        weightedTargets.push({
+          x: worldX + dx,
+          z: worldZ + dz,
+          weight,
+          dirX: dx * invDistance,
+          dirZ: dz * invDistance,
+          bedY: sampledSupport.bedY,
+        });
+        totalWeight += weight;
+      }
+    }
+
+    let acceptedMass = 0;
+    for (const target of weightedTargets) {
+      const weight01 = target.weight / Math.max(0.0001, totalWeight);
+      const cellMass = amount * weight01;
+      const impulseScale = impactSpeed * Math.max(0.18, 1 - weight01);
+      acceptedMass += applyImpactToColumn(
+        target.x,
+        target.z,
+        cellMass,
+        target.bedY,
+        target.dirX * impulseScale,
+        target.dirZ * impulseScale,
+      );
+    }
+    return acceptedMass;
   }
-  return accepted;
+
+  return applyImpactToColumn(worldX, worldZ, amount, surfaceY - amount, 0, 0);
 }
 
 function addContinuousSpillMassAtColumn(
@@ -274,6 +390,7 @@ function addContinuousSpillMassAtColumn(
   surfaceY: number,
   amount: number,
   _emitterId: number,
+  _emitter?: SpillEmitterRuntime,
 ) {
   if (amount <= 0) return 0;
 
@@ -324,6 +441,42 @@ function processWaterRuntimeInputEvents() {
           break;
         }
 
+        const terrainSupport = resolveQueuedShallowTerrainSupport?.(
+          event.worldX,
+          event.worldZ,
+          event.worldY,
+        );
+        if (!terrainSupport?.foundSupport) {
+          (globalThis as any).__DVE_SHALLOW_LAST_PLACEMENT_REJECT__ = {
+            worldX: event.worldX,
+            worldY: event.worldY,
+            worldZ: event.worldZ,
+            reason: "no-terrain-support",
+            source: "queued-add-mass",
+          };
+          unhandled += 1;
+          break;
+        }
+
+        const bedY = terrainSupport.bedY;
+        const fallDistance = Math.max(0, event.worldY - bedY);
+        if (fallDistance > SHALLOW_DIRECT_PLACEMENT_MAX_FALL) {
+          queueSpillTransfer({
+            sourceDomain: "shallow",
+            targetDomain: "shallow",
+            worldX: event.worldX,
+            worldY: event.worldY,
+            worldZ: event.worldZ,
+            landingSurfaceY: bedY + massDelta,
+            mass: massDelta,
+            fallHeight: Math.max(0, event.worldY - (bedY + massDelta)),
+            fxProfile: "waterball",
+          });
+          sourceDelta += massDelta;
+          handled += 1;
+          break;
+        }
+
         // Shallow first: editor water belongs to the shallow runtime domain.
         // That domain now owns its own terrain-conforming visual stack
         // (film + edge splats) instead of painting dve_liquid directly.
@@ -334,12 +487,12 @@ function processWaterRuntimeInputEvents() {
         addedMass = placeShallowWaterSeed(
           event.worldX,
           event.worldZ,
-          event.worldY + massDelta,
+          bedY + massDelta,
           massDelta,
           0,
           undefined,
           {
-            bedY: event.worldY,
+            bedY,
             authority: "player",
           },
         );
@@ -592,7 +745,7 @@ export class DVEBabylonRenderer extends DVERenderer {
   private readonly _durablePersistenceBackend: WaterWorldPersistenceBackend =
     new IndexedDBWaterPersistenceBackend();
   private readonly _shallowSectionFrameCache = new Map<string, ShallowSectionRenderCache>();
-  private readonly spillFxRenderer = new SpillFxRenderer();
+  private readonly spillFxRenderer: SpillFxRenderer;
 
   get localFluidSystem(): DVEWaterLocalFluidSystem | null {
     return getSceneWaterHybridBridge(this.scene).localFluidSystem;
@@ -736,10 +889,44 @@ export class DVEBabylonRenderer extends DVERenderer {
     this._dormantWaterSnapshotKeys.clear();
   }
 
+  /**
+   * Clears every water-domain cache needed by the shallow isolation lab.
+   * This is narrower than dispose(): the renderer stays alive, but the runtime
+   * and the renderer-owned shallow visual state both return to a blank slate.
+   */
+  resetWaterDebugState() {
+    const waterHybridBridge = getSceneWaterHybridBridge(this.scene);
+
+    for (const section of getActiveContinuousSections().values()) {
+      waterHybridBridge.removeSection(section.originX, section.originZ);
+    }
+    for (const key of Array.from(this._shallowSectionFrameCache.keys())) {
+      const [originX, originZ] = key.split("_").map((value) => Number(value));
+      removeEditorShallowSurfaceSection(originX, originZ);
+      this.shallowCompositeController?.removeSection(key);
+      this.shallowLocalFluidCoupler?.removeSection(key);
+      waterHybridBridge.clearInjectedShallowSection(originX, originZ);
+    }
+
+    this._shallowSectionFrameCache.clear();
+    this.shallowCompositeController?.setLocalFluidContributions(null);
+    this.spillFxRenderer.clear(waterHybridBridge.localFluidSystem);
+    clearEditorShallowSurfaceRegistry();
+    clearAllShallowWater();
+    clearAllContinuousWater();
+    clearAllSpillWater();
+    this.clearDormantWaterSnapshots();
+    this.waterLODManager.clear();
+    this.waterChunkRegistry.clear();
+    this.shallowBoundaryRegistry.clear();
+    (globalThis as any).__DVE_WATER_HANDOFF_COUNTS__ = null;
+  }
+
   constructor(data: DVEBabylonRendererInitData) {
     super();
     this.engine = data.scene.getEngine() as any;
     this.scene = data.scene;
+    this.spillFxRenderer = new SpillFxRenderer(this.scene);
     this.foManager = new DVEBRFOManager();
     this.meshCuller = new DVEBRMeshCuller();
 
@@ -763,6 +950,8 @@ export class DVEBabylonRenderer extends DVERenderer {
       this.scene,
       EngineSettings.settings.rendererSettings.bufferMode
     );
+    resolveQueuedShallowTerrainSupport = (worldX, worldZ, guessY) =>
+      this.resolveShallowTerrainSupport(worldX, worldZ, guessY);
     this.scene.onDisposeObservable.addOnce(() => this.dispose());
     if (!DVEBabylonRenderer.instance) DVEBabylonRenderer.instance = this;
 
@@ -841,14 +1030,34 @@ export class DVEBabylonRenderer extends DVERenderer {
           };
         }
 
-        const accepted = addContinuousWaterSeed(
+        if (!this.hasContinuousHandoffSupport(worldX, worldZ, bedY, surfaceY)) {
+          return {
+            acceptedMass: 0,
+            disposition: "rejected",
+          };
+        }
+
+        const handoffTarget = this.resolveContinuousHandoffTarget(
           worldX,
           worldZ,
+          bedY,
           surfaceY,
+        );
+        if (!handoffTarget) {
+          return {
+            acceptedMass: 0,
+            disposition: "rejected",
+          };
+        }
+
+        const accepted = addContinuousWaterSeed(
+          handoffTarget.worldX,
+          handoffTarget.worldZ,
+          Math.max(surfaceY, handoffTarget.surfaceY),
           thickness,
           Math.max(1, emitterId),
           {
-            bedY,
+            bedY: handoffTarget.bedY,
             authority: "continuous-handoff",
             ownershipConfidence: 1,
             ownershipTicks: WATER_HANDOFF_GRACE_TICKS,
@@ -857,13 +1066,13 @@ export class DVEBabylonRenderer extends DVERenderer {
         );
         if (accepted > 0.0001) {
           const section = getContinuousSection(
-            getRuntimeSectionOrigin(worldX),
-            getRuntimeSectionOrigin(worldZ),
+            getRuntimeSectionOrigin(handoffTarget.worldX),
+            getRuntimeSectionOrigin(handoffTarget.worldZ),
           );
           let continuousDepth = 0;
           if (section) {
-            const localX = getRuntimeLocalCoord(worldX);
-            const localZ = getRuntimeLocalCoord(worldZ);
+            const localX = getRuntimeLocalCoord(handoffTarget.worldX);
+            const localZ = getRuntimeLocalCoord(handoffTarget.worldZ);
             const column = section.columns[localZ * section.sizeX + localX];
             if (column?.active) {
               continuousDepth = column.depth;
@@ -975,10 +1184,11 @@ export class DVEBabylonRenderer extends DVERenderer {
           ).accounting;
         },
         tickShallow: (tickDt) => {
+          const shallowDebugProfile = getActiveShallowDebugProfile();
           this.syncShallowTerrainSupport();
           return tickShallowWater(
             tickDt,
-            undefined,
+            shallowDebugProfile.runtimeConfig,
             this.shallowBoundaryRegistry,
             ownershipPreviewSummary?.preview,
           ).accounting;
@@ -1011,6 +1221,12 @@ export class DVEBabylonRenderer extends DVERenderer {
           };
 
           return transferSummary.accounting;
+        },
+        finalizeOwnership: () => {
+          this.waterOwnershipResolver.finalizeAll(
+            getActiveShallowSections(),
+            getActiveContinuousSections(),
+          );
         },
         resolveEvents: (tickDt, tick) => {
           const SECTION_SIZE = WATER_RUNTIME_SECTION_SIZE;
@@ -1139,6 +1355,7 @@ export class DVEBabylonRenderer extends DVERenderer {
           return spillSummary.accounting;
         },
         extractRenderData: () => {
+          const shallowDebugProfile = getActiveShallowDebugProfile();
           advanceEditorShallowSurfaceLayer(dt);
           const activeSections = getActiveShallowSections();
           activeShallowKeys.clear();
@@ -1154,10 +1371,16 @@ export class DVEBabylonRenderer extends DVERenderer {
               shallowGhosts,
             );
             this.applyContinuousIntegrationMask(snapshot.film);
-            snapshot.edgeField = buildShallowWaterEdgeFieldSectionRenderData(
-              snapshot.film,
-              snapshot.edgeField,
-            );
+            if (shallowDebugProfile.visuals.enableEdgeSplats) {
+              snapshot.edgeField = buildShallowWaterEdgeFieldSectionRenderData(
+                snapshot.film,
+                snapshot.edgeField,
+                shallowGhosts,
+              );
+            } else {
+              snapshot.edgeField.splats.length = 0;
+              snapshot.edgeField.activeSplatCount = 0;
+            }
             const signature = computeShallowSectionMaterialSignature(gpuData);
             const shallowChanged = !previousCache || previousCache.signature !== signature;
             this._shallowSectionFrameCache.set(key, {
@@ -1174,27 +1397,35 @@ export class DVEBabylonRenderer extends DVERenderer {
               continue;
             }
 
-            const retainedByBridge =
-              !shallowChanged &&
-              waterHybridBridge.retainInjectedShallowSection(
-                gpuData.originX,
-                gpuData.originZ,
-              );
-            if (!retainedByBridge) {
-              waterHybridBridge.injectShallowSection(
-                gpuData.originX,
-                gpuData.originZ,
-                gpuData.sizeX,
-                gpuData.sizeZ,
-                gpuData.columnBuffer,
-                gpuData.columnStride,
-                gpuData.columnMetadata,
-              );
+            if (shallowDebugProfile.visuals.enableHybridInjection) {
+              const retainedByBridge =
+                !shallowChanged &&
+                waterHybridBridge.retainInjectedShallowSection(
+                  gpuData.originX,
+                  gpuData.originZ,
+                );
+              if (!retainedByBridge) {
+                waterHybridBridge.injectShallowSection(
+                  gpuData.originX,
+                  gpuData.originZ,
+                  gpuData.sizeX,
+                  gpuData.sizeZ,
+                  gpuData.columnBuffer,
+                  gpuData.columnStride,
+                  gpuData.columnMetadata,
+                );
+              }
+            } else {
+              waterHybridBridge.clearInjectedShallowSection(gpuData.originX, gpuData.originZ);
             }
 
             activeShallowKeys.add(key);
             this.shallowCompositeController?.updateSection(key, snapshot);
-            this.shallowLocalFluidCoupler?.syncSection(key, gpuData);
+            if (shallowDebugProfile.visuals.enableLocalFluid) {
+              this.shallowLocalFluidCoupler?.syncSection(key, gpuData);
+            } else {
+              this.shallowLocalFluidCoupler?.removeSection(key);
+            }
             updateEditorShallowSurfaceSection(
               gpuData.originX,
               gpuData.originZ,
@@ -1227,7 +1458,7 @@ export class DVEBabylonRenderer extends DVERenderer {
             this.waterLODManager.measureManagedMass(),
           spill: measureSpillWaterMass(),
         }),
-        massValidationEpsilon: 0.001,
+        massValidationEpsilon: 0.05,
         onMassValidationFailure: (result) => {
           (globalThis as any).__DVE_WATER_RUNTIME_EXPECTED_MASS_DELTA__ =
             result.expectedMassDelta ?? 0;
@@ -1251,7 +1482,10 @@ export class DVEBabylonRenderer extends DVERenderer {
         },
       });
 
-      this.shallowLocalFluidCoupler?.update(dt);
+      const shallowDebugProfile = getActiveShallowDebugProfile();
+      if (shallowDebugProfile.visuals.enableLocalFluid) {
+        this.shallowLocalFluidCoupler?.update(dt);
+      }
       this.spillFxRenderer.sync(
         waterHybridBridge.localFluidSystem,
         getActiveSpillEmitters().values(),
@@ -1260,7 +1494,7 @@ export class DVEBabylonRenderer extends DVERenderer {
       const shallowClipState = waterHybridBridge.getClipState();
       const shallowLocalFluidSystem = waterHybridBridge.localFluidSystem;
       this.shallowCompositeController?.setLocalFluidContributions(
-        shallowLocalFluidSystem
+        shallowDebugProfile.visuals.enableLocalFluid && shallowLocalFluidSystem
           ? {
               originX: shallowClipState.originX,
               originZ: shallowClipState.originZ,
@@ -1441,12 +1675,11 @@ export class DVEBabylonRenderer extends DVERenderer {
           );
           processShallowWaterUpdate(sectorKey, waterUpdate);
         } else {
-          const { originX, originZ } = getWaterSectionContext(sectorKey);
           // A missing waterUpdate only means the mesher did not emit water payload
           // for this section update. The water runtime remains authoritative and
-          // must not be cleared outside the orchestrator tick, or mass disappears
-          // with expectedMassDelta=0 during editor terrain edits.
-          clearWaterVisualSection(originX, originZ);
+          // must not be cleared outside the orchestrator tick, or editor paints
+          // can produce transient cuts and flicker before the next water frame
+          // rebuilds or retires the section authoritatively.
         }
         this.splatManager!.processSectionMeshes(sectorKey, meshes);
       };
@@ -1516,10 +1749,11 @@ export class DVEBabylonRenderer extends DVERenderer {
     if (!EngineSettings.settings.terrain.dissolutionSplats) {
       MeshManager.onSectionUpdated = (_sectorKey, _meshes, waterUpdate) => {
         if (!waterUpdate) {
-          const { originX, originZ } = getWaterSectionContext(_sectorKey);
           // Keep runtime water state authoritative across mesh updates that omit
-          // water payload; only sector removal should destroy logical water state.
-          clearWaterVisualSection(originX, originZ);
+          // water payload; only the orchestrator tick or sector removal should
+          // retire visual water state. Clearing here causes shallow sections to
+          // blink out between mesh updates, especially around editor paints and
+          // section seams.
           return;
         }
         waterHybridBridge.updateFromSectionGPUData(
@@ -1587,7 +1821,138 @@ export class DVEBabylonRenderer extends DVERenderer {
     }
   }
 
-  private sampleTerrainBedY(worldX: number, worldZ: number, guessY: number) {
+  paintImmediateShallowWater(
+    worldX: number,
+    worldY: number,
+    worldZ: number,
+    massDelta = 0.25,
+    emitterId = 0,
+    bedYHint?: number,
+  ) {
+    const amount = Math.max(0, massDelta);
+    if (amount <= 0) return 0;
+
+    const shallowDebugProfile = getActiveShallowDebugProfile();
+    const terrainSupport = this.resolveShallowTerrainSupport(
+      worldX,
+      worldZ,
+      worldY,
+      bedYHint,
+    );
+    if (!terrainSupport.foundSupport) {
+      (globalThis as any).__DVE_SHALLOW_LAST_PLACEMENT_REJECT__ = {
+        worldX,
+        worldY,
+        worldZ,
+        reason: "no-terrain-support",
+      };
+      return 0;
+    }
+    const bedY = terrainSupport.bedY;
+    const fallDistance = Math.max(0, worldY - bedY);
+
+    if (fallDistance > SHALLOW_DIRECT_PLACEMENT_MAX_FALL) {
+      queueSpillTransfer({
+        sourceDomain: "shallow",
+        targetDomain: "shallow",
+        worldX,
+        worldY,
+        worldZ,
+        landingSurfaceY: bedY + amount,
+        mass: amount,
+        fallHeight: Math.max(0, worldY - (bedY + amount)),
+        fxProfile: "waterball",
+      });
+      return amount;
+    }
+
+    let addedMass = placeShallowWaterSeed(
+      worldX,
+      worldZ,
+      bedY + amount,
+      amount,
+      emitterId,
+      shallowDebugProfile.runtimeConfig,
+      {
+        bedY,
+        authority: "player",
+      },
+    );
+
+    if (addedMass > 0) {
+      const section = getShallowSection(
+        getRuntimeSectionOrigin(worldX),
+        getRuntimeSectionOrigin(worldZ),
+      );
+      if (section) {
+        const localX = getRuntimeLocalCoord(worldX);
+        const localZ = getRuntimeLocalCoord(worldZ);
+        const column = section.columns[localZ * section.sizeX + localX];
+        if (column) {
+          column.authority = "player";
+          column.ownershipDomain = "shallow";
+        }
+      }
+      return addedMass;
+    }
+
+    const inserted = addContinuousWaterSeed(worldX, worldZ, bedY, amount, 1, {
+      authority: "continuous-handoff",
+      ownershipConfidence: 1,
+      ownershipTicks: WATER_HANDOFF_GRACE_TICKS,
+      handoffGraceTicks: WATER_HANDOFF_GRACE_TICKS,
+    });
+    return inserted > 0 ? inserted : 0;
+  }
+
+  sampleImmediateShallowPlacement(
+    worldX: number,
+    worldY: number,
+    worldZ: number,
+    bedYHint?: number,
+  ) {
+    const section = getShallowSection(
+      getRuntimeSectionOrigin(worldX),
+      getRuntimeSectionOrigin(worldZ),
+    );
+    if (section) {
+      const localX = getRuntimeLocalCoord(worldX);
+      const localZ = getRuntimeLocalCoord(worldZ);
+      const column = section.columns[localZ * section.sizeX + localX];
+      if (column?.active && Number.isFinite(column.bedY) && Number.isFinite(column.surfaceY)) {
+        return {
+          bedY: column.bedY,
+          surfaceY: column.surfaceY,
+        };
+      }
+    }
+
+    const terrainSupport = this.resolveShallowTerrainSupport(
+      worldX,
+      worldZ,
+      worldY,
+      bedYHint,
+    );
+    const bedY = terrainSupport.bedY;
+    return {
+      bedY,
+      surfaceY: bedY,
+    };
+  }
+
+  private resolveShallowTerrainSupport(
+    worldX: number,
+    worldZ: number,
+    guessY: number,
+    bedYHint?: number,
+  ) {
+    if (Number.isFinite(bedYHint)) {
+      return {
+        bedY: bedYHint as number,
+        foundSupport: true,
+      };
+    }
+
     const cursor = this._shallowTerrainCursor;
     const baseY = Math.round(Number.isFinite(guessY) ? guessY : 0);
     cursor.setFocalPoint(0, worldX, baseY, worldZ);
@@ -1597,10 +1962,40 @@ export class DVEBabylonRenderer extends DVERenderer {
     for (let y = startY; y >= endY; y--) {
       const voxel = cursor.getVoxel(worldX, y, worldZ);
       if (!isTerrainSupportVoxel(voxel)) continue;
-      return y + 1;
+      return {
+        bedY: y + 1,
+        foundSupport: true,
+      };
     }
 
-    return Number.isFinite(guessY) ? guessY : 0;
+    const farEndY = baseY - SHALLOW_TERRAIN_SCAN_DOWN_FAR;
+    for (let coarseY = endY - SHALLOW_TERRAIN_COARSE_STEP; coarseY >= farEndY; coarseY -= SHALLOW_TERRAIN_COARSE_STEP) {
+      const voxel = cursor.getVoxel(worldX, coarseY, worldZ);
+      if (!isTerrainSupportVoxel(voxel)) continue;
+      const refineStart = Math.min(endY, coarseY + SHALLOW_TERRAIN_COARSE_STEP - 1);
+      const refineEnd = coarseY;
+      for (let y = refineStart; y >= refineEnd; y--) {
+        const refineVoxel = cursor.getVoxel(worldX, y, worldZ);
+        if (!isTerrainSupportVoxel(refineVoxel)) continue;
+        return {
+          bedY: y + 1,
+          foundSupport: true,
+        };
+      }
+      return {
+        bedY: coarseY + 1,
+        foundSupport: true,
+      };
+    }
+
+    return {
+      bedY: Number.isFinite(guessY) ? guessY : 0,
+      foundSupport: false,
+    };
+  }
+
+  private sampleTerrainBedY(worldX: number, worldZ: number, guessY: number) {
+    return this.resolveShallowTerrainSupport(worldX, worldZ, guessY).bedY;
   }
 
   private sampleShallowBedYForHint(
@@ -1657,7 +2052,124 @@ export class DVEBabylonRenderer extends DVERenderer {
     return section.columns[localZ * section.sizeX + localX] ?? null;
   }
 
-  private sampleContinuousIntegrationField(worldX: number, worldZ: number) {
+  private isReachableContinuousSupport(
+    shallowBedY: number,
+    shallowSurfaceY: number,
+    column: ReturnType<DVEBabylonRenderer["getContinuousColumnAt"]>,
+  ) {
+    if (
+      !column?.active ||
+      column.ownershipDomain !== "continuous" ||
+      column.depth <= 0.0001
+    ) {
+      return false;
+    }
+
+    const floorDrop = shallowBedY - column.bedY;
+    const surfaceClearance = column.surfaceY - (shallowBedY - 0.08);
+    const surfaceDelta = Math.abs(column.surfaceY - shallowSurfaceY);
+    const sameWaterPlane = surfaceDelta <= 0.42;
+    const coastalBridge =
+      column.surfaceY >= shallowBedY - 0.22 &&
+      floorDrop <= 1.1 &&
+      surfaceDelta <= 0.72;
+
+    // Deep coastal receivers can be physically valid even when the large body bed is far below the shoreline lip.
+    const deepBodyReceiverHeadroom = Math.max(
+      0.9,
+      Math.min(3, column.depth * 0.12),
+    );
+    const deepBodyReceiver =
+      column.depth >= 2 &&
+      column.surfaceY >= shallowBedY - 0.18 &&
+      shallowSurfaceY - column.surfaceY <= deepBodyReceiverHeadroom;
+
+    return (
+      (surfaceClearance >= -0.02 &&
+        (floorDrop <= 0.45 || sameWaterPlane || coastalBridge)) ||
+      deepBodyReceiver
+    );
+  }
+
+  private hasContinuousHandoffSupport(
+    worldX: number,
+    worldZ: number,
+    shallowBedY: number,
+    shallowSurfaceY: number,
+  ) {
+    for (let dz = -1; dz <= 1; dz++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const distance = Math.abs(dx) + Math.abs(dz);
+        if (distance > 1) continue;
+        const column = this.getContinuousColumnAt(worldX + dx, worldZ + dz);
+        if (this.isReachableContinuousSupport(shallowBedY, shallowSurfaceY, column)) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  private resolveContinuousHandoffTarget(
+    worldX: number,
+    worldZ: number,
+    shallowBedY: number,
+    shallowSurfaceY: number,
+  ) {
+    let bestTarget: {
+      worldX: number;
+      worldZ: number;
+      depth: number;
+      surfaceY: number;
+      bedY: number;
+      distance: number;
+    } | null = null;
+
+    for (let dz = -1; dz <= 1; dz++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const distance = Math.abs(dx) + Math.abs(dz);
+        if (distance > 1) continue;
+        const targetX = worldX + dx;
+        const targetZ = worldZ + dz;
+        const column = this.getContinuousColumnAt(targetX, targetZ);
+        if (!this.isReachableContinuousSupport(shallowBedY, shallowSurfaceY, column)) {
+          continue;
+        }
+        const candidate = {
+          worldX: targetX,
+          worldZ: targetZ,
+          depth: column!.depth,
+          surfaceY: column!.surfaceY,
+          bedY: column!.bedY,
+          distance,
+        };
+        if (!bestTarget) {
+          bestTarget = candidate;
+          continue;
+        }
+        if (candidate.depth > bestTarget.depth + 0.0001) {
+          bestTarget = candidate;
+          continue;
+        }
+        if (
+          Math.abs(candidate.depth - bestTarget.depth) <= 0.0001 &&
+          candidate.distance < bestTarget.distance
+        ) {
+          bestTarget = candidate;
+        }
+      }
+    }
+
+    return bestTarget;
+  }
+
+  private sampleContinuousIntegrationField(
+    worldX: number,
+    worldZ: number,
+    shallowBedY: number,
+    shallowSurfaceY: number,
+  ) {
     let strongestDepth = 0;
     let strongestSurfaceY = Number.NEGATIVE_INFINITY;
     let strongestWeightedDepth = 0;
@@ -1667,16 +2179,14 @@ export class DVEBabylonRenderer extends DVERenderer {
 
     for (let dz = -1; dz <= 1; dz++) {
       for (let dx = -1; dx <= 1; dx++) {
+        const distance = Math.abs(dx) + Math.abs(dz);
+        if (distance > 1) continue;
         const column = this.getContinuousColumnAt(worldX + dx, worldZ + dz);
-        if (
-          !column?.active ||
-          column.ownershipDomain !== "continuous" ||
-          column.depth <= 0.0001
-        ) {
+        if (!column) continue;
+        if (!this.isReachableContinuousSupport(shallowBedY, shallowSurfaceY, column)) {
           continue;
         }
-        const distance = Math.abs(dx) + Math.abs(dz);
-        const weight = distance === 0 ? 1 : distance === 1 ? 0.42 : 0.22;
+        const weight = distance === 0 ? 1 : 0.42;
         neighborCount += 1;
         neighborhoodDepth += column.depth * weight;
         neighborhoodWeight += weight;
@@ -1710,6 +2220,8 @@ export class DVEBabylonRenderer extends DVERenderer {
         const integrationField = this.sampleContinuousIntegrationField(
           film.originX + x,
           film.originZ + z,
+          column.bedY,
+          column.surfaceY,
         );
         if (integrationField.neighborCount <= 0) {
           activeColumnCount += 1;
@@ -1731,26 +2243,34 @@ export class DVEBabylonRenderer extends DVERenderer {
             (column.patchHandoffReady ? 0.22 : 0) +
             (column.handoffPending ? 0.12 : 0) +
             column.deepBlend * 0.12 +
-            clamp01(integrationField.neighborCount / 6) * 0.08,
+            clamp01(integrationField.neighborCount / 4) * 0.1,
         );
-        const coastalPull = clamp01(integrationField.neighborCount / 6);
+        const coastalPull = clamp01(integrationField.neighborCount / 4);
         const integration = clamp01(
-          depthDominance * 0.68 + handoffSignal * 0.22 + coastalPull * 0.1,
+          depthDominance * 0.48 + handoffSignal * 0.28 + coastalPull * 0.18,
         );
+        const integrationFade = clamp01(
+          integration * (0.62 + handoffSignal * 0.18 + coastalPull * 0.08),
+        );
+        const handoffProtected =
+          column.handoffBlend > 0.08 ||
+          column.patchHandoffReady ||
+          column.handoffPending ||
+          coastalPull >= 0.25;
 
         if (integration <= 0.02) {
           activeColumnCount += 1;
           continue;
         }
 
-        column.coverage *= 1 - integration;
-        column.filmOpacity *= 1 - integration * 0.95;
-        column.edgeStrength *= 1 - integration;
-        column.foam *= 1 - integration * 0.92;
-        column.wetness *= 1 - integration * 0.62;
-        column.breakup *= 1 - integration * 0.88;
-        column.microRipple *= 1 - integration * 0.7;
-        column.filmThickness = Math.max(0.006, column.filmThickness * (1 - integration * 0.78));
+        column.coverage *= 1 - integrationFade;
+        column.filmOpacity *= 1 - integrationFade * 0.92;
+        column.edgeStrength *= 1 - integrationFade;
+        column.foam *= 1 - integrationFade * 0.9;
+        column.wetness *= 1 - integrationFade * 0.58;
+        column.breakup *= 1 - integrationFade * 0.84;
+        column.microRipple *= 1 - integrationFade * 0.68;
+        column.filmThickness = Math.max(0.006, column.filmThickness * (1 - integrationFade * 0.74));
         column.visualSurfaceY = Math.min(
           column.visualSurfaceY,
           integrationField.strongestSurfaceY || column.visualSurfaceY,
@@ -1759,6 +2279,17 @@ export class DVEBabylonRenderer extends DVERenderer {
         column.deepBlend = Math.max(column.deepBlend, integration * 0.72);
 
         if (column.coverage <= 0.035 || column.filmOpacity <= 0.03) {
+          if (handoffProtected) {
+            const retainedCoverage = 0.05 + coastalPull * 0.04 + handoffSignal * 0.04;
+            const retainedOpacity = 0.05 + coastalPull * 0.035 + handoffSignal * 0.04;
+            column.coverage = Math.max(column.coverage, retainedCoverage);
+            column.filmOpacity = Math.max(column.filmOpacity, retainedOpacity);
+            column.edgeStrength = Math.max(column.edgeStrength, 0.035);
+            column.breakup = Math.max(column.breakup, 0.02);
+            column.microRipple = Math.max(column.microRipple, 0.02);
+            activeColumnCount += 1;
+            continue;
+          }
           column.active = false;
           column.coverage = 0;
           column.filmOpacity = 0;
@@ -1841,8 +2372,12 @@ export class DVEBabylonRenderer extends DVERenderer {
         );
         const length = Math.hypot(flowX, flowZ);
         if (length > 0.0001) {
-          flowX /= length;
-          flowZ /= length;
+          // Normalize direction but preserve capped slope magnitude so steep
+          // terrain pulls harder than gentle terrain (cap at 1.5).
+          const cappedMag = Math.min(length, 1.5);
+          const scale = cappedMag / length;
+          flowX *= scale;
+          flowZ *= scale;
         } else {
           flowX = 0;
           flowZ = 0;
@@ -1891,18 +2426,14 @@ export class DVEBabylonRenderer extends DVERenderer {
   private syncShallowTerrainSupport() {
     for (const grid of getActiveShallowSections().values()) {
       let guessY = Number.isFinite(grid.terrainY) ? grid.terrainY : 0;
-      let hasActive = false;
 
       for (const column of grid.columns) {
         if (!column.active || column.thickness <= 0.0001) continue;
-        hasActive = true;
         if (Number.isFinite(column.bedY) && column.bedY !== 0) {
           guessY = column.bedY;
           break;
         }
       }
-
-      if (!hasActive) continue;
 
       let minBedY = Number.POSITIVE_INFINITY;
       for (let z = 0; z < grid.sizeZ; z++) {
@@ -1911,13 +2442,28 @@ export class DVEBabylonRenderer extends DVERenderer {
           const column = grid.columns[index];
           const sampleGuess =
             Number.isFinite(column.bedY) && column.bedY !== 0 ? column.bedY : guessY;
-          const sampledBedY = this.sampleTerrainBedY(
+          const support = this.resolveShallowTerrainSupport(
             grid.originX + x,
             grid.originZ + z,
             sampleGuess,
           );
-          if (!Number.isFinite(sampledBedY)) continue;
 
+          if (!support.foundSupport) {
+            // Void column: no terrain under this cell.
+            // Active columns are left as-is so freshly placed water is never
+            // wiped before the player can see it; it will evaporate naturally
+            // or drain via the void-edge drain pass below.
+            if (!column.active || column.thickness <= 0.0001) {
+              // Inactive void column: mark NaN to poison ghost data.
+              column.active = false;
+              column.thickness = 0;
+              column.bedY = NaN;
+              column.surfaceY = NaN;
+            }
+            continue;
+          }
+
+          const sampledBedY = support.bedY;
           minBedY = Math.min(minBedY, sampledBedY);
           if (!column.active || column.thickness <= 0.0001) {
             column.bedY = sampledBedY;
@@ -1944,6 +2490,7 @@ export class DVEBabylonRenderer extends DVERenderer {
   dispose() {
     if (this._disposed) return;
     this._disposed = true;
+    resolveQueuedShallowTerrainSupport = null;
     for (const observer of this._beforeRenderObservers) {
       this.scene.onBeforeRenderObservable.remove(observer);
     }

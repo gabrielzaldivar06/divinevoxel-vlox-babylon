@@ -9,7 +9,7 @@ import { HemisphericLight } from "@babylonjs/core/Lights/hemisphericLight";
 import { ShadowGenerator } from "@babylonjs/core/Lights/Shadows/shadowGenerator";
 import { CascadedShadowGenerator } from "@babylonjs/core/Lights/Shadows/cascadedShadowGenerator";
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
-import type { SSRRenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPipeline/Pipelines/ssrRenderingPipeline";
+import { SSRRenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPipeline/Pipelines/ssrRenderingPipeline";
 import { SSAO2RenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPipeline/Pipelines/ssao2RenderingPipeline";
 import { ImageProcessingConfiguration } from "@babylonjs/core/Materials/imageProcessingConfiguration";
 import { ColorCurves } from "@babylonjs/core/Materials/colorCurves";
@@ -62,46 +62,57 @@ const DEFAULT_RENDERER_PRESET: RendererPresetCfg = {
   environmentIntensity: 0.58,
   grainIntensity: 12,
   bilateralStrength: 0,
-  ssr:  { samples: 2, strength: 0.8, roughnessFactor: 0.22, step: 3, maxSteps: 48, maxDistance: 128, blurDownsample: 2, thickness: 0.8 },
+  // roughnessFactor 0.12: only surfaces with roughness < 0.12 receive SSR rays.
+  // Water roughness = 0.02–0.10; rough terrain voxels = 0.35+. Safe ceiling for all presets.
+  ssr:  { samples: 2, strength: 0.72, roughnessFactor: 0.12, step: 3, maxSteps: 48, maxDistance: 128, blurDownsample: 2, thickness: 0.8 },
   ssao: { totalStrength: 0.8, samples: 12, radius: 1.5 },
 };
 const RENDERER_PRESET_CONFIGS: Readonly<Record<string, RendererPresetCfg>> = {
+  // All roughnessFactor values are capped at 0.12 — the water/terrain boundary.
+  // Water PBR roughness = 0.02–0.10; terrain voxels = 0.35+. Keeping the threshold
+  // below 0.13 ensures SSR rays fire only on water-smooth surfaces and never on
+  // voxel terrain, which was the root cause of the diagonal banding artifacts.
   "pbr-premium": {
     environmentIntensity: 0.42, grainIntensity: 16, bilateralStrength: 0.65,
-    ssr:  { samples: 4, strength: 0.72, roughnessFactor: 0.24, step: 3, maxSteps: 52, maxDistance: 112, blurDownsample: 2, thickness: 1.05 },
+    ssr:  { samples: 4, strength: 0.72, roughnessFactor: 0.10, step: 3, maxSteps: 56, maxDistance: 112, blurDownsample: 1, thickness: 0.9 },
     ssao: { totalStrength: 0.9, samples: 14, radius: 2.5 },
   },
   "pbr-premium-v2": {
     environmentIntensity: 0.68, grainIntensity: 16, bilateralStrength: 0.65,
     depthOfField: { enabled: false },
-    ssr:  { samples: 4, strength: 0.8, roughnessFactor: 0.1, step: 3, maxSteps: 50, maxDistance: 128, blurDownsample: 2, thickness: 0.98 },
+    ssr:  { samples: 4, strength: 0.80, roughnessFactor: 0.10, step: 3, maxSteps: 54, maxDistance: 128, blurDownsample: 1, thickness: 0.9 },
     ssao: { totalStrength: 0.9, samples: 8, radius: 2.2 },
+  },
+  "material-import": {
+    environmentIntensity: 0.58, grainIntensity: 12, bilateralStrength: 0,
+    ssr:  { samples: 4, strength: 0.68, roughnessFactor: 0.12, step: 3, maxSteps: 48, maxDistance: 128, blurDownsample: 2, thickness: 0.85 },
+    ssao: { totalStrength: 0.8, samples: 12, radius: 1.5 },
   },
   "optimum-inspired": {
     environmentIntensity: 0.62, grainIntensity: 12, bilateralStrength: 0,
-    ssr:  { samples: 4, strength: 0.76, roughnessFactor: 0.16, step: 3, maxSteps: 48, maxDistance: 128, blurDownsample: 2, thickness: 0.8 },
+    ssr:  { samples: 4, strength: 0.76, roughnessFactor: 0.11, step: 3, maxSteps: 48, maxDistance: 128, blurDownsample: 2, thickness: 0.85 },
     ssao: { totalStrength: 0.8, samples: 12, radius: 1.5 },
   },
   "universalis-inspired": {
     environmentIntensity: 0.74, grainIntensity: 12, bilateralStrength: 0,
-    ssr:  { samples: 4, strength: 0.82, roughnessFactor: 0.12, step: 3, maxSteps: 48, maxDistance: 128, blurDownsample: 2, thickness: 0.96 },
+    ssr:  { samples: 4, strength: 0.82, roughnessFactor: 0.11, step: 3, maxSteps: 52, maxDistance: 128, blurDownsample: 1, thickness: 0.9 },
     ssao: { totalStrength: 0.85, samples: 14, radius: 2.2 },
   },
   "definitivo": {
     environmentIntensity: 0.78, grainIntensity: 14, bilateralStrength: 0.65,
     depthOfField: { enabled: true },
-    ssr:  { samples: 4, strength: 0.84, roughnessFactor: 0.11, step: 3, maxSteps: 50, maxDistance: 128, blurDownsample: 2, thickness: 0.96 },
+    ssr:  { samples: 4, strength: 0.84, roughnessFactor: 0.10, step: 3, maxSteps: 56, maxDistance: 128, blurDownsample: 1, thickness: 0.9 },
     ssao: { totalStrength: 0.97, samples: 16, radius: 3.2 },
   },
   // BUG-A01: these premium presets were missing — they fell to DEFAULT (ssr.samples=2, SE-02 off)
   "pbr-surface-lod": {
     environmentIntensity: 0.64, grainIntensity: 14, bilateralStrength: 0.55,
-    ssr:  { samples: 4, strength: 0.78, roughnessFactor: 0.14, step: 3, maxSteps: 50, maxDistance: 128, blurDownsample: 2, thickness: 0.9 },
+    ssr:  { samples: 4, strength: 0.78, roughnessFactor: 0.11, step: 3, maxSteps: 52, maxDistance: 128, blurDownsample: 1, thickness: 0.88 },
     ssao: { totalStrength: 0.85, samples: 14, radius: 2.2 },
   },
   "phase-4-geometry": {
     environmentIntensity: 0.66, grainIntensity: 14, bilateralStrength: 0.60,
-    ssr:  { samples: 4, strength: 0.82, roughnessFactor: 0.12, step: 3, maxSteps: 50, maxDistance: 128, blurDownsample: 2, thickness: 0.92 },
+    ssr:  { samples: 4, strength: 0.82, roughnessFactor: 0.11, step: 3, maxSteps: 52, maxDistance: 128, blurDownsample: 1, thickness: 0.90 },
     ssao: { totalStrength: 0.88, samples: 14, radius: 2.2 },
   },
 };
@@ -313,10 +324,7 @@ function applyTerrainPhase1RendererProfile(
     pipeline.imageProcessing.contrast = 1.16;
     pipeline.imageProcessing.exposure = 0.9;
     pipeline.bloomThreshold = 0.62;
-    if (ssr) {
-      ssr.strength = 0.64;       // material-import not in RENDERER_PRESET_CONFIGS — keep here
-      ssr.roughnessFactor = 0.24;
-    }
+    // material-import is now in RENDERER_PRESET_CONFIGS; SSR params come from the table.
     sunLight.intensity = 6.8;
   }
 
@@ -324,19 +332,16 @@ function applyTerrainPhase1RendererProfile(
     pipeline.imageProcessing.contrast = 1.12;
     pipeline.imageProcessing.exposure = 1.04;
     pipeline.bloomThreshold = 0.5;
-    if (ssr) {
-      ssr.strength = 0.72;       // feature-flag path — not in table, keep here
-      ssr.roughnessFactor = 0.18;
-    }
+    // SSR params from table (DEFAULT roughnessFactor=0.12); no override needed.
     sunLight.intensity = 8.2;
   }
 
   if (terrain.materialWetness) {
     pipeline.imageProcessing.exposure = 1.02;
     pipeline.bloomThreshold = 0.56;
+    // materialWetness: slightly stronger reflections but must stay at water threshold.
     if (ssr) {
-      ssr.strength = 0.78;       // feature-flag path — not in table, keep here
-      ssr.roughnessFactor = 0.14;
+      ssr.strength = Math.min(ssr.strength + 0.06, 0.84); // +6% on existing preset value
     }
     sunLight.intensity = 8.0;
   }
@@ -772,11 +777,55 @@ export default async function InitDVEPBR(initData: DVEBRPBRData) {
  */
   LevelParticles.init(scene);
   applyTerrainPhase1Atmosphere(scene, isPBRPremium || isPBRPremiumV2);
-  // Temporary stability switch:
-  // The remaining diagonal/fractal-like bands only show up in PBR mode and span
-  // both water and solid terrain, which strongly points at the shared SSR path.
-  // Disable SSR until the terrain/water reflectance budget is retuned safely.
+
+  // SSR — Screen-Space Reflections for water surfaces.
+  // Key settings to avoid the voxel-terrain banding artifacts that caused
+  // the previous disable:
+  //  • roughnessFactor low (0.08–0.14): only near-mirror surfaces (water) receive
+  //    SSR rays; rough terrain blocks are unaffected.
+  //  • selfCollisionNumSkip = 3: prevents ray from immediately re-hitting the
+  //    emitting surface (critical for flat water where the normal faces straight up).
+  //  • enableAutomaticThicknessComputation: uses real depth buffer thickness so
+  //    ray hits terrain geometry correctly instead of using a fixed slab thickness
+  //    that caused the diagonal banding.
+  //  • blurDispersionStrength = 0: no blur noise — water is smooth.
+  //  • strength capped at 0.72: leaves room for environment cubemap fallback so
+  //    the transition at reflection boundaries is not a hard cut.
   let ssr: SSRRenderingPipeline | null = null;
+  try {
+    const ssrCfg = presetCfg.ssr;
+    const ssrPipeline = new SSRRenderingPipeline(
+      "dve_ssr",
+      scene,
+      [activeCamera],
+      false, // not using geometry buffer — use pre-pass instead
+    );
+    ssrPipeline.step                            = ssrCfg.step;       // ray step size
+    ssrPipeline.maxSteps                        = ssrCfg.maxSteps;   // max ray iterations
+    ssrPipeline.maxDistance                     = ssrCfg.maxDistance;
+    ssrPipeline.thickness                       = ssrCfg.thickness;
+    ssrPipeline.selfCollisionNumSkip            = 3;  // skip own surface (flat water fix)
+    ssrPipeline.samples                         = ssrCfg.samples;
+    ssrPipeline.strength                        = ssrCfg.strength; // per-preset value, all ≤ 0.84
+    // roughnessFactor: only materials with roughness < this threshold receive SSR.
+    // Water roughness = 0.02–0.06 (lake) or 0.04–0.10 (puddle), so 0.12 catches
+    // water while keeping all rough terrain (roughness > 0.35) out of SSR.
+    // All preset roughnessFactor values are pre-capped at 0.12 in RENDERER_PRESET_CONFIGS
+    // and DEFAULT_RENDERER_PRESET. The Math.min is a final safety net.
+    ssrPipeline.roughnessFactor                 = Math.min(ssrCfg.roughnessFactor, 0.12);
+    ssrPipeline.blurDownsample                  = ssrCfg.blurDownsample;
+    ssrPipeline.blurDispersionStrength          = 0;  // no noise on smooth water
+    ssrPipeline.enableAutomaticThicknessComputation = true;
+    ssrPipeline.attenuateScreenBorders          = true;  // fade out at screen edges
+    ssrPipeline.attenuateFacingCamera           = true;  // fade grazing-angle artifacts
+    ssrPipeline.attenuateIntersectionDistance   = true;
+    ssrPipeline.reflectionSpecularFalloffExponent = 3.0; // sharp falloff for glossy water
+    scene.onDisposeObservable.addOnce(() => ssrPipeline.dispose());
+    ssr = ssrPipeline;
+  } catch {
+    // SSR not supported in this environment (e.g. WebGL1 fallback) — continue without.
+    ssr = null;
+  }
 
   // R20: SSAO2 — contact shadows for voxel geometry
   const ssao = new SSAO2RenderingPipeline("ssao", initData.scene, {

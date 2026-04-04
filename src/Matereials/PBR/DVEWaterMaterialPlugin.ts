@@ -2364,19 +2364,46 @@ surfaceReflectivityColor = mix(surfaceReflectivityColor, vec3(0.04, 0.055, 0.07)
   );
   vec2 dveAperiodicMacroUV = dveGetAperiodicDetailUV(vPositionW.xz + dveHybridAdvection * 11.0, dveHybridFlowVector, dveAperiodicSeed, 0.016, dveWaveAttenuation);
   vec2 dveAperiodicMicroUV = dveGetAperiodicDetailUV(vPositionW.xz + dveHybridAdvection * 13.0, dveHybridFlowVector, fract(dveAperiodicSeed + 0.37), 0.058, dveWaveAttenuation);
+  // ── Normal map layer design (2 octaves + UDN Gerstner) ──────────────────
+  // Each octave blends its base UV with an aperiodic UV (same frequency band,
+  // phase-scrambled) to eliminate tiling.  Mix weight kept at 0.40 so both
+  // UVs contribute equally rather than one dominating the other.
+  //
+  // Octave A – MACRO  scale 0.012  (large rolling-swell detail, visible far)
+  // Octave B – MICRO  scale 0.060  (close-range ripple detail, fades at dist)
+  // Octave C – analytical Gerstner (procedural broad wave shape, always on)
+  //
+  // Removed: foam-breaker height-field layer.  That approach used voronoi cell
+  // boundaries as a height source: the resulting gradient had erratic amplitude
+  // spikes at cell edges (×6.5 factor) which created harsh specular flickers at
+  // grazing angles.  The foam-breaker texture is correctly used for foam only.
   vec3 dveMacroSample = mix(
     texture(dve_water_normal, dveMacroUV).xyz * 2.0 - 1.0,
     texture(dve_water_normal, dveAperiodicMacroUV).xyz * 2.0 - 1.0,
-    0.56 + dveLargeBodySignal * 0.16 + dvePatchFlowSignal * 0.12
+    // 0.40 base: both UVs contribute equally for anti-tiling.
+    // Large-body / patch signals tilt slightly toward the aperiodic (more
+    // varied) version for open water where tiling is most visible.
+    0.40 + dveLargeBodySignal * 0.12 + dvePatchFlowSignal * 0.08
   );
   vec3 dveMicroSample = mix(
     texture(dve_water_normal, dveMicroUV).xyz * 2.0 - 1.0,
     texture(dve_water_normal, dveAperiodicMicroUV).xyz * 2.0 - 1.0,
-    0.48 * dveDetailFade + dveLargeBodySignal * 0.1 + dvePatchFlowSignal * 0.08
+    // 0.40 base: both UVs contribute — aperiodic tilts in only at close range
+    // (dveDetailFade ≈ 1) where the fine-scale tiling would otherwise be seen.
+    0.40 * dveDetailFade + dveLargeBodySignal * 0.08 + dvePatchFlowSignal * 0.06
   );
+  // Macro: strong XZ slope (swell-like shape).
+  // Micro: 0.28 instead of the previous 0.18 — micro was 51% weaker per channel
+  //        AND only weighted at 30% in the mix below, making it essentially
+  //        invisible (~5% effective contribution).  0.28 brings it to ~80% of
+  //        macro strength per channel so it registers in specular at close range.
   vec3 dveMacroNormal = normalize(vec3(dveMacroSample.x * (0.35 + dveDropLift * 0.08 + dveHybridPressure * 0.07), 1.0, dveMacroSample.y * (0.35 + dveDropLift * 0.08 + dveHybridPressure * 0.07)));
-  vec3 dveMicroNormal = normalize(vec3(dveMicroSample.x * (0.18 + dveHybridFlowMagnitude * 0.04), 1.0, dveMicroSample.y * (0.18 + dveHybridFlowMagnitude * 0.04)));
-  vec3 dveWaterDetailNormal = normalize(mix(dveMacroNormal, dveMicroNormal, (0.18 + dveWaveAttenuation * 0.1) + dveDetailFade * 0.12));
+  vec3 dveMicroNormal = normalize(vec3(dveMicroSample.x * (0.28 + dveHybridFlowMagnitude * 0.06), 1.0, dveMicroSample.y * (0.28 + dveHybridFlowMagnitude * 0.06)));
+  // Blend macro↔micro: weight 0.45–0.58 toward micro at close range so the
+  // high-frequency ripple detail is clearly visible instead of being swamped by
+  // the macro swell.  At distance dveDetailFade→0 so the mix shifts all the way
+  // to macro (which holds up well at low resolution / far LODs).
+  vec3 dveWaterDetailNormal = normalize(mix(dveMacroNormal, dveMicroNormal, 0.28 + dveDetailFade * 0.26 + dveWaveAttenuation * 0.08));
   // ─── Blend analytical Gerstner normal with texture detail ──────────────
   // Gerstner provides the broad wave shape, texture normals add micro-detail.
   // Use UDN (Unreal-style) blending: sum XZ gradients, renormalize.
@@ -2406,6 +2433,43 @@ dveWaterNormal = normalize(mix(dveWaterNormal, vec3(0.0, -1.0, 0.0), dveUnderwat
 float dveWaterViewDot = dveGetWaterViewDot(dveWaterNormal, dveWaterViewDir);
 float dveFresnel = dveGetWaterFresnelResponse(dveWaterViewDot);
 finalDiffuse.rgb = mix(finalDiffuse.rgb, finalDiffuse.rgb * vec3(1.03, 1.05, 1.08), dveFresnel * 0.18 * (1.0 - dveUnderwaterFactor * 0.9));
+// ─── Analytic caustics ──────────────────────────────────────────────────
+// Two-layer animated voronoi that simulates refracted-sunlight concentrations.
+// Uses d2-d1 (.w component) which is the standard F2-F1 metric: it peaks at
+// 0.5 mid-cell and dips to 0 at cell boundaries — inverting it gives bright
+// ridges between cells, exactly the light-focus pattern of caustics.
+// The two UV layers scroll in opposite directions to create interference whose
+// combined bright regions drift and pulse without periodicity.
+// Correction notes vs prior version:
+//  • Switched from .y (minEdgeDistance ~0..0.5) to .w (d2-d1 ~0..0.7) which
+//    has much wider coverage per cell — avoids tiny pinprick highlights.
+//  • Scale factor reduced from 2.8 → 1.6 to avoid over-clamping at larger d2-d1.
+//  • Multiplied layers instead of pow-squaring them: products preserve breadth
+//    while still sharpening the peak, avoiding near-zero contributions.
+//  • Max additive strength capped at 0.28 per channel to prevent HDR clip.
+{
+  float dveCausticT = dve_time;
+  // Layer A — larger cells (0.14), slow drift +X+Z
+  vec2 cauUVA = vPositionW.xz * 0.14 + vec2(dveCausticT * 0.038, dveCausticT * 0.026);
+  // Layer B — smaller cells (0.22), drifts diagonally -X+Z at different speed
+  vec2 cauUVB = vPositionW.xz * 0.22 + vec2(-dveCausticT * 0.031, dveCausticT * 0.047);
+  // d2-d1: high in mid-cell, low at edges; invert → bright ridges = caustic lines
+  float cauA = clamp(1.0 - dveVoronoiCellData(cauUVA).w * 1.6, 0.0, 1.0);
+  float cauB = clamp(1.0 - dveVoronoiCellData(cauUVB).w * 1.6, 0.0, 1.0);
+  // Combined: product peaks only where both layers independently have a bright line
+  float causticPattern = cauA * cauB;
+  // Surface caustics: looking down at water (underwaterFactor ≈ 0), fades at
+  // grazing angles via Fresnel (specular already handles that highlight zone).
+  float surfaceCausticsStr = (1.0 - dveUnderwaterFactor) * (1.0 - dveFresnel * 0.60);
+  // Underwater / bed caustics: the classic dancing-light pattern cast on the
+  // voxel floor below the surface.  Stronger underwater than surface.
+  float underwaterCausticsStr = dveUnderwaterFactor * 0.85;
+  // Combined strength — max 0.28 additive per channel to stay inside SDR range
+  float causticsStrength = clamp(surfaceCausticsStr * 0.22 + underwaterCausticsStr * 0.28, 0.0, 0.28);
+  // Slightly cool blue-green tint: refracted sky-light + water colour
+  vec3 causticTint = vec3(0.82, 1.04, 1.12);
+  finalDiffuse.rgb += causticPattern * causticsStrength * causticTint;
+}
 #endif
 `,
       };

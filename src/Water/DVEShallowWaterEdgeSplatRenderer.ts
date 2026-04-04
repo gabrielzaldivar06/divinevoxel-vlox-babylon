@@ -301,7 +301,33 @@ export class DVEShallowWaterEdgeSplatRenderer {
     record.uvs.fill(0);
     record.colors.fill(0);
 
+    const clearSlot = (slotIndex: number) => {
+      const vertexBase = slotIndex * (SPLAT_RING_SEGMENTS + 1);
+      for (let vertex = 0; vertex <= SPLAT_RING_SEGMENTS; vertex++) {
+        const vertexIndex = vertexBase + vertex;
+        const posOffset = vertexIndex * 3;
+        const uvOffset = vertexIndex * 2;
+        const colorOffset = vertexIndex * 4;
+        record.positions[posOffset + 0] = edgeField.originX + 0.5;
+        record.positions[posOffset + 1] = 0;
+        record.positions[posOffset + 2] = edgeField.originZ + 0.5;
+        record.normals[posOffset + 0] = 0;
+        record.normals[posOffset + 1] = 1;
+        record.normals[posOffset + 2] = 0;
+        record.uvs[uvOffset + 0] = 0.5;
+        record.uvs[uvOffset + 1] = 0.5;
+        record.colors[colorOffset + 0] = 0.16;
+        record.colors[colorOffset + 1] = 0.34;
+        record.colors[colorOffset + 2] = 0.42;
+        record.colors[colorOffset + 3] = 0;
+      }
+    };
+
     const writeSlot = (slotIndex: number, splat: ShallowEdgeSplat | null) => {
+      if (!splat) {
+        clearSlot(slotIndex);
+        return;
+      }
       const vertexBase = slotIndex * (SPLAT_RING_SEGMENTS + 1);
       const centerOffset = vertexBase * 3;
       const uvBase = vertexBase * 2;

@@ -7,8 +7,8 @@ import {
 } from "@divinevoxel/vlox/Water/Shallow/index.js";
 
 const SECTION_SIZE = 16;
-const SHALLOW_HANDOFF_OUT_DURATION = 0.22;
-const SHALLOW_HANDOFF_IN_DURATION = 0.35;
+const SHALLOW_HANDOFF_OUT_DURATION = 0.6;
+const SHALLOW_HANDOFF_IN_DURATION = 0.75;
 const SHALLOW_HANDOFF_THICKNESS_REF = 0.75;
 
 type HandoffTransitionKind = "outgoing" | "incoming";
@@ -37,6 +37,15 @@ function clamp01(value: number) {
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
+}
+
+function lerp(start: number, end: number, alpha: number) {
+  return start + (end - start) * alpha;
+}
+
+function smoothstep01(value: number) {
+  const t = clamp01(value);
+  return t * t * (3 - 2 * t);
 }
 
 function makeEmptyVisualColumn(): ShallowVisualColumnState {
@@ -78,6 +87,7 @@ function makeEmptyVisualColumn(): ShallowVisualColumnState {
     mergeBlend: 0,
     deepBlend: 0,
     handoffBlend: 0,
+    turbidity: 0,
     emitterId: 0,
     handoffPending: false,
     ownershipDomain: "none",
@@ -134,6 +144,14 @@ function getColumnIndex(sizeX: number, x: number, z: number) {
   return z * sizeX + x;
 }
 
+function getTransitionReferenceDepth(
+  bedY: number,
+  surfaceY: number,
+  thickness: number,
+) {
+  return Math.max(0, surfaceY - bedY, thickness);
+}
+
 function applyTransitionToColumn(
   column: ShallowVisualColumnState,
   record: HandoffTransitionRecord,
@@ -143,27 +161,32 @@ function applyTransitionToColumn(
   if (progress <= 0.0001) return false;
 
   const thickness01 = clamp01(record.thickness / SHALLOW_HANDOFF_THICKNESS_REF);
-  const coverage = clamp01(
-    thickness01 * (record.kind === "outgoing" ? 0.34 : 0.78) * progress,
-  );
+  const smoothProgress = smoothstep01(progress);
+  const coverageScale =
+    record.kind === "outgoing"
+      ? lerp(0.8, 0.42, normalizedAge)
+      : lerp(0.42, 0.8, normalizedAge);
+  const coverage = clamp01(thickness01 * coverageScale * lerp(0.82, 1, smoothProgress));
   const foam =
     record.kind === "outgoing"
-      ? clamp01(0.05 + progress * 0.16)
-      : clamp01(0.08 + progress * 0.26);
+      ? clamp01(0.05 + smoothProgress * 0.16)
+      : clamp01(0.08 + smoothProgress * 0.26);
   const wetness =
     record.kind === "outgoing"
-      ? clamp01(0.12 + progress * 0.22)
-      : clamp01(0.18 + progress * 0.38);
+      ? clamp01(0.12 + smoothProgress * 0.22)
+      : clamp01(0.18 + smoothProgress * 0.38);
   const edgeStrength =
     record.kind === "outgoing"
-      ? clamp01(0.08 + progress * 0.18)
-      : clamp01(0.16 + progress * 0.24);
+      ? clamp01(0.08 + smoothProgress * 0.18)
+      : clamp01(0.16 + smoothProgress * 0.24);
   const breakup =
     record.kind === "outgoing"
-      ? clamp01(0.04 + progress * 0.12)
-      : clamp01(0.08 + progress * 0.18);
+      ? clamp01(0.04 + smoothProgress * 0.12)
+      : clamp01(0.08 + smoothProgress * 0.18);
   const microRipple = clamp01(
-    record.kind === "outgoing" ? 0.04 + progress * 0.08 : 0.12 + progress * 0.22,
+    record.kind === "outgoing"
+      ? 0.04 + smoothProgress * 0.08
+      : 0.12 + smoothProgress * 0.22,
   );
   const filmThickness = clamp(
     record.kind === "outgoing"
@@ -172,16 +195,18 @@ function applyTransitionToColumn(
     0.006,
     0.075,
   );
-  const transitionedThickness = Math.max(
-    record.thickness * progress * (record.kind === "outgoing" ? 0.18 : 1),
-    0,
+  const referenceDepth = getTransitionReferenceDepth(
+    record.bedY,
+    record.surfaceY,
+    record.thickness,
   );
+  const transitionedThickness = referenceDepth * smoothProgress;
   const transitionedSurfaceY = record.bedY + transitionedThickness;
   const filmOpacity = clamp01(
     (record.kind === "outgoing" ? 0.06 : 0.16) +
       wetness * (record.kind === "outgoing" ? 0.22 : 0.45) +
       foam * (record.kind === "outgoing" ? 0.08 : 0.16) +
-      progress * (record.kind === "outgoing" ? 0.03 : 0.08),
+      smoothProgress * (record.kind === "outgoing" ? 0.03 : 0.08),
   );
 
   column.active = true;
@@ -191,8 +216,8 @@ function applyTransitionToColumn(
   column.visualSurfaceY = Math.max(
     column.visualSurfaceY,
     record.kind === "outgoing"
-      ? record.bedY + filmThickness + transitionedThickness * 0.02
-      : record.bedY + Math.max(filmThickness, transitionedThickness * 0.04),
+      ? transitionedSurfaceY + filmThickness * 0.35
+      : Math.max(transitionedSurfaceY, record.bedY + filmThickness),
   );
   column.filmThickness = Math.max(column.filmThickness, filmThickness);
   column.filmOpacity = Math.max(column.filmOpacity, filmOpacity);
@@ -202,12 +227,15 @@ function applyTransitionToColumn(
   column.wetness = Math.max(column.wetness, wetness);
   column.breakup = Math.max(column.breakup, breakup);
   column.microRipple = Math.max(column.microRipple, microRipple);
-  column.mergeBlend = Math.max(column.mergeBlend, record.kind === "outgoing" ? 0.42 : 0.42);
-  column.deepBlend = Math.max(column.deepBlend, record.kind === "outgoing" ? 0.54 : 0.36);
-  column.handoffBlend = Math.max(column.handoffBlend, record.kind === "outgoing" ? progress * 0.75 : progress * 0.42);
+  const mergeTarget = record.kind === "outgoing" ? 0.5 : 0.46;
+  const deepTarget = record.kind === "outgoing" ? 0.62 : 0.42;
+  const handoffTarget = record.kind === "outgoing" ? smoothProgress * 0.82 : smoothProgress * 0.56;
+  column.mergeBlend = Math.max(column.mergeBlend, lerp(column.mergeBlend, mergeTarget, 0.42 * smoothProgress));
+  column.deepBlend = Math.max(column.deepBlend, lerp(column.deepBlend, deepTarget, 0.48 * smoothProgress));
+  column.handoffBlend = Math.max(column.handoffBlend, lerp(column.handoffBlend, handoffTarget, 0.6));
   column.patchHandoffReady = record.kind === "outgoing";
   column.localNeighborCount = Math.max(column.localNeighborCount, 2);
-  column.localCore = Math.max(column.localCore, record.kind === "outgoing" ? 0.42 : 0.42);
+  column.localCore = Math.max(column.localCore, lerp(0.28, 0.48, smoothProgress));
   column.age = Math.max(column.age, record.age);
   column.emitterId = Math.max(column.emitterId, record.emitterId);
   column.handoffPending = false;
@@ -277,6 +305,7 @@ export class DVEShallowWaterHandoffTransitionRegistry {
     snapshot.edgeField = buildShallowWaterEdgeFieldSectionRenderData(
       snapshot.film,
       snapshot.edgeField as ShallowEdgeFieldSectionRenderData | undefined,
+      undefined,
     );
   }
 
@@ -322,6 +351,7 @@ export class DVEShallowWaterHandoffTransitionRegistry {
       const edgeField = buildShallowWaterEdgeFieldSectionRenderData(
         film,
         previous?.edgeField as ShallowEdgeFieldSectionRenderData | undefined,
+        undefined,
       );
       snapshots.push([sectionKey, { film, edgeField }]);
     }
@@ -369,6 +399,33 @@ export class DVEShallowWaterHandoffTransitionRegistry {
     const id = `${sectionKey}:${localX}:${localZ}:${kind}`;
     const duration =
       kind === "outgoing" ? SHALLOW_HANDOFF_OUT_DURATION : SHALLOW_HANDOFF_IN_DURATION;
+    const existing = this.records.get(id);
+    if (existing) {
+      const existingReferenceDepth = getTransitionReferenceDepth(
+        existing.bedY,
+        existing.surfaceY,
+        existing.thickness,
+      );
+      const nextReferenceDepth = getTransitionReferenceDepth(
+        bedY,
+        surfaceY,
+        thickness,
+      );
+      existing.worldX = worldX;
+      existing.worldZ = worldZ;
+      existing.emitterId = Math.max(existing.emitterId, emitterId);
+      if (nextReferenceDepth >= existingReferenceDepth * 0.98) {
+        existing.bedY = bedY;
+        existing.surfaceY = surfaceY;
+        existing.thickness = thickness;
+      } else {
+        existing.bedY = Math.min(existing.bedY, bedY);
+        existing.surfaceY = Math.max(existing.surfaceY, surfaceY);
+        existing.thickness = Math.max(existing.thickness, thickness);
+      }
+      existing.duration = Math.max(existing.duration, duration);
+      return;
+    }
     this.records.set(id, {
       id,
       sectionKey,
